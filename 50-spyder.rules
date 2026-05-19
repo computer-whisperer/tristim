@@ -1,0 +1,27 @@
+# Datacolor Spyder family — grant access to the currently logged-in seat user
+# via systemd-logind's uaccess mechanism (no group membership required).
+#
+# Install: sudo cp 50-spyder.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+# Then unplug + replug the device.
+
+# SpyderExpress / Spyder 2024 (PID 0x0a0b — confirmed on christian's machine)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0a0b", TAG+="uaccess", MODE="0664"
+
+# Other Spyder-family PIDs — kept here for portability across hardware variants.
+# Original SpyderX (0x0a00), SpyderX Pro / Elite firmware variants, and any
+# future PID-0x0a0X variants Datacolor ships. Harmless to leave even if the
+# corresponding device is never plugged in.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0a00", TAG+="uaccess", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0a01", TAG+="uaccess", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0a02", TAG+="uaccess", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0a0a", TAG+="uaccess", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0a0c", TAG+="uaccess", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0a0d", TAG+="uaccess", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0a0e", TAG+="uaccess", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0a0f", TAG+="uaccess", MODE="0664"
+
+# Older Spyder2/3/4/5 (not relevant for christian's hardware, but harmless)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0200", TAG+="uaccess", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0300", TAG+="uaccess", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0400", TAG+="uaccess", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="085c", ATTRS{idProduct}=="0500", TAG+="uaccess", MODE="0664"

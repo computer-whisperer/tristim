@@ -1,0 +1,15 @@
+# Build output
+target/
+
+# External source (cloned ArgyllCMS for protocol reference; GPL/AGPL, not ours)
+refs/
+
+# IDE / editor noise
+.vscode/
+.idea/
+*.swp
+*~
+
+# Scratch CSVs at the workspace root — keeps the root clean.
+# Committed measurements live under `measurements/`.
+/*.csv

@@ -1,0 +1,18 @@
+[package]
+name = "spyder-display"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wayland layer-shell client for displaying known RGB test patches on a chosen output, for color measurement with spyder-driver."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+thiserror.workspace = true
+memmap2 = "0.9"
+rustix = { version = "0.38", features = ["fs", "mm"] }

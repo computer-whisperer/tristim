@@ -1,0 +1,13 @@
+[package]
+name = "spyder-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust driver for Datacolor Spyder colorimeters (SpyderX family, including SpyderExpress / 0x0A0B)"
+
+[dependencies]
+rusb.workspace = true
+rand.workspace = true
+thiserror.workspace = true
