@@ -1,16 +1,34 @@
 //! Wayland layer-shell client for showing solid-color test patches on a
 //! chosen output.
 //!
+//! Two modes:
+//!
+//! **SDR (default)** writes 8-bit XRGB8888 with no color description.
+//! Compositor treats values as sRGB. Works on any wayland compositor.
+//!
+//! **HDR** writes fp16 PQ-encoded values and attaches a parametric
+//! `wp_color_management_v1` description (PQ + BT.2020 + mastering
+//! metadata). The compositor (prism) recognises the description and
+//! scans the buffer out without color transforms; the panel applies
+//! its PQ EOTF to recover absolute luminance. Requires both
+//! wp_color_management_v1 and shm fp16 format support on the
+//! compositor.
+//!
 //! Usage:
 //!
 //! ```no_run
 //! use spyder_display::PatchSurface;
+//! // SDR
 //! let mut patch = PatchSurface::open("DP-1")?;
 //! patch.set_color([1.0, 1.0, 1.0])?;
-//! // ... measure with spyder-driver ...
-//! patch.set_color([0.5, 0.0, 0.0])?;
-//! // ...
-//! drop(patch);  // surface goes away
+//!
+//! // HDR — explicit per-panel mastering params
+//! use spyder_display::{PqDescriptionParams};
+//! let mut hdr = PatchSurface::open_hdr(
+//!     "DP-4",
+//!     PqDescriptionParams::pg27ucdm_default(),
+//! )?;
+//! hdr.set_nits([100.0, 100.0, 100.0])?;  // 100 cd/m² white
 //! # Ok::<(), spyder_display::Error>(())
 //! ```
 //!
@@ -18,6 +36,11 @@
 //! chosen output, placed in the `Overlay` layer (above normal windows),
 //! with `exclusive_zone = -1` (does not push other windows around) and no
 //! keyboard interactivity (user can still alt-tab away if needed).
+
+pub mod color_mgmt;
+pub mod pq;
+
+pub use color_mgmt::{DescriptionState, PqDescriptionParams};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -34,13 +57,22 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    Connection, Dispatch, QueueHandle, WEnum,
 };
+use wayland_protocols::wp::color_management::v1::client::{
+    wp_color_management_surface_v1::WpColorManagementSurfaceV1,
+    wp_color_manager_v1::WpColorManagerV1,
+    wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
+    wp_image_description_v1::WpImageDescriptionV1,
+};
+
+use crate::color_mgmt::ColorManagedSurface;
 
 const PATCH_WIDTH: u32 = 512;
 const PATCH_HEIGHT: u32 = 512;
@@ -76,6 +108,21 @@ pub enum Error {
 
     #[error("compositor never sent initial configure within {0:?}")]
     NoInitialConfigure(Duration),
+
+    #[error("compositor doesn't advertise wp_color_manager_v1 (required for HDR mode)")]
+    NoColorManager,
+
+    #[error(
+        "compositor rejected our PQ image description: {0} \
+         (typically means the compositor doesn't support the requested TF or primaries)"
+    )]
+    DescriptionFailed(String),
+
+    #[error("image description never went ready within {0:?}")]
+    NoDescriptionReady(Duration),
+
+    #[error("set_nits called on an SDR patch — use set_color or open_hdr instead")]
+    NotHdrMode,
 }
 
 /// A layer-shell surface fixed on a chosen output, holding a solid color.
@@ -86,12 +133,27 @@ pub struct PatchSurface {
 }
 
 impl PatchSurface {
-    /// Open a connection to the Wayland display, find an output matching
-    /// `output_name`, and create a fullscreen layer-shell surface on it.
-    ///
-    /// `output_name` matches against the output's `name` (e.g. `"DP-1"`,
-    /// `"HDMI-A-2"`). Use [`list_outputs`] to enumerate.
+    /// SDR convenience — see [`Self::open_with_mode`] for the full
+    /// API. Equivalent to opening in SDR mode.
     pub fn open(output_name: &str) -> Result<Self, Error> {
+        Self::open_with_mode(output_name, None)
+    }
+
+    /// HDR convenience — opens in HDR mode with the given PQ
+    /// mastering description params. The compositor must advertise
+    /// `wp_color_manager_v1` and `wl_shm` Xbgr16161616f, otherwise
+    /// `Error::NoColorManager` / a shm format mismatch is returned.
+    pub fn open_hdr(output_name: &str, params: PqDescriptionParams) -> Result<Self, Error> {
+        Self::open_with_mode(output_name, Some(params))
+    }
+
+    /// Full constructor. `hdr_params = Some(_)` puts the patch in
+    /// HDR mode (fp16 buffers + wp_color_management description);
+    /// `None` keeps the historical 8-bit SDR path.
+    pub fn open_with_mode(
+        output_name: &str,
+        hdr_params: Option<PqDescriptionParams>,
+    ) -> Result<Self, Error> {
         let conn = Connection::connect_to_env()?;
         let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)?;
         let qh = event_queue.handle();
@@ -104,6 +166,23 @@ impl PatchSurface {
             LayerShell::bind(&globals, &qh).map_err(|_| Error::NoLayerShell)?;
         let shm = Shm::bind(&globals, &qh).map_err(Error::Bind)?;
 
+        // Optional bind: wp_color_manager_v1. Always try; we only
+        // error out if HDR mode was requested AND the bind failed.
+        // SCTK doesn't manage this global so we go through the raw
+        // globals list directly.
+        let color_manager = globals
+            .bind::<WpColorManagerV1, _, _>(&qh, 1..=2, ())
+            .ok();
+        if hdr_params.is_some() && color_manager.is_none() {
+            return Err(Error::NoColorManager);
+        }
+
+        let initial_content = if hdr_params.is_some() {
+            PatchContent::HdrPqNits([0.0, 0.0, 0.0])
+        } else {
+            PatchContent::Sdr(0xFF_00_00_00)
+        };
+
         let mut state = AppState {
             registry_state,
             output_state,
@@ -112,10 +191,13 @@ impl PatchSurface {
             shm,
             pool: None,
             surface_state: SurfaceState::WaitingForOutputs,
-            current_color_argb: 0xFF_00_00_00,
+            current_content: initial_content,
             current_width: PATCH_WIDTH,
             current_height: PATCH_HEIGHT,
             redraw_pending: true,
+            color_manager,
+            color_managed: None,
+            hdr_params,
         };
 
         // Pump events until OutputState has enumerated all outputs, so we
@@ -127,8 +209,10 @@ impl PatchSurface {
         // Pick the matching output.
         let wl_output = pick_output(&state.output_state, output_name)?;
 
-        // Create the SHM pool now that we know we have a buffer to back.
-        let pool_size = (PATCH_WIDTH * PATCH_HEIGHT * 4) as usize * 2; // double-buffer
+        // Pool size depends on bytes-per-pixel. fp16 buffers are 2×
+        // the SDR size.
+        let bpp = if hdr_params.is_some() { 8 } else { 4 };
+        let pool_size = (PATCH_WIDTH * PATCH_HEIGHT * bpp) as usize * 2; // double-buffer
         let pool = SlotPool::new(pool_size, &state.shm)?;
         state.pool = Some(pool);
 
@@ -164,6 +248,41 @@ impl PatchSurface {
             event_queue.blocking_dispatch(&mut state)?;
         }
 
+        // HDR mode: build + attach the PQ image description now that
+        // the surface exists. Wait for ready/failed.
+        if let (Some(params), Some(manager)) =
+            (state.hdr_params, state.color_manager.clone())
+        {
+            let SurfaceState::Configured(layer_surface) = &state.surface_state else {
+                unreachable!("just waited for Configured above")
+            };
+            let wl_surface = layer_surface.wl_surface().clone();
+            let cm =
+                ColorManagedSurface::attach(manager, &qh, &wl_surface, params);
+            state.color_managed = Some(cm);
+            // Flush + roundtrip to send create + set requests and
+            // pick up ready/failed.
+            event_queue.roundtrip(&mut state)?;
+            let ready_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let snapshot =
+                    state.color_managed.as_ref().unwrap().state();
+                match snapshot {
+                    DescriptionState::Ready { .. } => break,
+                    DescriptionState::Failed { reason } => {
+                        return Err(Error::DescriptionFailed(reason));
+                    }
+                    DescriptionState::Pending => {}
+                }
+                if Instant::now() >= ready_deadline {
+                    return Err(Error::NoDescriptionReady(
+                        Duration::from_secs(1),
+                    ));
+                }
+                event_queue.blocking_dispatch(&mut state)?;
+            }
+        }
+
         Ok(Self {
             conn,
             state,
@@ -171,17 +290,54 @@ impl PatchSurface {
         })
     }
 
-    /// Set the patch color (linear-or-encoded RGB in `0..=1`). The bytes
-    /// written into the SHM buffer are XRGB8888 with each channel scaled to
-    /// `0..=255` and clamped; what the display does with them is up to the
-    /// compositor (today: niri = pass-through sRGB).
+    /// Set the patch color (linear-or-encoded RGB in `0..=1`).
+    ///
+    /// SDR mode: bytes written are XRGB8888 with each channel scaled
+    /// to `0..=255`; the compositor treats them as sRGB.
+    ///
+    /// HDR mode: the `0..=1` value is interpreted as a luminance
+    /// fraction of `mastering_max_lum` (i.e. `1.0` = panel peak).
+    /// Use [`Self::set_nits`] if you want to specify absolute cd/m²
+    /// directly — more natural for HDR calibration where you're
+    /// targeting specific luminance levels.
     pub fn set_color(&mut self, rgb: [f64; 3]) -> Result<(), Error> {
-        let r = (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u32;
-        let g = (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u32;
-        let b = (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u32;
-        self.state.current_color_argb = 0xFF_00_00_00 | (r << 16) | (g << 8) | b;
+        match self.state.current_content {
+            PatchContent::Sdr(_) => {
+                let r = (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u32;
+                let g = (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u32;
+                let b = (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u32;
+                self.state.current_content =
+                    PatchContent::Sdr(0xFF_00_00_00 | (r << 16) | (g << 8) | b);
+            }
+            PatchContent::HdrPqNits(_) => {
+                let peak = self
+                    .state
+                    .hdr_params
+                    .expect("hdr_params set whenever HDR content active")
+                    .mastering_max_lum as f64;
+                self.state.current_content = PatchContent::HdrPqNits([
+                    rgb[0].clamp(0.0, 1.0) * peak,
+                    rgb[1].clamp(0.0, 1.0) * peak,
+                    rgb[2].clamp(0.0, 1.0) * peak,
+                ]);
+            }
+        }
         self.state.redraw_pending = true;
+        self.redraw_and_settle(Duration::from_millis(50))
+    }
 
+    /// HDR-mode patch luminance, in absolute cd/m² per channel.
+    /// Returns [`Error::NotHdrMode`] if the patch was opened SDR.
+    /// Values are clamped to [0, 10000] (the PQ EOTF's domain);
+    /// >mastering_max_lum is allowed by the protocol (it's what
+    /// `extended_target_volume` is about), but in practice the panel
+    /// will hard-clip to its own peak.
+    pub fn set_nits(&mut self, rgb_nits: [f64; 3]) -> Result<(), Error> {
+        if !matches!(self.state.current_content, PatchContent::HdrPqNits(_)) {
+            return Err(Error::NotHdrMode);
+        }
+        self.state.current_content = PatchContent::HdrPqNits(rgb_nits);
+        self.state.redraw_pending = true;
         self.redraw_and_settle(Duration::from_millis(50))
     }
 
@@ -228,10 +384,13 @@ pub fn list_outputs() -> Result<Vec<OutputDescription>, Error> {
         shm: Shm::bind(&globals, &qh).map_err(Error::Bind)?,
         pool: None,
         surface_state: SurfaceState::WaitingForOutputs,
-        current_color_argb: 0,
+        current_content: PatchContent::Sdr(0),
         current_width: PATCH_WIDTH,
         current_height: PATCH_HEIGHT,
         redraw_pending: false,
+        color_manager: None,
+        color_managed: None,
+        hdr_params: None,
     };
     event_queue.roundtrip(&mut state)?;
     event_queue.roundtrip(&mut state)?;
@@ -290,6 +449,20 @@ enum SurfaceState {
     Configured(LayerSurface),
 }
 
+/// What the patch holds — either an SDR XRGB8888 color or HDR
+/// fp16 PQ-encoded per-channel nits.
+#[derive(Clone, Copy, Debug)]
+enum PatchContent {
+    /// 8-bit XRGB packed little-endian; AppState.draw writes one
+    /// u32 per pixel.
+    Sdr(u32),
+    /// Per-channel luminance in cd/m². AppState.draw forward-PQ
+    /// encodes + writes IEEE 754 binary16 (4 channels: R, G, B,
+    /// alpha=1.0 — the buffer format is alpha-undefined but writing
+    /// 1.0 gives a sane value if the compositor ever samples it).
+    HdrPqNits([f64; 3]),
+}
+
 struct AppState {
     registry_state: RegistryState,
     output_state: OutputState,
@@ -298,10 +471,22 @@ struct AppState {
     shm: Shm,
     pool: Option<SlotPool>,
     surface_state: SurfaceState,
-    current_color_argb: u32,
+    current_content: PatchContent,
     current_width: u32,
     current_height: u32,
     redraw_pending: bool,
+    /// Bound `wp_color_manager_v1` global, captured at registry
+    /// init. `None` for SDR-only mode or when the compositor doesn't
+    /// advertise the protocol.
+    color_manager: Option<WpColorManagerV1>,
+    /// `Some` once an HDR description is attached to the surface.
+    /// Kept alive for the lifetime of the surface (drop sends the
+    /// destructor + unset).
+    color_managed: Option<ColorManagedSurface>,
+    /// HDR mastering params if open_hdr was used. Set up at
+    /// construction; reused when the surface is rebuilt (today we
+    /// don't, but future configure handling might).
+    hdr_params: Option<PqDescriptionParams>,
 }
 
 impl AppState {
@@ -314,20 +499,47 @@ impl AppState {
         };
         let width = self.current_width as i32;
         let height = self.current_height as i32;
-        let stride = width * 4;
 
-        let (buffer, canvas) = pool.create_buffer(
-            width,
-            height,
-            stride,
-            wl_shm::Format::Xrgb8888,
-        )?;
-
-        // Fill with our color (XRGB8888, little-endian native u32).
-        let color = self.current_color_argb.to_le_bytes();
-        for px in canvas.chunks_exact_mut(4) {
-            px.copy_from_slice(&color);
-        }
+        let (buffer, _) = match self.current_content {
+            PatchContent::Sdr(argb) => {
+                let stride = width * 4;
+                let (buffer, canvas) = pool.create_buffer(
+                    width,
+                    height,
+                    stride,
+                    wl_shm::Format::Xrgb8888,
+                )?;
+                let color = argb.to_le_bytes();
+                for px in canvas.chunks_exact_mut(4) {
+                    px.copy_from_slice(&color);
+                }
+                (buffer, ())
+            }
+            PatchContent::HdrPqNits(rgb_nits) => {
+                let stride = width * 8;
+                let (buffer, canvas) = pool.create_buffer(
+                    width,
+                    height,
+                    stride,
+                    wl_shm::Format::Xbgr16161616f,
+                )?;
+                // PQ-encode + half-float each channel once; replicate
+                // for every pixel. Xbgr16161616f memory layout is
+                // [R, G, B, X] half-floats little-endian.
+                let pq = crate::pq::nits_triple_to_pq(rgb_nits);
+                let r = half::f16::from_f64(pq[0]).to_le_bytes();
+                let g = half::f16::from_f64(pq[1]).to_le_bytes();
+                let b = half::f16::from_f64(pq[2]).to_le_bytes();
+                // Alpha undefined for Xbgr; write 1.0 so a stray
+                // sampler doesn't see noise.
+                let a = half::f16::from_f64(1.0).to_le_bytes();
+                let pixel: [u8; 8] = [r[0], r[1], g[0], g[1], b[0], b[1], a[0], a[1]];
+                for px in canvas.chunks_exact_mut(8) {
+                    px.copy_from_slice(&pixel);
+                }
+                (buffer, ())
+            }
+        };
 
         let wl_surface = layer_surface.wl_surface();
         wl_surface.set_buffer_scale(1);
@@ -470,3 +682,64 @@ delegate_output!(AppState);
 delegate_shm!(AppState);
 delegate_layer!(AppState);
 delegate_registry!(AppState);
+
+// ─── wp_color_management_v1 client-side dispatch ──────────────────────────
+//
+// SCTK doesn't ship a handler for these so we wire the four
+// interfaces by hand. The manager + surface + creator dispatches are
+// stateless (just ignore supported_* + ack destructors); the
+// description dispatch updates the shared DescriptionState Mutex so
+// open_with_mode can poll ready/failed after the create round-trip.
+
+impl Dispatch<WpColorManagerV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpColorManagerV1,
+        event: <WpColorManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        crate::color_mgmt::handle_manager_event(event);
+    }
+}
+
+impl Dispatch<WpImageDescriptionCreatorParamsV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpImageDescriptionCreatorParamsV1,
+        _event: <WpImageDescriptionCreatorParamsV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // Creator interface has no events.
+    }
+}
+
+impl Dispatch<WpImageDescriptionV1, Arc<Mutex<DescriptionState>>> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpImageDescriptionV1,
+        event: <WpImageDescriptionV1 as wayland_client::Proxy>::Event,
+        data: &Arc<Mutex<DescriptionState>>,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        crate::color_mgmt::handle_description_event(event, data);
+        let _ = WEnum::<()>::Unknown; // silence unused import in -D warnings build
+    }
+}
+
+impl Dispatch<WpColorManagementSurfaceV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpColorManagementSurfaceV1,
+        _event: <WpColorManagementSurfaceV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // Surface extension has no events.
+    }
+}

@@ -55,6 +55,12 @@ fn print_usage() {
     eprintln!("          --grey-steps N       grayscale ramp size (default: 11)");
     eprintln!("          --prep-secs N        seconds to wait for puck placement (default: 6)");
     eprintln!("          --settle-ms N        ms to wait after each color change (default: 250)");
+    eprintln!("          --hdr                run an HDR PQ sweep (fp16 + wp_color_management_v1);");
+    eprintln!("                               patch values are absolute cd/m². Requires a compositor");
+    eprintln!("                               that advertises both (e.g. prism).");
+    eprintln!("          --peak-nits N        HDR mastering peak luminance, cd/m² (default: 400)");
+    eprintln!("          --max-cll N          HDR max content light level, cd/m² (default: peak)");
+    eprintln!("          --max-fall N         HDR max frame-average light, cd/m² (default: peak/2)");
     eprintln!("  analyze FILE.csv [FILE.csv ...]");
     eprintln!("        Summarize one sweep (detailed) or compare several (table + ΔuV matrix).");
 }
@@ -137,24 +143,72 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(250);
 
-    // Build the color set:
-    //   - grayscale ramp (0..1 in N steps)
-    //   - R/G/B ramps (4 steps each, 0.25 / 0.50 / 0.75 / 1.00)
-    //   - extra: pure white and pure black bookends are already in greys
+    // HDR mode: write PQ-encoded fp16 patches via the compositor's
+    // wp_color_management_v1 protocol. Requires prism (or any
+    // compositor advertising the protocol + fp16 shm formats).
+    // Patches are specified in absolute cd/m²; CSV r_in/g_in/b_in
+    // columns carry nits values instead of 0..=1.
+    let hdr_mode = args.iter().any(|a| a == "--hdr");
+    let peak_nits: u32 = arg_value(args, "--peak-nits")
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
+    let max_cll: u32 = arg_value(args, "--max-cll")
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(peak_nits);
+    let max_fall: u32 = arg_value(args, "--max-fall")
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(peak_nits / 2);
+
+    // Build the color set. Values are cd/m² when --hdr, else 0..=1.
     let mut patches: Vec<Patch> = Vec::new();
-    for k in 0..grey_steps {
-        let v = k as f64 / (grey_steps - 1) as f64;
-        patches.push(Patch::new(format!("grey_{:03}", (v * 1000.0) as i32), [v, v, v]));
-    }
-    for &v in &[0.25, 0.5, 0.75, 1.0] {
-        patches.push(Patch::new(format!("red_{:03}", (v * 1000.0) as i32), [v, 0.0, 0.0]));
-        patches.push(Patch::new(format!("grn_{:03}", (v * 1000.0) as i32), [0.0, v, 0.0]));
-        patches.push(Patch::new(format!("blu_{:03}", (v * 1000.0) as i32), [0.0, 0.0, v]));
+    if hdr_mode {
+        // Grayscale ramp at perceptually-meaningful nits levels.
+        // Skew low — PQ packs most of its precision into the dark
+        // range, so verification is most interesting there.
+        let nits_steps: Vec<f64> = if grey_steps == 11 {
+            vec![0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 150.0, 200.0, 300.0,
+                 peak_nits as f64]
+        } else {
+            // Geometric ramp 0.5..peak.
+            let mut v = vec![0.0];
+            let peak = peak_nits as f64;
+            for k in 1..grey_steps {
+                let t = k as f64 / (grey_steps - 1) as f64;
+                v.push(0.5 * (peak / 0.5).powf(t));
+            }
+            v
+        };
+        for nits in nits_steps {
+            patches.push(Patch::new(format!("grey_{:04}n", nits as i32), [nits, nits, nits]));
+        }
+        for &nits in &[50.0, 100.0, 200.0, peak_nits as f64] {
+            patches.push(Patch::new(format!("red_{:04}n", nits as i32), [nits, 0.0, 0.0]));
+            patches.push(Patch::new(format!("grn_{:04}n", nits as i32), [0.0, nits, 0.0]));
+            patches.push(Patch::new(format!("blu_{:04}n", nits as i32), [0.0, 0.0, nits]));
+        }
+    } else {
+        for k in 0..grey_steps {
+            let v = k as f64 / (grey_steps - 1) as f64;
+            patches.push(Patch::new(format!("grey_{:03}", (v * 1000.0) as i32), [v, v, v]));
+        }
+        for &v in &[0.25, 0.5, 0.75, 1.0] {
+            patches.push(Patch::new(format!("red_{:03}", (v * 1000.0) as i32), [v, 0.0, 0.0]));
+            patches.push(Patch::new(format!("grn_{:03}", (v * 1000.0) as i32), [0.0, v, 0.0]));
+            patches.push(Patch::new(format!("blu_{:03}", (v * 1000.0) as i32), [0.0, 0.0, v]));
+        }
     }
 
     eprintln!(
-        "sweep: output={}, cal={}, {} patches, settle {}ms, csv -> {}",
-        output, cal_index, patches.len(), settle_ms, out_path.display()
+        "sweep: output={}, mode={}, cal={}, {} patches, settle {}ms, csv -> {}",
+        output,
+        if hdr_mode { "HDR PQ" } else { "SDR sRGB" },
+        cal_index,
+        patches.len(),
+        settle_ms,
+        out_path.display()
     );
 
     // Open device + display surface up front so we fail fast if either is broken.
@@ -170,10 +224,25 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
         cal_index, cal.gain, cal.offset
     );
 
-    let mut patch_surface = PatchSurface::open(&output)?;
+    let mut patch_surface = if hdr_mode {
+        use spyder_display::PqDescriptionParams;
+        let params = PqDescriptionParams {
+            mastering_min_lum_ticks: 5, // 0.0005 cd/m² — OLED black
+            mastering_max_lum: peak_nits,
+            max_cll,
+            max_fall,
+        };
+        PatchSurface::open_hdr(&output, params)?
+    } else {
+        PatchSurface::open(&output)?
+    };
 
     // Initial dark patch so the user knows where to put the puck.
-    patch_surface.set_color([0.0, 0.0, 0.0])?;
+    if hdr_mode {
+        patch_surface.set_nits([0.0, 0.0, 0.0])?;
+    } else {
+        patch_surface.set_color([0.0, 0.0, 0.0])?;
+    }
     eprintln!(
         "Place the puck flat against output '{}' now. Sweep starts in {}s.",
         output, prep_secs
@@ -203,7 +272,11 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
             patch.rgb[1],
             patch.rgb[2]
         );
-        patch_surface.set_color(patch.rgb)?;
+        if hdr_mode {
+            patch_surface.set_nits(patch.rgb)?;
+        } else {
+            patch_surface.set_color(patch.rgb)?;
+        }
         std::thread::sleep(settle);
 
         // Take one measurement.
@@ -240,7 +313,11 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     // Black patch on the way out so the panel isn't left glaring.
-    let _ = patch_surface.set_color([0.0, 0.0, 0.0]);
+    if hdr_mode {
+        let _ = patch_surface.set_nits([0.0, 0.0, 0.0]);
+    } else {
+        let _ = patch_surface.set_color([0.0, 0.0, 0.0]);
+    }
 
     eprintln!();
     eprintln!("Done. Peak measured Y = {:.2} cd/m². CSV at {}.", max_y, out_path.display());

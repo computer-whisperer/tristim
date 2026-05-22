@@ -13,6 +13,13 @@ path = "src/lib.rs"
 [dependencies]
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
+# Staging color-management bindings (wp_color_management_v1) — used
+# by the HDR-mode patch path to declare PQ + BT.2020 encoding so the
+# compositor scans buffers out without color transforms. SCTK doesn't
+# ship a high-level wrapper; we drive the protocol directly.
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 thiserror.workspace = true
 memmap2 = "0.9"
 rustix = { version = "0.38", features = ["fs", "mm"] }
+# fp16 encoding for HDR patches (f32 → IEEE 754 binary16).
+half = "2"
