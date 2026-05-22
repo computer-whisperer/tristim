@@ -210,6 +210,7 @@ impl PatchSurface {
             color_managed: None,
             hdr_params,
             window_fraction: 1.0,
+            border_content: None,
         };
 
         // Pump events until OutputState has enumerated all outputs, so we
@@ -377,6 +378,69 @@ impl PatchSurface {
         self.redraw_and_settle(Duration::from_millis(50))
     }
 
+    /// Set the surround colour painted outside the centered window
+    /// when [`set_window_fraction`](Self::set_window_fraction) is
+    /// below 1.0. `rgb` is in 0..=1 (clamped). In HDR mode this is
+    /// scaled to `mastering_max_lum × rgb` cd/m² before PQ encoding
+    /// (parallels [`set_color`](Self::set_color)).
+    ///
+    /// Most useful as an **anti-CABL** measure: panels that gate the
+    /// backlight off below some frame-average brightness threshold
+    /// will render low-intensity centred patches as black if the
+    /// surround is also black. A modest border value (e.g. 0.1–0.2
+    /// in SDR / ~50 cd/m² in HDR) keeps average frame brightness
+    /// above the threshold without contaminating the colorimeter's
+    /// view of the central patch.
+    ///
+    /// Persists across subsequent `set_color` / `set_nits` calls
+    /// until cleared (`clear_border`) or overwritten.
+    pub fn set_border_color(&mut self, rgb: [f64; 3]) -> Result<(), Error> {
+        let content = match self.state.current_content {
+            PatchContent::Sdr(_) => {
+                let r = (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u32;
+                let g = (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u32;
+                let b = (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u32;
+                PatchContent::Sdr(0xFF_00_00_00 | (r << 16) | (g << 8) | b)
+            }
+            PatchContent::HdrPqNits(_) => {
+                let peak = self
+                    .state
+                    .hdr_params
+                    .expect("hdr_params set whenever HDR content active")
+                    .mastering_max_lum as f64;
+                PatchContent::HdrPqNits([
+                    rgb[0].clamp(0.0, 1.0) * peak,
+                    rgb[1].clamp(0.0, 1.0) * peak,
+                    rgb[2].clamp(0.0, 1.0) * peak,
+                ])
+            }
+        };
+        self.state.border_content = Some(content);
+        self.state.redraw_pending = true;
+        self.redraw_and_settle(Duration::from_millis(50))
+    }
+
+    /// HDR-mode border luminance, in absolute cd/m² per channel.
+    /// Returns [`Error::NotHdrMode`] if the patch was opened SDR
+    /// (call [`set_border_color`](Self::set_border_color) instead).
+    /// See [`set_border_color`](Self::set_border_color) for the
+    /// general rationale.
+    pub fn set_border_nits(&mut self, rgb_nits: [f64; 3]) -> Result<(), Error> {
+        if !matches!(self.state.current_content, PatchContent::HdrPqNits(_)) {
+            return Err(Error::NotHdrMode);
+        }
+        self.state.border_content = Some(PatchContent::HdrPqNits(rgb_nits));
+        self.state.redraw_pending = true;
+        self.redraw_and_settle(Duration::from_millis(50))
+    }
+
+    /// Revert the surround to the legacy black default.
+    pub fn clear_border(&mut self) -> Result<(), Error> {
+        self.state.border_content = None;
+        self.state.redraw_pending = true;
+        self.redraw_and_settle(Duration::from_millis(50))
+    }
+
     /// Block until the buffer is on screen (via frame callback), with a
     /// fudge factor for monitor scan-out latency. ~50 ms is enough for any
     /// modern panel + compositor combo to have actually transitioned to the
@@ -428,6 +492,7 @@ pub fn list_outputs() -> Result<Vec<OutputDescription>, Error> {
         color_managed: None,
         hdr_params: None,
         window_fraction: 1.0,
+        border_content: None,
     };
     event_queue.roundtrip(&mut state)?;
     event_queue.roundtrip(&mut state)?;
@@ -525,9 +590,17 @@ struct AppState {
     /// don't, but future configure handling might).
     hdr_params: Option<PqDescriptionParams>,
     /// Centered-window area fraction. 1.0 = fullscreen (no black
-    /// border). <1.0 → black surround + centered window of the patch
-    /// color, sized so the window covers `sqrt(f)` of each axis.
+    /// border). <1.0 → surround of `border_content` (or black if
+    /// unset) + centered window of the patch color, sized so the
+    /// window covers `sqrt(f)` of each axis.
     window_fraction: f64,
+    /// Surround colour when `window_fraction < 1.0`. `None` = legacy
+    /// black surround (`#000000` SDR / 0 nits HDR). `Some(...)` paints
+    /// the chosen colour everywhere outside the centered window —
+    /// useful when the panel does content-adaptive backlight dimming
+    /// and would otherwise gate the backlight off during low-intensity
+    /// measurements, killing dim patch measurements.
+    border_content: Option<PatchContent>,
 }
 
 /// Compute a centered window rect covering `fraction` of the surface
@@ -645,8 +718,12 @@ impl AppState {
                     stride,
                     wl_shm::Format::Xrgb8888,
                 )?;
-                // Background = opaque black; foreground = caller's color.
-                let bg: [u8; 4] = 0xFF_00_00_00u32.to_le_bytes();
+                // Background = configured border colour, falling back to
+                // opaque black for the legacy unset case.
+                let bg: [u8; 4] = match self.border_content {
+                    Some(PatchContent::Sdr(b)) => b.to_le_bytes(),
+                    _ => 0xFF_00_00_00u32.to_le_bytes(),
+                };
                 let fg: [u8; 4] = argb.to_le_bytes();
                 fill_window_4bpp(canvas, width, &bg, &fg, win_x, win_y, win_w, win_h);
                 (buffer, ())
@@ -660,9 +737,13 @@ impl AppState {
                     wl_shm::Format::Xbgr16161616f,
                 )?;
                 // Xbgr16161616f memory layout is [R, G, B, X] half-floats
-                // little-endian. Background = PQ-encoded 0 nits (panel's
-                // floor); foreground = caller's PQ-encoded nits.
-                let bg = hdr_pixel([0.0, 0.0, 0.0]);
+                // little-endian. Background = configured border luminance,
+                // falling back to PQ-encoded 0 nits for the legacy
+                // unset case (the panel's floor).
+                let bg = match self.border_content {
+                    Some(PatchContent::HdrPqNits(border_nits)) => hdr_pixel(border_nits),
+                    _ => hdr_pixel([0.0, 0.0, 0.0]),
+                };
                 let fg = hdr_pixel(rgb_nits);
                 fill_window_8bpp(canvas, width, &bg, &fg, win_x, win_y, win_w, win_h);
                 (buffer, ())
