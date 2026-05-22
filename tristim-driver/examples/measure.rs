@@ -1,21 +1,21 @@
 //! Take one XYZ measurement. Hold the colorimeter against any patch on screen
 //! and watch the numbers.
 
-use spyder_driver::Spyder;
+use tristim_driver::Colorimeter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut spyder = Spyder::open_any()?;
-    let info = spyder.get_info()?;
+    let mut device = Colorimeter::open_any()?;
+    let info = device.get_info()?;
     println!(
         "Spyder {} (HW {}.{:02}, SN {})",
-        if spyder.is_spyder_2024() { "2024" } else { "X2" },
+        if device.is_spyder_2024() { "2024" } else { "X2" },
         info.hw_version.0,
         info.hw_version.1,
         info.serial,
     );
 
     println!("Taking one measurement (cal index 0)... hold the puck against a bright patch.");
-    let (xyz, raw, cal, setup) = spyder.measure_xyz(0)?;
+    let (xyz, raw, cal, setup) = device.measure_xyz(0)?;
 
     println!("\nRaw 6-channel sensor counts: {:?}", raw.0);
     println!("Black-cal (subtracted before matrix): {:?}", setup.s5);

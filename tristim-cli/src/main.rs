@@ -1,19 +1,19 @@
-//! `spyder` — orchestrate the Spyder colorimeter + a Wayland test-patch
-//! surface to characterize displays.
+//! `tristim` — orchestrate a Datacolor Spyder colorimeter + a Wayland
+//! test-patch surface to characterize displays.
 //!
 //! Subcommands:
-//!   spyder list-outputs                          enumerate connected outputs
-//!   spyder info                                  open the spyder, print HW info
-//!   spyder measure [--cal N]                     take one XYZ measurement
-//!                                                (puck must be aimed manually)
-//!   spyder sweep --output NAME [opts]            walk a color set on NAME,
-//!                                                measure each, write CSV
-//!   spyder analyze FILE.csv [FILE.csv ...]       summarize sweep(s)
+//!   tristim list-outputs                          enumerate connected outputs
+//!   tristim info                                  open the colorimeter, print HW info
+//!   tristim measure [--cal N]                     take one XYZ measurement
+//!                                                 (puck must be aimed manually)
+//!   tristim sweep --output NAME [opts]            walk a color set on NAME,
+//!                                                 measure each, write CSV
+//!   tristim analyze FILE.csv [FILE.csv ...]       summarize sweep(s)
 
 mod analyze;
 
-use spyder_display::{list_outputs, PatchSurface};
-use spyder_driver::Spyder;
+use tristim_display::{PatchSurface, list_outputs};
+use tristim_driver::Colorimeter;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -43,10 +43,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn print_usage() {
-    eprintln!("USAGE: spyder <subcommand> [opts]");
+    eprintln!("USAGE: tristim <subcommand> [opts]");
     eprintln!();
     eprintln!("  list-outputs              enumerate Wayland outputs");
-    eprintln!("  info                      open the Spyder, print HW info");
+    eprintln!("  info                      open the colorimeter, print HW info");
     eprintln!("  measure [--cal N]         take one XYZ measurement (aim puck manually)");
     eprintln!("  sweep --output NAME [opts]");
     eprintln!("        Walk a color set on NAME, measuring each. Options:");
@@ -85,16 +85,16 @@ fn cmd_list_outputs() -> Result<(), Box<dyn Error>> {
 }
 
 fn cmd_info() -> Result<(), Box<dyn Error>> {
-    let mut spyder = Spyder::open_any()?;
-    let info = spyder.get_info()?;
+    let mut device = Colorimeter::open_any()?;
+    let info = device.get_info()?;
     println!(
         "{} (PID 0x{:04x}) — HW {}.{:02} — SN {}",
-        if spyder.is_spyder_2024() {
+        if device.is_spyder_2024() {
             "Spyder 2024"
         } else {
             "SpyderX2"
         },
-        spyder.pid(),
+        device.pid(),
         info.hw_version.0,
         info.hw_version.1,
         info.serial,
@@ -109,15 +109,15 @@ fn cmd_measure(args: &[String]) -> Result<(), Box<dyn Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let mut spyder = Spyder::open_any()?;
-    let info = spyder.get_info()?;
+    let mut device = Colorimeter::open_any()?;
+    let info = device.get_info()?;
     println!(
         "Spyder 2024 SN {} — HW {}.{:02}",
         info.serial, info.hw_version.0, info.hw_version.1
     );
 
     println!("Measuring (cal {})... aim the puck.", cal);
-    let (xyz, raw, _, _) = spyder.measure_xyz(cal)?;
+    let (xyz, raw, _, _) = device.measure_xyz(cal)?;
     println!("Raw  : {:?}", raw.0);
     println!("X={:.4}  Y={:.4} cd/m²  Z={:.4}", xyz.x, xyz.y, xyz.z);
     if let Some((x, y)) = xyz.chromaticity() {
@@ -128,7 +128,7 @@ fn cmd_measure(args: &[String]) -> Result<(), Box<dyn Error>> {
 
 fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
     let output = arg_value(args, "--output")
-        .ok_or("--output NAME is required (try `spyder list-outputs`)")?;
+        .ok_or("--output NAME is required (try `tristim list-outputs`)")?;
     let out_path: PathBuf = arg_value(args, "--out").map(PathBuf::from).unwrap_or_else(|| "sweep.csv".into());
     let cal_index: u8 = arg_value(args, "--cal")
         .as_deref()
@@ -228,20 +228,20 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
     );
 
     // Open device + display surface up front so we fail fast if either is broken.
-    let mut spyder = Spyder::open_any()?;
-    let info = spyder.get_info()?;
+    let mut device = Colorimeter::open_any()?;
+    let info = device.get_info()?;
     eprintln!("Spyder SN {} HW {}.{:02}", info.serial, info.hw_version.0, info.hw_version.1);
 
     // Pre-fetch calibration + setup once. (We re-fetch setup before each
     // measure inside the driver, but downloading the cal matrix is slow.)
-    let cal = spyder.get_calibration(cal_index)?;
+    let cal = device.get_calibration(cal_index)?;
     eprintln!(
         "cal[{}] downloaded: gain={:?}, offset={:?}",
         cal_index, cal.gain, cal.offset
     );
 
     let mut patch_surface = if hdr_mode {
-        use spyder_display::PqDescriptionParams;
+        use tristim_display::PqDescriptionParams;
         let params = PqDescriptionParams {
             mastering_min_lum_ticks: 5, // 0.0005 cd/m² — OLED black
             mastering_max_lum: peak_nits,
@@ -297,9 +297,9 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
         std::thread::sleep(settle);
 
         // Take one measurement.
-        let setup = spyder.get_setup(&cal)?;
-        let raw = spyder.measure_raw(&setup)?;
-        let xyz = spyder_driver::measurement::raw_to_xyz(&raw, &setup, &cal);
+        let setup = device.get_setup(&cal)?;
+        let raw = device.measure_raw(&setup)?;
+        let xyz = tristim_driver::measurement::raw_to_xyz(&raw, &setup, &cal);
         let chroma = xyz.chromaticity().unwrap_or((0.0, 0.0));
 
         eprintln!(

@@ -1,11 +1,11 @@
 [package]
-name = "spyder-display"
+name = "tristim-display"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Wayland layer-shell client for displaying known RGB test patches on a chosen output, for color measurement with spyder-driver."
+description = "Wayland layer-shell client for displaying known RGB test patches on a chosen output, paired with tristim-driver for closed-loop colorimeter measurement."
 
 [lib]
 path = "src/lib.rs"

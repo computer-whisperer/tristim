@@ -1,0 +1,16 @@
+[package]
+name = "tristim-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Orchestrator CLI for tristim-driver + tristim-display: probe / measure / sweep / characterize."
+
+[[bin]]
+name = "tristim"
+path = "src/main.rs"
+
+[dependencies]
+tristim-driver = { path = "../tristim-driver" }
+tristim-display = { path = "../tristim-display" }

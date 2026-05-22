@@ -1,10 +1,10 @@
-//! High-level device handle for the Spyder.
+//! High-level handle for an open Datacolor Spyder colorimeter.
 
 use crate::measurement::{
     self, Calibration, RawMeasurement, Setup, Xyz, encode_measure_request,
     parse_calibration, parse_raw_measurement, parse_setup,
 };
-use crate::protocol::{EP_IN, EP_OUT, HEADER_LEN, Opcode, SPYDER_VID, pid};
+use crate::protocol::{DATACOLOR_VID, EP_IN, EP_OUT, HEADER_LEN, Opcode, pid};
 use rusb::{Context, DeviceHandle, UsbContext};
 use std::thread;
 use std::time::Duration;
@@ -18,7 +18,7 @@ pub enum Error {
     #[error("USB I/O: {0}")]
     Usb(#[from] rusb::Error),
 
-    #[error("no Spyder device found (looked for VID 0x{0:04x})")]
+    #[error("no Datacolor colorimeter found (looked for VID 0x{0:04x})")]
     NotFound(u16),
 
     #[error("short write: sent {sent}, expected {expected}")]
@@ -66,12 +66,12 @@ pub struct DeviceInfo {
 }
 
 /// An opened SpyderX2-family colorimeter (covers SpyderX2 and Spyder 2024).
-pub struct Spyder {
+pub struct Colorimeter {
     handle: DeviceHandle<Context>,
     pid: u16,
 }
 
-impl Spyder {
+impl Colorimeter {
     /// Find and open the first Spyder-family device on the bus.
     ///
     /// Tries PIDs `SPYDER_2024` (0x0A0B) and `SPYDERX2` (0x0A0A) — both use
@@ -85,7 +85,7 @@ impl Spyder {
 
         for device in devices.iter() {
             let desc = device.device_descriptor()?;
-            if desc.vendor_id() != SPYDER_VID {
+            if desc.vendor_id() != DATACOLOR_VID {
                 continue;
             }
             if !candidates.contains(&desc.product_id()) {
@@ -100,17 +100,17 @@ impl Spyder {
             let _ = handle.set_active_configuration(1);
             handle.claim_interface(INTERFACE)?;
             let _ = handle.set_alternate_setting(INTERFACE, 0);
-            let spyder = Self {
+            let device = Self {
                 handle,
                 pid: desc.product_id(),
             };
             // Vendor-class reset; without it the device receives bulk writes
             // but never replies. See `send_reset()` for details.
-            spyder.send_reset()?;
-            return Ok(spyder);
+            device.send_reset()?;
+            return Ok(device);
         }
 
-        Err(Error::NotFound(SPYDER_VID))
+        Err(Error::NotFound(DATACOLOR_VID))
     }
 
     /// USB product ID of the device we opened.

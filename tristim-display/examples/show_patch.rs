@@ -1,10 +1,10 @@
 //! Show a solid-color patch on a chosen output for N seconds, then exit.
 //!
 //! Usage:
-//!   cargo run -p spyder-display --example show_patch -- --list
-//!   cargo run -p spyder-display --example show_patch -- --output DP-1 --color 1,0.5,0 --secs 5
+//!   cargo run -p tristim-display --example show_patch -- --list
+//!   cargo run -p tristim-display --example show_patch -- --output DP-1 --color 1,0.5,0 --secs 5
 
-use spyder_display::{list_outputs, PatchSurface};
+use tristim_display::{list_outputs, PatchSurface};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

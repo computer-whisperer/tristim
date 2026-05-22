@@ -33,7 +33,7 @@
 //! `bRequest=0x02`, `wValue=2`, `wIndex=0`, no data, then **500 ms sleep**.
 
 /// Datacolor / ColorVision USB vendor ID.
-pub const SPYDER_VID: u16 = 0x085c;
+pub const DATACOLOR_VID: u16 = 0x085c;
 
 /// Known SpyderX-family product IDs.
 pub mod pid {

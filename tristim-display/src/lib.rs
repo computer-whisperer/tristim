@@ -17,19 +17,19 @@
 //! Usage:
 //!
 //! ```no_run
-//! use spyder_display::PatchSurface;
+//! use tristim_display::PatchSurface;
 //! // SDR
 //! let mut patch = PatchSurface::open("DP-1")?;
 //! patch.set_color([1.0, 1.0, 1.0])?;
 //!
 //! // HDR — explicit per-panel mastering params
-//! use spyder_display::{PqDescriptionParams};
+//! use tristim_display::{PqDescriptionParams};
 //! let mut hdr = PatchSurface::open_hdr(
 //!     "DP-4",
 //!     PqDescriptionParams::pg27ucdm_default(),
 //! )?;
 //! hdr.set_nits([100.0, 100.0, 100.0])?;  // 100 cd/m² white
-//! # Ok::<(), spyder_display::Error>(())
+//! # Ok::<(), tristim_display::Error>(())
 //! ```
 //!
 //! The patch is a layer-shell surface anchored to all four edges of the
@@ -234,7 +234,7 @@ impl PatchSurface {
             &qh,
             wl_surface,
             Layer::Overlay,
-            Some("spyder-patch"),
+            Some("tristim-patch"),
             Some(&wl_output),
         );
 

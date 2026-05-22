@@ -1,4 +1,4 @@
-//! Analyze one or more sweep CSVs produced by `spyder sweep`.
+//! Analyze one or more sweep CSVs produced by `tristim sweep`.
 //!
 //! Computes per-panel summary metrics (peak Y, white point + Δuv from D65,
 //! gamma fit, primary chromaticities, gamut area) and a cross-panel
@@ -62,7 +62,7 @@ const SRGB_TRIANGLE_AREA: f64 = 0.1121; // computed from sRGB primaries below
 
 pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        eprintln!("USAGE: spyder analyze FILE.csv [FILE.csv ...]");
+        eprintln!("USAGE: tristim analyze FILE.csv [FILE.csv ...]");
         eprintln!();
         eprintln!("  One file:  detailed per-panel report");
         eprintln!("  Many:      side-by-side table + cross-panel white-point deltas");

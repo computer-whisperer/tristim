@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "spyder-driver",
-    "spyder-display",
-    "spyder-cli",
+    "tristim-driver",
+    "tristim-display",
+    "tristim-cli",
 ]
 
 [workspace.package]
@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/christian/spyder"
+repository = "https://github.com/computer-whisperer/tristim"
 
 [workspace.dependencies]
 rusb = "0.9"

@@ -11,6 +11,6 @@ pub mod device;
 pub mod measurement;
 pub mod protocol;
 
-pub use device::{DeviceInfo, Spyder};
+pub use device::{Colorimeter, DeviceInfo};
 pub use measurement::{Calibration, RawMeasurement, Setup, Xyz};
-pub use protocol::{Opcode, SPYDER_VID};
+pub use protocol::{DATACOLOR_VID, Opcode};

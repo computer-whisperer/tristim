@@ -61,15 +61,15 @@ All under `/home/christian/workspace/spyder/refs/argyll-3.5.0/spectro/`:
 
 ## Where the Rust driver stands
 
-- `spyder-driver/src/protocol.rs` — opcode constants + wire-format docs
-- `spyder-driver/src/device.rs` — `Spyder` handle with `open_any()`, `command()`, `get_info()`. ~280 LOC.
-- `spyder-driver/examples/probe.rs` — proof-of-life, dumps info and calibration matrix raw bytes
+- `tristim-driver/src/protocol.rs` — opcode constants + wire-format docs
+- `tristim-driver/src/device.rs` — `Colorimeter` handle with `open_any()`, `command()`, `get_info()`. ~280 LOC.
+- `tristim-driver/examples/probe.rs` — proof-of-life, dumps info and calibration matrix raw bytes
 
-## Next steps (no longer blocked)
+## Historic next-steps list (kept for reference; all completed)
 
-1. **Parse `0xF6` reply into a calibration matrix.** The 108 bytes include floats (visible `3e c7 87 3c` = 0x3c87c73e in little-endian = ~0.0166 as IEEE 754 — looks like big-endian f32 in the wire). See `spydX2_getCalibration()` for the exact field layout.
-2. **Parse `0xF7` reply into setup parameters** (gain, integration time, black-cal trim values).
-3. **Implement `measure()` using `0xF2`**: send setup params, read raw sensor counts.
-4. **Convert raw → XYZ** using the calibration matrix.
-5. **Write `spyder-display`**: layer-shell Wayland client to put a known RGB patch on a chosen output.
-6. **Write `spyder-cli`**: orchestrate `characterize` (patch series), `profile` (fit model), `verify`.
+1. ~~Parse `0xF6` reply into a calibration matrix.~~ Done — `tristim_driver::measurement::parse_calibration`.
+2. ~~Parse `0xF7` reply into setup parameters.~~ Done — `parse_setup`.
+3. ~~Implement `measure()` using `0xF2`.~~ Done — `Colorimeter::measure_raw`.
+4. ~~Convert raw → XYZ.~~ Done — `measurement::raw_to_xyz`.
+5. ~~Write `tristim-display`.~~ Done — SDR + HDR PQ via `wp_color_management_v1`, windowed-patch mode.
+6. ~~Write `tristim-cli`.~~ Done — `info` / `measure` / `sweep` / `analyze` subcommands; closed-loop calibration via prism IPC is the current work.

@@ -1,7 +1,7 @@
 # Datacolor Spyder family — grant access to the currently logged-in seat user
 # via systemd-logind's uaccess mechanism (no group membership required).
 #
-# Install: sudo cp 50-spyder.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+# Install: sudo cp 50-tristim.rules /etc/udev/rules.d/ && sudo udevadm control --reload
 # Then unplug + replug the device.
 
 # SpyderExpress / Spyder 2024 (PID 0x0a0b — confirmed on christian's machine)
