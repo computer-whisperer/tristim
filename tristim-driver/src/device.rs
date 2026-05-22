@@ -126,7 +126,14 @@ impl Colorimeter {
     /// Vendor-class reset that the SpyderX2/2024 firmware requires before it
     /// will respond to bulk commands. Mirrors `spydX2_reset()` in ArgyllCMS.
     /// Identical request for SpyderX, X2, and 2024.
-    fn send_reset(&self) -> Result<()> {
+    ///
+    /// Exposed `pub` so callers running tight measurement loops (e.g.
+    /// closed-loop calibrators) can amortize the 500 ms reset cost: reset
+    /// once per batch, then call [`measure_raw_no_reset`](Self::measure_raw_no_reset)
+    /// for each patch. The sensor's dark current is stable enough over
+    /// seconds-long batches that the per-measurement auto-zero Argyll
+    /// performs by default is conservative for short-burst use.
+    pub fn send_reset(&self) -> Result<()> {
         const BM_REQUEST_TYPE: u8 = 0x41;
         const B_REQUEST: u8 = 0x02;
         const W_VALUE: u16 = 2;
@@ -290,6 +297,21 @@ impl Colorimeter {
     pub fn measure_raw(&mut self, setup: &Setup) -> Result<RawMeasurement> {
         // Argyll resets before every measurement (auto-zero behavior).
         self.send_reset()?;
+        self.measure_raw_no_reset(setup)
+    }
+
+    /// Same as [`measure_raw`](Self::measure_raw) but skips the auto-zero
+    /// reset. The caller is responsible for having issued
+    /// [`send_reset`](Self::send_reset) at least once on this `Colorimeter`
+    /// before the first call (otherwise the firmware will not respond to
+    /// bulk commands).
+    ///
+    /// Use this in tight measurement loops where the ~500 ms reset
+    /// dominates wall time — at the cost of skipping dark-current
+    /// refresh between samples. Over a sweep of seconds the drift is
+    /// negligible for emissive measurements above a few cd/m²; for
+    /// near-black or thermally-active sessions, prefer `measure_raw`.
+    pub fn measure_raw_no_reset(&mut self, setup: &Setup) -> Result<RawMeasurement> {
         let send = encode_measure_request(setup);
         // No checksum on the measurement reply per spydX2_Measure (last arg is 0).
         // Bump timeout — integration time alone can be ~720 msec.
