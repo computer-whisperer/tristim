@@ -61,6 +61,10 @@ fn print_usage() {
     eprintln!("          --peak-nits N        HDR mastering peak luminance, cd/m² (default: 400)");
     eprintln!("          --max-cll N          HDR max content light level, cd/m² (default: peak)");
     eprintln!("          --max-fall N         HDR max frame-average light, cd/m² (default: peak/2)");
+    eprintln!("          --window F           centered bright window covering fraction F of");
+    eprintln!("                               output area on a black background (default: 1.0 =");
+    eprintln!("                               fullscreen). Use ~0.04–0.10 to measure OLED peak");
+    eprintln!("                               brightness past ABL.");
     eprintln!("  analyze FILE.csv [FILE.csv ...]");
     eprintln!("        Summarize one sweep (detailed) or compare several (table + ΔuV matrix).");
 }
@@ -161,6 +165,13 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .and_then(|s| s.parse().ok())
         .unwrap_or(peak_nits / 2);
+    // Centered-window fraction: 1.0 = fullscreen (default), <1.0 paints a
+    // smaller bright region on a black surround so the panel's ABL doesn't
+    // throttle high-luminance patches.
+    let window_fraction: f64 = arg_value(args, "--window")
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
 
     // Build the color set. Values are cd/m² when --hdr, else 0..=1.
     let mut patches: Vec<Patch> = Vec::new();
@@ -202,12 +213,17 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     eprintln!(
-        "sweep: output={}, mode={}, cal={}, {} patches, settle {}ms, csv -> {}",
+        "sweep: output={}, mode={}, cal={}, {} patches, settle {}ms, window={}, csv -> {}",
         output,
         if hdr_mode { "HDR PQ" } else { "SDR sRGB" },
         cal_index,
         patches.len(),
         settle_ms,
+        if (window_fraction - 1.0).abs() < 1e-6 {
+            "fullscreen".to_string()
+        } else {
+            format!("{:.1}% area", window_fraction * 100.0)
+        },
         out_path.display()
     );
 
@@ -236,6 +252,7 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
     } else {
         PatchSurface::open(&output)?
     };
+    patch_surface.set_window_fraction(window_fraction)?;
 
     // Initial dark patch so the user knows where to put the puck.
     if hdr_mode {

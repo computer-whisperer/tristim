@@ -36,6 +36,17 @@
 //! chosen output, placed in the `Overlay` layer (above normal windows),
 //! with `exclusive_zone = -1` (does not push other windows around) and no
 //! keyboard interactivity (user can still alt-tab away if needed).
+//!
+//! **Windowed patches**: by default the patch fills the whole output.
+//! For OLEDs and other panels with global power limiters, a 100%-APL
+//! white fill is throttled by the panel's automatic brightness limiter
+//! (ABL) and never reaches the rated peak. Use
+//! [`PatchSurface::set_window_fraction`] to paint a smaller bright
+//! region on a black background — the surface is still fullscreen (so
+//! the rest of the desktop stays hidden during a sweep) but the
+//! emitting area is reduced. Typical values: `0.10` for ~10% APL,
+//! `0.04` for ~4% (close to industry-spec "peak brightness, 4% window"
+//! ratings).
 
 pub mod color_mgmt;
 pub mod pq;
@@ -198,6 +209,7 @@ impl PatchSurface {
             color_manager,
             color_managed: None,
             hdr_params,
+            window_fraction: 1.0,
         };
 
         // Pump events until OutputState has enumerated all outputs, so we
@@ -341,6 +353,30 @@ impl PatchSurface {
         self.redraw_and_settle(Duration::from_millis(50))
     }
 
+    /// Centered-window patch mode: paint a black background everywhere
+    /// except a centered rectangle whose area is `fraction` of the
+    /// surface. `fraction >= 1.0` (default) is equivalent to fullscreen.
+    /// `fraction <= 0.0` is treated as fullscreen too (a zero-size
+    /// window has no useful colorimeter target). The window is sized
+    /// proportionally on each axis (i.e. each axis is scaled by
+    /// `sqrt(fraction)`), keeping the window's aspect ratio equal to
+    /// the surface's.
+    ///
+    /// Use small fractions (~0.04–0.10) to defeat the panel's ABL when
+    /// measuring rated peak luminance on OLEDs. The current patch
+    /// content is repainted with the new layout; no separate
+    /// `set_color`/`set_nits` call needed.
+    pub fn set_window_fraction(&mut self, fraction: f64) -> Result<(), Error> {
+        let f = if fraction.is_finite() && fraction > 0.0 {
+            fraction.min(1.0)
+        } else {
+            1.0
+        };
+        self.state.window_fraction = f;
+        self.state.redraw_pending = true;
+        self.redraw_and_settle(Duration::from_millis(50))
+    }
+
     /// Block until the buffer is on screen (via frame callback), with a
     /// fudge factor for monitor scan-out latency. ~50 ms is enough for any
     /// modern panel + compositor combo to have actually transitioned to the
@@ -391,6 +427,7 @@ pub fn list_outputs() -> Result<Vec<OutputDescription>, Error> {
         color_manager: None,
         color_managed: None,
         hdr_params: None,
+        window_fraction: 1.0,
     };
     event_queue.roundtrip(&mut state)?;
     event_queue.roundtrip(&mut state)?;
@@ -487,6 +524,100 @@ struct AppState {
     /// construction; reused when the surface is rebuilt (today we
     /// don't, but future configure handling might).
     hdr_params: Option<PqDescriptionParams>,
+    /// Centered-window area fraction. 1.0 = fullscreen (no black
+    /// border). <1.0 → black surround + centered window of the patch
+    /// color, sized so the window covers `sqrt(f)` of each axis.
+    window_fraction: f64,
+}
+
+/// Compute a centered window rect covering `fraction` of the surface
+/// area, with each axis scaled by `sqrt(fraction)`. fraction ≥ 1.0
+/// returns the full surface.
+fn window_rect(width: i32, height: i32, fraction: f64) -> (i32, i32, i32, i32) {
+    if !(fraction.is_finite() && fraction > 0.0 && fraction < 1.0) {
+        return (0, 0, width, height);
+    }
+    let scale = fraction.sqrt();
+    let ww = ((width as f64 * scale).round() as i32).clamp(1, width);
+    let wh = ((height as f64 * scale).round() as i32).clamp(1, height);
+    let wx = (width - ww) / 2;
+    let wy = (height - wh) / 2;
+    (wx, wy, ww, wh)
+}
+
+/// Fill the canvas with `bg` everywhere except a `(win_x, win_y, win_w,
+/// win_h)` rectangle that gets `fg`. 4 bytes per pixel.
+fn fill_window_4bpp(
+    canvas: &mut [u8],
+    width: i32,
+    bg: &[u8; 4],
+    fg: &[u8; 4],
+    win_x: i32,
+    win_y: i32,
+    win_w: i32,
+    win_h: i32,
+) {
+    for px in canvas.chunks_exact_mut(4) {
+        px.copy_from_slice(bg);
+    }
+    if win_w == width && win_x == 0 {
+        // Fast path: window spans the full width — overwrite whole rows.
+        let row_bytes = (width as usize) * 4;
+        let fg_row: Vec<u8> = fg.iter().copied().cycle().take(row_bytes).collect();
+        for row in win_y..win_y + win_h {
+            let off = (row as usize) * row_bytes;
+            canvas[off..off + row_bytes].copy_from_slice(&fg_row);
+        }
+    } else {
+        let row_bytes = (width as usize) * 4;
+        let span_bytes = (win_w as usize) * 4;
+        let fg_span: Vec<u8> = fg.iter().copied().cycle().take(span_bytes).collect();
+        for row in win_y..win_y + win_h {
+            let off = (row as usize) * row_bytes + (win_x as usize) * 4;
+            canvas[off..off + span_bytes].copy_from_slice(&fg_span);
+        }
+    }
+}
+
+/// Same as [`fill_window_4bpp`] but for 8-byte fp16 pixels.
+fn fill_window_8bpp(
+    canvas: &mut [u8],
+    width: i32,
+    bg: &[u8; 8],
+    fg: &[u8; 8],
+    win_x: i32,
+    win_y: i32,
+    win_w: i32,
+    win_h: i32,
+) {
+    for px in canvas.chunks_exact_mut(8) {
+        px.copy_from_slice(bg);
+    }
+    let row_bytes = (width as usize) * 8;
+    let span_bytes = (win_w as usize) * 8;
+    let fg_span: Vec<u8> = fg.iter().copied().cycle().take(span_bytes).collect();
+    if win_w == width && win_x == 0 {
+        for row in win_y..win_y + win_h {
+            let off = (row as usize) * row_bytes;
+            canvas[off..off + row_bytes].copy_from_slice(&fg_span);
+        }
+    } else {
+        for row in win_y..win_y + win_h {
+            let off = (row as usize) * row_bytes + (win_x as usize) * 8;
+            canvas[off..off + span_bytes].copy_from_slice(&fg_span);
+        }
+    }
+}
+
+/// PQ-encode + half-float pack one RGB triple into Xbgr16161616f bytes.
+fn hdr_pixel(rgb_nits: [f64; 3]) -> [u8; 8] {
+    let pq = crate::pq::nits_triple_to_pq(rgb_nits);
+    let r = half::f16::from_f64(pq[0]).to_le_bytes();
+    let g = half::f16::from_f64(pq[1]).to_le_bytes();
+    let b = half::f16::from_f64(pq[2]).to_le_bytes();
+    // Alpha undefined for Xbgr; write 1.0 so a stray sampler isn't noise.
+    let a = half::f16::from_f64(1.0).to_le_bytes();
+    [r[0], r[1], g[0], g[1], b[0], b[1], a[0], a[1]]
 }
 
 impl AppState {
@@ -500,6 +631,11 @@ impl AppState {
         let width = self.current_width as i32;
         let height = self.current_height as i32;
 
+        // Window placement (centered). fraction=1.0 ⇒ whole surface;
+        // smaller fractions reduce the bright region's area by `f` while
+        // preserving the surface's aspect ratio inside the window.
+        let (win_x, win_y, win_w, win_h) = window_rect(width, height, self.window_fraction);
+
         let (buffer, _) = match self.current_content {
             PatchContent::Sdr(argb) => {
                 let stride = width * 4;
@@ -509,10 +645,10 @@ impl AppState {
                     stride,
                     wl_shm::Format::Xrgb8888,
                 )?;
-                let color = argb.to_le_bytes();
-                for px in canvas.chunks_exact_mut(4) {
-                    px.copy_from_slice(&color);
-                }
+                // Background = opaque black; foreground = caller's color.
+                let bg: [u8; 4] = 0xFF_00_00_00u32.to_le_bytes();
+                let fg: [u8; 4] = argb.to_le_bytes();
+                fill_window_4bpp(canvas, width, &bg, &fg, win_x, win_y, win_w, win_h);
                 (buffer, ())
             }
             PatchContent::HdrPqNits(rgb_nits) => {
@@ -523,20 +659,12 @@ impl AppState {
                     stride,
                     wl_shm::Format::Xbgr16161616f,
                 )?;
-                // PQ-encode + half-float each channel once; replicate
-                // for every pixel. Xbgr16161616f memory layout is
-                // [R, G, B, X] half-floats little-endian.
-                let pq = crate::pq::nits_triple_to_pq(rgb_nits);
-                let r = half::f16::from_f64(pq[0]).to_le_bytes();
-                let g = half::f16::from_f64(pq[1]).to_le_bytes();
-                let b = half::f16::from_f64(pq[2]).to_le_bytes();
-                // Alpha undefined for Xbgr; write 1.0 so a stray
-                // sampler doesn't see noise.
-                let a = half::f16::from_f64(1.0).to_le_bytes();
-                let pixel: [u8; 8] = [r[0], r[1], g[0], g[1], b[0], b[1], a[0], a[1]];
-                for px in canvas.chunks_exact_mut(8) {
-                    px.copy_from_slice(&pixel);
-                }
+                // Xbgr16161616f memory layout is [R, G, B, X] half-floats
+                // little-endian. Background = PQ-encoded 0 nits (panel's
+                // floor); foreground = caller's PQ-encoded nits.
+                let bg = hdr_pixel([0.0, 0.0, 0.0]);
+                let fg = hdr_pixel(rgb_nits);
+                fill_window_8bpp(canvas, width, &bg, &fg, win_x, win_y, win_w, win_h);
                 (buffer, ())
             }
         };
