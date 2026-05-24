@@ -1,0 +1,12 @@
+[package]
+name = "tristim-analyze"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Interpret tristim captures: derive the expected output per sample from the negotiated color description and score how far the measurement landed from it."
+
+[dependencies]
+tristim-capture = { path = "../tristim-capture" }
+tristim-color = { path = "../tristim-color" }

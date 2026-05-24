@@ -462,6 +462,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tristim-analyze"
+version = "0.1.0"
+dependencies = [
+ "tristim-capture",
+ "tristim-color",
+]
+
+[[package]]
 name = "tristim-capture"
 version = "0.1.0"
 dependencies = [

@@ -5,6 +5,7 @@ members = [
     "tristim-display",
     "tristim-capture",
     "tristim-color",
+    "tristim-analyze",
     "tristim-cli",
 ]
 
