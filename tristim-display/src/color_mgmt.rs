@@ -1,14 +1,15 @@
-//! Client-side `wp_color_management_v1` driver — just enough to
-//! attach a parametric PQ + BT.2020 image description to our patch
-//! surface so the compositor scans it out without color transforms.
+//! Client-side `wp_color_management_v1` driver — attach a parametric
+//! image description to our patch surface so the compositor scans it
+//! out as the declared color encoding, and record what the compositor
+//! advertised + how it responded.
 //!
 //! Why we write this directly instead of using a higher-level
 //! wrapper: SCTK 0.19 doesn't ship one, and the protocol surface we
 //! actually exercise is small (one description, one attachment per
-//! surface lifetime). The dispatch impls here handle the manager's
-//! supported_* enumeration events (we ignore them — we already
-//! decided what description to build) and the description's
-//! ready/failed event (we record the outcome for the caller).
+//! surface lifetime). The dispatch impls here accumulate the manager's
+//! supported_* enumeration events into [`ColorCapabilities`] (a fact
+//! the validator records) and track the description's ready/failed
+//! outcome for the caller.
 
 use std::sync::{Arc, Mutex};
 
@@ -59,8 +60,41 @@ impl PqDescriptionParams {
 #[derive(Clone, Debug)]
 pub enum DescriptionState {
     Pending,
-    Ready { identity_low: u32 },
-    Failed { reason: String },
+    /// Compositor accepted the description and assigned it `identity`.
+    Ready {
+        identity: u64,
+    },
+    /// Compositor rejected the description. `cause` is the protocol enum
+    /// name (e.g. `"unsupported"`), `message` its human string.
+    Failed {
+        cause: String,
+        message: String,
+    },
+}
+
+/// What the compositor advertised through `wp_color_manager_v1`'s
+/// `supported_*` enumeration events. Each list holds the protocol enum
+/// variant names (e.g. `"St2084Pq"`, `"Bt2020"`), or `"unknown(N)"` for
+/// values this build's protocol bindings don't recognise. An all-empty
+/// set with `done == false` means the compositor exposes no color
+/// management at all.
+#[derive(Clone, Debug, Default)]
+pub struct ColorCapabilities {
+    pub transfer_functions: Vec<String>,
+    pub primaries: Vec<String>,
+    pub features: Vec<String>,
+    pub render_intents: Vec<String>,
+    /// Whether the manager's `done` event arrived (enumeration complete).
+    pub done: bool,
+}
+
+/// Render a `WEnum` capability value as a stable string: the bound
+/// enum's `Debug` name for known values, `unknown(N)` otherwise.
+fn wenum_str<T: std::fmt::Debug>(w: WEnum<T>) -> String {
+    match w {
+        WEnum::Value(v) => format!("{v:?}"),
+        WEnum::Unknown(n) => format!("unknown({n})"),
+    }
 }
 
 /// Wraps the lifetime of a color-management binding for one patch
@@ -157,22 +191,21 @@ impl Drop for ColorManagedSurface {
 
 // ─── Dispatch impls ────────────────────────────────────────────────────────
 
-/// Marker trait the application's state type must satisfy. Caller
-/// implements `Dispatch` for each of the four interfaces by
-/// delegating to the helper impls below — see `lib.rs` for the
-/// concrete forwarding pattern.
-pub fn handle_manager_event(event: <WpColorManagerV1 as wayland_client::Proxy>::Event) {
+/// Accumulate the manager's `supported_*` enumeration into `caps`.
+/// Called from the `WpColorManagerV1` dispatch impl in `lib.rs`.
+pub fn handle_manager_event(
+    event: <WpColorManagerV1 as wayland_client::Proxy>::Event,
+    caps: &mut ColorCapabilities,
+) {
     use wp_color_manager_v1::Event;
-    // We don't care about the supported_* events — we already know
-    // what description we want and the compositor will tell us via
-    // ready/failed if it can't satisfy it. Logged at trace for
-    // debugging but otherwise ignored.
     match event {
-        Event::SupportedIntent { .. }
-        | Event::SupportedFeature { .. }
-        | Event::SupportedTfNamed { .. }
-        | Event::SupportedPrimariesNamed { .. }
-        | Event::Done => {}
+        Event::SupportedIntent { render_intent } => {
+            caps.render_intents.push(wenum_str(render_intent));
+        }
+        Event::SupportedFeature { feature } => caps.features.push(wenum_str(feature)),
+        Event::SupportedTfNamed { tf } => caps.transfer_functions.push(wenum_str(tf)),
+        Event::SupportedPrimariesNamed { primaries } => caps.primaries.push(wenum_str(primaries)),
+        Event::Done => caps.done = true,
         _ => {}
     }
 }
@@ -186,7 +219,7 @@ pub fn handle_description_event(
     match event {
         Event::Ready { identity } => {
             *st = DescriptionState::Ready {
-                identity_low: identity,
+                identity: identity as u64,
             };
         }
         Event::Ready2 {
@@ -194,17 +227,13 @@ pub fn handle_description_event(
             identity_lo,
         } => {
             *st = DescriptionState::Ready {
-                identity_low: identity_lo,
+                identity: ((identity_hi as u64) << 32) | identity_lo as u64,
             };
-            let _ = identity_hi;
         }
         Event::Failed { cause, msg } => {
-            let cause_str = match cause {
-                WEnum::Value(c) => format!("{c:?}"),
-                WEnum::Unknown(v) => format!("unknown({v})"),
-            };
             *st = DescriptionState::Failed {
-                reason: format!("{cause_str}: {msg}"),
+                cause: wenum_str(cause),
+                message: msg,
             };
         }
         _ => {}

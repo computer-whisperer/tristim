@@ -51,7 +51,7 @@
 pub mod color_mgmt;
 pub mod pq;
 
-pub use color_mgmt::{DescriptionState, PqDescriptionParams};
+pub use color_mgmt::{ColorCapabilities, DescriptionState, PqDescriptionParams};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -72,7 +72,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, WEnum,
+    Connection, Dispatch, QueueHandle,
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
 };
@@ -204,6 +204,7 @@ impl PatchSurface {
             redraw_pending: true,
             color_manager,
             color_managed: None,
+            capabilities: ColorCapabilities::default(),
             hdr_params,
             window_fraction: 1.0,
             border_content: None,
@@ -274,8 +275,8 @@ impl PatchSurface {
                 let snapshot = state.color_managed.as_ref().unwrap().state();
                 match snapshot {
                     DescriptionState::Ready { .. } => break,
-                    DescriptionState::Failed { reason } => {
-                        return Err(Error::DescriptionFailed(reason));
+                    DescriptionState::Failed { cause, message } => {
+                        return Err(Error::DescriptionFailed(format!("{cause}: {message}")));
                     }
                     DescriptionState::Pending => {}
                 }
@@ -291,6 +292,22 @@ impl PatchSurface {
             state,
             event_queue,
         })
+    }
+
+    /// What the compositor advertised through `wp_color_manager_v1`'s
+    /// `supported_*` events. Empty (and `done == false`) if the
+    /// compositor exposes no color management. A fact the validator
+    /// records verbatim.
+    pub fn color_capabilities(&self) -> &ColorCapabilities {
+        &self.state.capabilities
+    }
+
+    /// The negotiation outcome for the color description attached to
+    /// this surface, or `None` if no description was attached (SDR /
+    /// unmanaged). The caller maps `None → Unmanaged`,
+    /// `Some(Ready) → accepted`, `Some(Failed) → rejected`.
+    pub fn description_state(&self) -> Option<DescriptionState> {
+        self.state.color_managed.as_ref().map(|cm| cm.state())
     }
 
     /// Set the patch color (linear-or-encoded RGB in `0..=1`).
@@ -480,6 +497,7 @@ pub fn list_outputs() -> Result<Vec<OutputDescription>, Error> {
         redraw_pending: false,
         color_manager: None,
         color_managed: None,
+        capabilities: ColorCapabilities::default(),
         hdr_params: None,
         window_fraction: 1.0,
         border_content: None,
@@ -572,6 +590,9 @@ struct AppState {
     /// Kept alive for the lifetime of the surface (drop sends the
     /// destructor + unset).
     color_managed: Option<ColorManagedSurface>,
+    /// Capabilities accumulated from the manager's `supported_*`
+    /// events during registry enumeration. Empty if no manager bound.
+    capabilities: ColorCapabilities,
     /// HDR mastering params if open_hdr was used. Set up at
     /// construction; reused when the surface is rebuilt (today we
     /// don't, but future configure handling might).
@@ -872,21 +893,22 @@ delegate_registry!(AppState);
 // ─── wp_color_management_v1 client-side dispatch ──────────────────────────
 //
 // SCTK doesn't ship a handler for these so we wire the four
-// interfaces by hand. The manager + surface + creator dispatches are
-// stateless (just ignore supported_* + ack destructors); the
-// description dispatch updates the shared DescriptionState Mutex so
-// open_with_mode can poll ready/failed after the create round-trip.
+// interfaces by hand. The manager dispatch accumulates supported_*
+// into AppState.capabilities; the surface + creator dispatches are
+// stateless (ack destructors); the description dispatch updates the
+// shared DescriptionState Mutex so open_with_mode can poll
+// ready/failed after the create round-trip.
 
 impl Dispatch<WpColorManagerV1, ()> for AppState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &WpColorManagerV1,
         event: <WpColorManagerV1 as wayland_client::Proxy>::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
-        crate::color_mgmt::handle_manager_event(event);
+        crate::color_mgmt::handle_manager_event(event, &mut state.capabilities);
     }
 }
 
@@ -913,7 +935,6 @@ impl Dispatch<WpImageDescriptionV1, Arc<Mutex<DescriptionState>>> for AppState {
         _qh: &QueueHandle<Self>,
     ) {
         crate::color_mgmt::handle_description_event(event, data);
-        let _ = WEnum::<()>::Unknown; // silence unused import in -D warnings build
     }
 }
 
