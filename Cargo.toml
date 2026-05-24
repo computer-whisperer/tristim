@@ -4,6 +4,7 @@ members = [
     "tristim-driver",
     "tristim-display",
     "tristim-capture",
+    "tristim-color",
     "tristim-cli",
 ]
 
