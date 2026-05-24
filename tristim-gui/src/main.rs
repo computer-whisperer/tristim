@@ -12,8 +12,7 @@ use aetna_core::color::ColorPreferences;
 use aetna_core::prelude::Rect;
 use aetna_winit_wgpu::{HostConfig, run_with_config};
 
-mod app;
-use app::PresenterApp;
+use tristim_gui::PresenterApp;
 
 const USAGE: &str = "\
 usage: tristim-gui <capture.json>

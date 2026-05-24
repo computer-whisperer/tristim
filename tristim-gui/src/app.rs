@@ -28,6 +28,17 @@ impl PresenterApp {
         }
     }
 
+    /// Number of trials in the loaded capture.
+    pub fn trial_count(&self) -> usize {
+        self.analyzed.trials.len()
+    }
+
+    /// Focus trial `i` (clamped to the valid range). Used by the headless
+    /// bundle dump to lay out every trial's panel, not just the default one.
+    pub fn select(&mut self, i: usize) {
+        self.selected = i.min(self.trial_count().saturating_sub(1));
+    }
+
     /// Short label for trial `i`: the requested (or unmanaged) basis + format.
     fn trial_label(&self, i: usize) -> String {
         let fmt = &self.analyzed.trials[i].pixel_format;

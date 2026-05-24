@@ -13,3 +13,6 @@ refs/
 # Scratch CSVs at the workspace root — keeps the root clean.
 # Committed measurements live under `measurements/`.
 /*.csv
+
+# Headless bundle-dump artifacts from the presenter (SVG / tree / draw-ops).
+/tristim-gui/out/
