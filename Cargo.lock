@@ -425,8 +425,6 @@ name = "tristim-display"
 version = "0.1.0"
 dependencies = [
  "half",
- "memmap2 0.9.10",
- "rustix 0.38.44",
  "smithay-client-toolkit",
  "thiserror",
  "wayland-client",

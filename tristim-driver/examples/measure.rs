@@ -8,7 +8,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let info = device.get_info()?;
     println!(
         "Spyder {} (HW {}.{:02}, SN {})",
-        if device.is_spyder_2024() { "2024" } else { "X2" },
+        if device.is_spyder_2024() {
+            "2024"
+        } else {
+            "X2"
+        },
         info.hw_version.0,
         info.hw_version.1,
         info.serial,
@@ -28,7 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nCalibration matrix (3x6, XYZ rows × 6 sensor channels):");
     for i in 0..3 {
         let label = ["X", "Y", "Z"][i];
-        let row: Vec<String> = cal.matrix[i].iter().map(|v| format!("{:+.4e}", v)).collect();
+        let row: Vec<String> = cal.matrix[i]
+            .iter()
+            .map(|v| format!("{:+.4e}", v))
+            .collect();
         println!("  {} = [{}]", label, row.join(", "));
     }
     println!("Gain:   {:?}", cal.gain);

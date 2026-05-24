@@ -43,9 +43,9 @@ struct PanelMetrics {
     gamma: f64,
     /// Goodness-of-fit of the gamma model. 1.0 = perfect.
     gamma_r2: f64,
-    red:   PrimaryStats,
+    red: PrimaryStats,
     green: PrimaryStats,
-    blue:  PrimaryStats,
+    blue: PrimaryStats,
     /// sRGB triangle area in xy is ~0.1121; ratio > 1 means wider gamut.
     gamut_area_ratio: f64,
     /// Y(R+G+B) compared to Y(white). 1.0 = perfectly additive.
@@ -93,8 +93,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
 // ---------------------------------------------------------------------------
 
 fn read_sweep(path: &Path) -> Result<Vec<Row>, Box<dyn Error>> {
-    let text = fs::read_to_string(path)
-        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let text = fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let mut rows = Vec::new();
     let mut lines = text.lines();
     let header = lines.next().ok_or("empty file")?;
@@ -142,9 +141,9 @@ fn compute_metrics(path: &Path, rows: &[Row]) -> Result<PanelMetrics, Box<dyn Er
 
     let white = lookup("grey_1000").ok_or("missing grey_1000 patch")?;
     let black = lookup("grey_000").ok_or("missing grey_000 patch")?;
-    let red   = lookup("red_1000").ok_or("missing red_1000 patch")?;
+    let red = lookup("red_1000").ok_or("missing red_1000 patch")?;
     let green = lookup("grn_1000").ok_or("missing grn_1000 patch")?;
-    let blue  = lookup("blu_1000").ok_or("missing blu_1000 patch")?;
+    let blue = lookup("blu_1000").ok_or("missing blu_1000 patch")?;
 
     let peak_y = white.big_y;
     let black_y = black.big_y;
@@ -238,7 +237,11 @@ fn fit_gamma(rows: &[Row], peak_y: f64) -> (f64, f64) {
         ss_res += (ys[i] - pred).powi(2);
         ss_tot += (ys[i] - mean_y).powi(2);
     }
-    let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { f64::NAN };
+    let r2 = if ss_tot > 0.0 {
+        1.0 - ss_res / ss_tot
+    } else {
+        f64::NAN
+    };
     (gamma, r2)
 }
 
@@ -277,7 +280,7 @@ fn cct_mccamy(white_xy: (f64, f64)) -> Option<f64> {
     }
     let n = (x - 0.3320) / denom;
     let cct = 437.0 * n.powi(3) + 3601.0 * n.powi(2) + 6831.0 * n + 5517.0;
-    if !cct.is_finite() || cct < 1000.0 || cct > 50000.0 {
+    if !cct.is_finite() || !(1000.0..=50000.0).contains(&cct) {
         return None;
     }
     Some(cct)
@@ -288,12 +291,20 @@ fn cct_mccamy(white_xy: (f64, f64)) -> Option<f64> {
 // ---------------------------------------------------------------------------
 
 fn print_detailed(m: &PanelMetrics) {
-    let name = m.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let name = m
+        .path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     println!("{}", name);
     println!();
     println!("  Peak white Y      {:7.2} cd/m²", m.peak_y);
     println!("  Black Y           {:7.3} cd/m²", m.black_y);
-    let contrast = if m.black_y > 1e-6 { m.peak_y / m.black_y } else { f64::INFINITY };
+    let contrast = if m.black_y > 1e-6 {
+        m.peak_y / m.black_y
+    } else {
+        f64::INFINITY
+    };
     println!("  Static contrast   {:>6.0}:1", contrast);
     println!(
         "  White point       xy = ({:.4}, {:.4})",
@@ -352,8 +363,16 @@ fn print_summary_table(metrics: &[PanelMetrics]) {
     );
     println!("{}", "-".repeat(106));
     for m in metrics {
-        let name = m.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let contrast = if m.black_y > 1e-6 { m.peak_y / m.black_y } else { 0.0 };
+        let name = m
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let contrast = if m.black_y > 1e-6 {
+            m.peak_y / m.black_y
+        } else {
+            0.0
+        };
         println!(
             "{:38} {:>8.2} {:>8.3} {:>5.0}:1 ({:.3}, {:.3}) {:>8.4} {:>6.2} {:>5.2}",
             name,

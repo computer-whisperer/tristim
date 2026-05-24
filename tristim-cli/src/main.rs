@@ -12,13 +12,13 @@
 
 mod analyze;
 
-use tristim_display::{PatchSurface, list_outputs};
-use tristim_driver::Colorimeter;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Duration;
+use tristim_display::{PatchSurface, list_outputs};
+use tristim_driver::Colorimeter;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let argv: Vec<String> = std::env::args().collect();
@@ -55,12 +55,18 @@ fn print_usage() {
     eprintln!("          --grey-steps N       grayscale ramp size (default: 11)");
     eprintln!("          --prep-secs N        seconds to wait for puck placement (default: 6)");
     eprintln!("          --settle-ms N        ms to wait after each color change (default: 250)");
-    eprintln!("          --hdr                run an HDR PQ sweep (fp16 + wp_color_management_v1);");
-    eprintln!("                               patch values are absolute cd/m². Requires a compositor");
+    eprintln!(
+        "          --hdr                run an HDR PQ sweep (fp16 + wp_color_management_v1);"
+    );
+    eprintln!(
+        "                               patch values are absolute cd/m². Requires a compositor"
+    );
     eprintln!("                               that advertises both (e.g. prism).");
     eprintln!("          --peak-nits N        HDR mastering peak luminance, cd/m² (default: 400)");
     eprintln!("          --max-cll N          HDR max content light level, cd/m² (default: peak)");
-    eprintln!("          --max-fall N         HDR max frame-average light, cd/m² (default: peak/2)");
+    eprintln!(
+        "          --max-fall N         HDR max frame-average light, cd/m² (default: peak/2)"
+    );
     eprintln!("          --window F           centered bright window covering fraction F of");
     eprintln!("                               output area on a black background (default: 1.0 =");
     eprintln!("                               fullscreen). Use ~0.04–0.10 to measure OLED peak");
@@ -129,7 +135,9 @@ fn cmd_measure(args: &[String]) -> Result<(), Box<dyn Error>> {
 fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
     let output = arg_value(args, "--output")
         .ok_or("--output NAME is required (try `tristim list-outputs`)")?;
-    let out_path: PathBuf = arg_value(args, "--out").map(PathBuf::from).unwrap_or_else(|| "sweep.csv".into());
+    let out_path: PathBuf = arg_value(args, "--out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "sweep.csv".into());
     let cal_index: u8 = arg_value(args, "--cal")
         .as_deref()
         .and_then(|s| s.parse().ok())
@@ -180,8 +188,19 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
         // Skew low — PQ packs most of its precision into the dark
         // range, so verification is most interesting there.
         let nits_steps: Vec<f64> = if grey_steps == 11 {
-            vec![0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 150.0, 200.0, 300.0,
-                 peak_nits as f64]
+            vec![
+                0.0,
+                1.0,
+                5.0,
+                10.0,
+                25.0,
+                50.0,
+                100.0,
+                150.0,
+                200.0,
+                300.0,
+                peak_nits as f64,
+            ]
         } else {
             // Geometric ramp 0.5..peak.
             let mut v = vec![0.0];
@@ -193,22 +212,46 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
             v
         };
         for nits in nits_steps {
-            patches.push(Patch::new(format!("grey_{:04}n", nits as i32), [nits, nits, nits]));
+            patches.push(Patch::new(
+                format!("grey_{:04}n", nits as i32),
+                [nits, nits, nits],
+            ));
         }
         for &nits in &[50.0, 100.0, 200.0, peak_nits as f64] {
-            patches.push(Patch::new(format!("red_{:04}n", nits as i32), [nits, 0.0, 0.0]));
-            patches.push(Patch::new(format!("grn_{:04}n", nits as i32), [0.0, nits, 0.0]));
-            patches.push(Patch::new(format!("blu_{:04}n", nits as i32), [0.0, 0.0, nits]));
+            patches.push(Patch::new(
+                format!("red_{:04}n", nits as i32),
+                [nits, 0.0, 0.0],
+            ));
+            patches.push(Patch::new(
+                format!("grn_{:04}n", nits as i32),
+                [0.0, nits, 0.0],
+            ));
+            patches.push(Patch::new(
+                format!("blu_{:04}n", nits as i32),
+                [0.0, 0.0, nits],
+            ));
         }
     } else {
         for k in 0..grey_steps {
             let v = k as f64 / (grey_steps - 1) as f64;
-            patches.push(Patch::new(format!("grey_{:03}", (v * 1000.0) as i32), [v, v, v]));
+            patches.push(Patch::new(
+                format!("grey_{:03}", (v * 1000.0) as i32),
+                [v, v, v],
+            ));
         }
         for &v in &[0.25, 0.5, 0.75, 1.0] {
-            patches.push(Patch::new(format!("red_{:03}", (v * 1000.0) as i32), [v, 0.0, 0.0]));
-            patches.push(Patch::new(format!("grn_{:03}", (v * 1000.0) as i32), [0.0, v, 0.0]));
-            patches.push(Patch::new(format!("blu_{:03}", (v * 1000.0) as i32), [0.0, 0.0, v]));
+            patches.push(Patch::new(
+                format!("red_{:03}", (v * 1000.0) as i32),
+                [v, 0.0, 0.0],
+            ));
+            patches.push(Patch::new(
+                format!("grn_{:03}", (v * 1000.0) as i32),
+                [0.0, v, 0.0],
+            ));
+            patches.push(Patch::new(
+                format!("blu_{:03}", (v * 1000.0) as i32),
+                [0.0, 0.0, v],
+            ));
         }
     }
 
@@ -230,7 +273,10 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
     // Open device + display surface up front so we fail fast if either is broken.
     let mut device = Colorimeter::open_any()?;
     let info = device.get_info()?;
-    eprintln!("Spyder SN {} HW {}.{:02}", info.serial, info.hw_version.0, info.hw_version.1);
+    eprintln!(
+        "Spyder SN {} HW {}.{:02}",
+        info.serial, info.hw_version.0, info.hw_version.1
+    );
 
     // Pre-fetch calibration + setup once. (We re-fetch setup before each
     // measure inside the driver, but downloading the cal matrix is slow.)
@@ -337,7 +383,11 @@ fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     eprintln!();
-    eprintln!("Done. Peak measured Y = {:.2} cd/m². CSV at {}.", max_y, out_path.display());
+    eprintln!(
+        "Done. Peak measured Y = {:.2} cd/m². CSV at {}.",
+        max_y,
+        out_path.display()
+    );
     Ok(())
 }
 

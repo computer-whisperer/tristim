@@ -60,21 +60,21 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     shell::{
+        WaylandSurface,
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
             LayerSurfaceConfigure,
         },
-        WaylandSurface,
     },
-    shm::{slot::SlotPool, Shm, ShmHandler},
+    shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use wayland_client::{
+    Connection, Dispatch, QueueHandle, WEnum,
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
-    Connection, Dispatch, QueueHandle, WEnum,
 };
 use wayland_protocols::wp::color_management::v1::client::{
     wp_color_management_surface_v1::WpColorManagementSurfaceV1,
@@ -171,19 +171,15 @@ impl PatchSurface {
 
         let registry_state = RegistryState::new(&globals);
         let output_state = OutputState::new(&globals, &qh);
-        let compositor_state =
-            CompositorState::bind(&globals, &qh).map_err(Error::Bind)?;
-        let layer_shell =
-            LayerShell::bind(&globals, &qh).map_err(|_| Error::NoLayerShell)?;
+        let compositor_state = CompositorState::bind(&globals, &qh).map_err(Error::Bind)?;
+        let layer_shell = LayerShell::bind(&globals, &qh).map_err(|_| Error::NoLayerShell)?;
         let shm = Shm::bind(&globals, &qh).map_err(Error::Bind)?;
 
         // Optional bind: wp_color_manager_v1. Always try; we only
         // error out if HDR mode was requested AND the bind failed.
         // SCTK doesn't manage this global so we go through the raw
         // globals list directly.
-        let color_manager = globals
-            .bind::<WpColorManagerV1, _, _>(&qh, 1..=2, ())
-            .ok();
+        let color_manager = globals.bind::<WpColorManagerV1, _, _>(&qh, 1..=2, ()).ok();
         if hdr_params.is_some() && color_manager.is_none() {
             return Err(Error::NoColorManager);
         }
@@ -263,23 +259,19 @@ impl PatchSurface {
 
         // HDR mode: build + attach the PQ image description now that
         // the surface exists. Wait for ready/failed.
-        if let (Some(params), Some(manager)) =
-            (state.hdr_params, state.color_manager.clone())
-        {
+        if let (Some(params), Some(manager)) = (state.hdr_params, state.color_manager.clone()) {
             let SurfaceState::Configured(layer_surface) = &state.surface_state else {
                 unreachable!("just waited for Configured above")
             };
             let wl_surface = layer_surface.wl_surface().clone();
-            let cm =
-                ColorManagedSurface::attach(manager, &qh, &wl_surface, params);
+            let cm = ColorManagedSurface::attach(manager, &qh, &wl_surface, params);
             state.color_managed = Some(cm);
             // Flush + roundtrip to send create + set requests and
             // pick up ready/failed.
             event_queue.roundtrip(&mut state)?;
             let ready_deadline = Instant::now() + Duration::from_secs(1);
             loop {
-                let snapshot =
-                    state.color_managed.as_ref().unwrap().state();
+                let snapshot = state.color_managed.as_ref().unwrap().state();
                 match snapshot {
                     DescriptionState::Ready { .. } => break,
                     DescriptionState::Failed { reason } => {
@@ -288,9 +280,7 @@ impl PatchSurface {
                     DescriptionState::Pending => {}
                 }
                 if Instant::now() >= ready_deadline {
-                    return Err(Error::NoDescriptionReady(
-                        Duration::from_secs(1),
-                    ));
+                    return Err(Error::NoDescriptionReady(Duration::from_secs(1)));
                 }
                 event_queue.blocking_dispatch(&mut state)?;
             }
@@ -341,8 +331,8 @@ impl PatchSurface {
 
     /// HDR-mode patch luminance, in absolute cd/m² per channel.
     /// Returns [`Error::NotHdrMode`] if the patch was opened SDR.
-    /// Values are clamped to [0, 10000] (the PQ EOTF's domain);
-    /// >mastering_max_lum is allowed by the protocol (it's what
+    /// Values are clamped to [0, 10000] (the PQ EOTF's domain); values
+    /// above `mastering_max_lum` are allowed by the protocol (it's what
     /// `extended_target_volume` is about), but in practice the panel
     /// will hard-clip to its own peak.
     pub fn set_nits(&mut self, rgb_nits: [f64; 3]) -> Result<(), Error> {
@@ -523,10 +513,7 @@ pub struct OutputDescription {
     pub size: Option<(i32, i32)>,
 }
 
-fn pick_output(
-    output_state: &OutputState,
-    name: &str,
-) -> Result<wl_output::WlOutput, Error> {
+fn pick_output(output_state: &OutputState, name: &str) -> Result<wl_output::WlOutput, Error> {
     let mut found_names = Vec::new();
     for output in output_state.outputs() {
         if let Some(info) = output_state.info(&output) {
@@ -603,80 +590,80 @@ struct AppState {
     border_content: Option<PatchContent>,
 }
 
+/// A pixel rectangle (origin + size) on the surface, used for
+/// centered-window patch placement.
+#[derive(Clone, Copy)]
+struct Rect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
 /// Compute a centered window rect covering `fraction` of the surface
 /// area, with each axis scaled by `sqrt(fraction)`. fraction ≥ 1.0
 /// returns the full surface.
-fn window_rect(width: i32, height: i32, fraction: f64) -> (i32, i32, i32, i32) {
+fn window_rect(width: i32, height: i32, fraction: f64) -> Rect {
     if !(fraction.is_finite() && fraction > 0.0 && fraction < 1.0) {
-        return (0, 0, width, height);
+        return Rect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: height,
+        };
     }
     let scale = fraction.sqrt();
     let ww = ((width as f64 * scale).round() as i32).clamp(1, width);
     let wh = ((height as f64 * scale).round() as i32).clamp(1, height);
-    let wx = (width - ww) / 2;
-    let wy = (height - wh) / 2;
-    (wx, wy, ww, wh)
+    Rect {
+        x: (width - ww) / 2,
+        y: (height - wh) / 2,
+        w: ww,
+        h: wh,
+    }
 }
 
-/// Fill the canvas with `bg` everywhere except a `(win_x, win_y, win_w,
-/// win_h)` rectangle that gets `fg`. 4 bytes per pixel.
-fn fill_window_4bpp(
-    canvas: &mut [u8],
-    width: i32,
-    bg: &[u8; 4],
-    fg: &[u8; 4],
-    win_x: i32,
-    win_y: i32,
-    win_w: i32,
-    win_h: i32,
-) {
+/// Fill the canvas with `bg` everywhere except the `win` rectangle,
+/// which gets `fg`. 4 bytes per pixel.
+fn fill_window_4bpp(canvas: &mut [u8], width: i32, bg: &[u8; 4], fg: &[u8; 4], win: &Rect) {
     for px in canvas.chunks_exact_mut(4) {
         px.copy_from_slice(bg);
     }
-    if win_w == width && win_x == 0 {
+    if win.w == width && win.x == 0 {
         // Fast path: window spans the full width — overwrite whole rows.
         let row_bytes = (width as usize) * 4;
         let fg_row: Vec<u8> = fg.iter().copied().cycle().take(row_bytes).collect();
-        for row in win_y..win_y + win_h {
+        for row in win.y..win.y + win.h {
             let off = (row as usize) * row_bytes;
             canvas[off..off + row_bytes].copy_from_slice(&fg_row);
         }
     } else {
         let row_bytes = (width as usize) * 4;
-        let span_bytes = (win_w as usize) * 4;
+        let span_bytes = (win.w as usize) * 4;
         let fg_span: Vec<u8> = fg.iter().copied().cycle().take(span_bytes).collect();
-        for row in win_y..win_y + win_h {
-            let off = (row as usize) * row_bytes + (win_x as usize) * 4;
+        for row in win.y..win.y + win.h {
+            let off = (row as usize) * row_bytes + (win.x as usize) * 4;
             canvas[off..off + span_bytes].copy_from_slice(&fg_span);
         }
     }
 }
 
 /// Same as [`fill_window_4bpp`] but for 8-byte fp16 pixels.
-fn fill_window_8bpp(
-    canvas: &mut [u8],
-    width: i32,
-    bg: &[u8; 8],
-    fg: &[u8; 8],
-    win_x: i32,
-    win_y: i32,
-    win_w: i32,
-    win_h: i32,
-) {
+fn fill_window_8bpp(canvas: &mut [u8], width: i32, bg: &[u8; 8], fg: &[u8; 8], win: &Rect) {
     for px in canvas.chunks_exact_mut(8) {
         px.copy_from_slice(bg);
     }
     let row_bytes = (width as usize) * 8;
-    let span_bytes = (win_w as usize) * 8;
+    let span_bytes = (win.w as usize) * 8;
     let fg_span: Vec<u8> = fg.iter().copied().cycle().take(span_bytes).collect();
-    if win_w == width && win_x == 0 {
-        for row in win_y..win_y + win_h {
+    if win.w == width && win.x == 0 {
+        for row in win.y..win.y + win.h {
             let off = (row as usize) * row_bytes;
             canvas[off..off + row_bytes].copy_from_slice(&fg_span);
         }
     } else {
-        for row in win_y..win_y + win_h {
-            let off = (row as usize) * row_bytes + (win_x as usize) * 8;
+        for row in win.y..win.y + win.h {
+            let off = (row as usize) * row_bytes + (win.x as usize) * 8;
             canvas[off..off + span_bytes].copy_from_slice(&fg_span);
         }
     }
@@ -707,17 +694,13 @@ impl AppState {
         // Window placement (centered). fraction=1.0 ⇒ whole surface;
         // smaller fractions reduce the bright region's area by `f` while
         // preserving the surface's aspect ratio inside the window.
-        let (win_x, win_y, win_w, win_h) = window_rect(width, height, self.window_fraction);
+        let win = window_rect(width, height, self.window_fraction);
 
         let (buffer, _) = match self.current_content {
             PatchContent::Sdr(argb) => {
                 let stride = width * 4;
-                let (buffer, canvas) = pool.create_buffer(
-                    width,
-                    height,
-                    stride,
-                    wl_shm::Format::Xrgb8888,
-                )?;
+                let (buffer, canvas) =
+                    pool.create_buffer(width, height, stride, wl_shm::Format::Xrgb8888)?;
                 // Background = configured border colour, falling back to
                 // opaque black for the legacy unset case.
                 let bg: [u8; 4] = match self.border_content {
@@ -725,17 +708,13 @@ impl AppState {
                     _ => 0xFF_00_00_00u32.to_le_bytes(),
                 };
                 let fg: [u8; 4] = argb.to_le_bytes();
-                fill_window_4bpp(canvas, width, &bg, &fg, win_x, win_y, win_w, win_h);
+                fill_window_4bpp(canvas, width, &bg, &fg, &win);
                 (buffer, ())
             }
             PatchContent::HdrPqNits(rgb_nits) => {
                 let stride = width * 8;
-                let (buffer, canvas) = pool.create_buffer(
-                    width,
-                    height,
-                    stride,
-                    wl_shm::Format::Xbgr16161616f,
-                )?;
+                let (buffer, canvas) =
+                    pool.create_buffer(width, height, stride, wl_shm::Format::Xbgr16161616f)?;
                 // Xbgr16161616f memory layout is [R, G, B, X] half-floats
                 // little-endian. Background = configured border luminance,
                 // falling back to PQ-encoded 0 nits for the legacy
@@ -745,7 +724,7 @@ impl AppState {
                     _ => hdr_pixel([0.0, 0.0, 0.0]),
                 };
                 let fg = hdr_pixel(rgb_nits);
-                fill_window_8bpp(canvas, width, &bg, &fg, win_x, win_y, win_w, win_h);
+                fill_window_8bpp(canvas, width, &bg, &fg, &win);
                 (buffer, ())
             }
         };
@@ -866,13 +845,11 @@ impl LayerShellHandler for AppState {
             self.current_height = configure.new_size.1;
         }
         // Transition to Configured (move the layer-surface handle in).
-        let layer_owned = match std::mem::replace(
-            &mut self.surface_state,
-            SurfaceState::WaitingForOutputs,
-        ) {
-            SurfaceState::PendingConfigure(s) | SurfaceState::Configured(s) => s,
-            SurfaceState::WaitingForOutputs => layer.clone(),
-        };
+        let layer_owned =
+            match std::mem::replace(&mut self.surface_state, SurfaceState::WaitingForOutputs) {
+                SurfaceState::PendingConfigure(s) | SurfaceState::Configured(s) => s,
+                SurfaceState::WaitingForOutputs => layer.clone(),
+            };
         self.surface_state = SurfaceState::Configured(layer_owned);
         // Draw immediately so the surface has content for the configure ack.
         let _ = self.draw(qh);

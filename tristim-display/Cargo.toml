@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Wayland layer-shell client for displaying known RGB test patches on a chosen output, paired with tristim-driver for closed-loop colorimeter measurement."
+description = "Wayland layer-shell client for displaying known RGB test patches on a chosen output, paired with tristim-driver for colorimeter measurement."
 
 [lib]
 path = "src/lib.rs"
@@ -19,7 +19,5 @@ wayland-client = "0.31"
 # ship a high-level wrapper; we drive the protocol directly.
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 thiserror.workspace = true
-memmap2 = "0.9"
-rustix = { version = "0.38", features = ["fs", "mm"] }
 # fp16 encoding for HDR patches (f32 → IEEE 754 binary16).
 half = "2"

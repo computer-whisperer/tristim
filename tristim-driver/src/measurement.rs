@@ -124,7 +124,10 @@ pub fn parse_calibration(payload: &[u8], expected_index: u8) -> Result<Calibrati
 
     // Matrix: 3 rows × 6 cols of f32 LE.
     // Argyll's offset formula: `10 + (j * 3 + i) * 4` for matrix[i][j].
+    // Indices drive a transposed byte-offset computation, so explicit
+    // `for i/j` reads clearer here than an enumerated iterator chain.
     let mut matrix = [[0.0f64; 6]; 3];
+    #[allow(clippy::needless_range_loop)]
     for i in 0..3 {
         for j in 0..6 {
             let off = 10 + (j * 3 + i) * 4;
@@ -218,6 +221,9 @@ pub fn encode_measure_request(setup: &Setup) -> [u8; 15] {
 ///    haven't performed our own black calibration, so it would be all zeros)
 /// 2. Matrix multiply: `XYZ[i] = sum(matrix[i][j] * corrected[j], j in 0..6)`
 /// 3. Per-channel gain + offset: `XYZ[i] = XYZ[i] * gain[i] + offset[i]`
+// Fixed-size 3×6 matrix math; explicit index loops read clearer than
+// iterator chains here.
+#[allow(clippy::needless_range_loop)]
 pub fn raw_to_xyz(raw: &RawMeasurement, setup: &Setup, cal: &Calibration) -> Xyz {
     // Black-cal subtraction with saturating semantics.
     let mut corrected = [0.0f64; 6];

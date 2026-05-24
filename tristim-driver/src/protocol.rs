@@ -48,7 +48,7 @@ pub mod pid {
 
 /// USB endpoint addresses (same for SpyderX, X2, and 2024).
 pub const EP_OUT: u8 = 0x01;
-pub const EP_IN:  u8 = 0x81;
+pub const EP_IN: u8 = 0x81;
 
 /// Header bytes on every packet (both directions).
 pub const HEADER_LEN: usize = 5;

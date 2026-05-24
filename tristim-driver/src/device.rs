@@ -1,8 +1,8 @@
 //! High-level handle for an open Datacolor Spyder colorimeter.
 
 use crate::measurement::{
-    self, Calibration, RawMeasurement, Setup, Xyz, encode_measure_request,
-    parse_calibration, parse_raw_measurement, parse_setup,
+    self, Calibration, RawMeasurement, Setup, Xyz, encode_measure_request, parse_calibration,
+    parse_raw_measurement, parse_setup,
 };
 use crate::protocol::{DATACOLOR_VID, EP_IN, EP_OUT, HEADER_LEN, Opcode, pid};
 use rusb::{Context, DeviceHandle, UsbContext};
@@ -232,10 +232,10 @@ impl Colorimeter {
     pub fn get_info(&mut self) -> Result<DeviceInfo> {
         let reply = self.command(Opcode::GetInfo, &[], 0x25, false, DEFAULT_TIMEOUT)?;
 
-        let major = parse_ascii_int(&reply[0..1])
-            .ok_or_else(|| Error::BadVersionString(reply.clone()))?;
-        let minor = parse_ascii_int(&reply[2..4])
-            .ok_or_else(|| Error::BadVersionString(reply.clone()))?;
+        let major =
+            parse_ascii_int(&reply[0..1]).ok_or_else(|| Error::BadVersionString(reply.clone()))?;
+        let minor =
+            parse_ascii_int(&reply[2..4]).ok_or_else(|| Error::BadVersionString(reply.clone()))?;
 
         let serial_bytes = &reply[4..12];
         let serial = std::str::from_utf8(serial_bytes)
@@ -315,20 +315,17 @@ impl Colorimeter {
         let send = encode_measure_request(setup);
         // No checksum on the measurement reply per spydX2_Measure (last arg is 0).
         // Bump timeout — integration time alone can be ~720 msec.
-        let reply = self.command(
-            Opcode::Measure,
-            &send,
-            0xc,
-            false,
-            Duration::from_secs(3),
-        )?;
+        let reply = self.command(Opcode::Measure, &send, 0xc, false, Duration::from_secs(3))?;
         Ok(parse_raw_measurement(&reply)?)
     }
 
     /// End-to-end XYZ measurement using calibration index `cal_index`.
     /// Convenience wrapper: downloads calibration if not cached, fetches
     /// setup, takes a measurement, converts raw counts to XYZ.
-    pub fn measure_xyz(&mut self, cal_index: u8) -> Result<(Xyz, RawMeasurement, Calibration, Setup)> {
+    pub fn measure_xyz(
+        &mut self,
+        cal_index: u8,
+    ) -> Result<(Xyz, RawMeasurement, Calibration, Setup)> {
         let cal = self.get_calibration(cal_index)?;
         let setup = self.get_setup(&cal)?;
         let raw = self.measure_raw(&setup)?;

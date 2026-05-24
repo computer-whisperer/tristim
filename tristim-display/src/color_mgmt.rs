@@ -103,18 +103,15 @@ impl ColorManagedSurface {
         // luminances: PQ defaults per spec are min 0.005, max ignored
         // (always min + 10000), reference 203. We pass them explicitly.
         creator.set_luminances(
-            50,       // 0.005 cd/m² × 10000
-            10_000,   // ignored for st2084_pq
-            203,      // reference white
+            50,     // 0.005 cd/m² × 10000
+            10_000, // ignored for st2084_pq
+            203,    // reference white
         );
 
         // mastering display — primaries default to the primary color
         // volume (BT.2020), so we only need to set luminances + cll
         // + fall.
-        creator.set_mastering_luminance(
-            params.mastering_min_lum_ticks,
-            params.mastering_max_lum,
-        );
+        creator.set_mastering_luminance(params.mastering_min_lum_ticks, params.mastering_max_lum);
         creator.set_max_cll(params.max_cll);
         creator.set_max_fall(params.max_fall);
 
@@ -127,10 +124,8 @@ impl ColorManagedSurface {
         //    with perceptual intent. Compositors must support
         //    perceptual; everything else is optional.
         let surface_ext = manager.get_surface(wl_surface, qh, ());
-        surface_ext.set_image_description(
-            &description,
-            wp_color_manager_v1::RenderIntent::Perceptual,
-        );
+        surface_ext
+            .set_image_description(&description, wp_color_manager_v1::RenderIntent::Perceptual);
 
         Self {
             manager,
@@ -166,9 +161,7 @@ impl Drop for ColorManagedSurface {
 /// implements `Dispatch` for each of the four interfaces by
 /// delegating to the helper impls below — see `lib.rs` for the
 /// concrete forwarding pattern.
-pub fn handle_manager_event(
-    event: <WpColorManagerV1 as wayland_client::Proxy>::Event,
-) {
+pub fn handle_manager_event(event: <WpColorManagerV1 as wayland_client::Proxy>::Event) {
     use wp_color_manager_v1::Event;
     // We don't care about the supported_* events — we already know
     // what description we want and the compositor will tell us via
@@ -196,7 +189,10 @@ pub fn handle_description_event(
                 identity_low: identity,
             };
         }
-        Event::Ready2 { identity_hi, identity_lo } => {
+        Event::Ready2 {
+            identity_hi,
+            identity_lo,
+        } => {
             *st = DescriptionState::Ready {
                 identity_low: identity_lo,
             };

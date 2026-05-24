@@ -4,8 +4,8 @@
 //!   cargo run -p tristim-display --example show_patch -- --list
 //!   cargo run -p tristim-display --example show_patch -- --output DP-1 --color 1,0.5,0 --secs 5
 
-use tristim_display::{list_outputs, PatchSurface};
 use std::time::Duration;
+use tristim_display::{PatchSurface, list_outputs};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -32,14 +32,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let parts: Vec<f64> = color_str
         .split(',')
-        .map(|s| s.trim().parse::<f64>().expect("color components must be numbers"))
+        .map(|s| {
+            s.trim()
+                .parse::<f64>()
+                .expect("color components must be numbers")
+        })
         .collect();
     if parts.len() != 3 {
         return Err("--color must be R,G,B with three components in 0..=1".into());
     }
     let rgb = [parts[0], parts[1], parts[2]];
 
-    println!("opening patch on output '{}' with color {:?} for {}s", output, rgb, secs);
+    println!(
+        "opening patch on output '{}' with color {:?} for {}s",
+        output, rgb, secs
+    );
     let mut patch = PatchSurface::open(&output)?;
     patch.set_color(rgb)?;
     std::thread::sleep(Duration::from_secs(secs));
