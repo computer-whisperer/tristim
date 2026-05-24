@@ -1,0 +1,26 @@
+[package]
+name = "tristim-gui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/computer-whisperer/tristim"
+description = "Aetna-based presenter for tristim captures: load a capture, analyze it, and visualize where a compositor reproduces color faithfully vs. where it drifts."
+# Excluded from the tristim workspace (see ../Cargo.toml): the aetna path deps
+# below are not fetchable in CI, so this crate carries its own Cargo.lock and is
+# built independently with `cargo run` from this directory.
+
+[[bin]]
+name = "tristim-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Presenter UI stack. Local path deps to a sibling aetna checkout; pin to the
+# git version (0.4.x) for the explicit color-mode support.
+aetna-core = { path = "../../aetna/aetna.main/crates/aetna-core" }
+aetna-winit-wgpu = { path = "../../aetna/aetna.main/crates/aetna-winit-wgpu" }
+
+# tristim backend libraries (members of the main workspace, reached by path).
+tristim-capture = { path = "../tristim-capture" }
+tristim-analyze = { path = "../tristim-analyze" }
+tristim-color = { path = "../tristim-color" }

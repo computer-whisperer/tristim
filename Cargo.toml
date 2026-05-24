@@ -8,6 +8,11 @@ members = [
     "tristim-analyze",
     "tristim-cli",
 ]
+# tristim-gui depends on aetna via a local path dep, which CI can't fetch.
+# Excluding it keeps it in the repo as a standalone crate (its own Cargo.lock,
+# built with `cd tristim-gui && cargo run`) without dragging aetna + the GPU
+# stack into the workspace lockfile that CI resolves. See tristim-gui/README.md.
+exclude = ["tristim-gui"]
 
 [workspace.package]
 version = "0.1.0"
