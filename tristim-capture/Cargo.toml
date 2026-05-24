@@ -1,0 +1,13 @@
+[package]
+name = "tristim-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Serde schema for tristim color-validation captures: the on-disk contract between the data gatherer and the analysis/presentation tools."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
