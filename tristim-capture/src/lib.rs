@@ -116,8 +116,10 @@ pub struct Capabilities {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FormatTrial {
     /// The colorimetry we requested ("settings Y"). The analysis tool derives
-    /// the expected output from this.
-    pub requested: ColorDescription,
+    /// the expected output from this. `None` for an unmanaged trial (a plain
+    /// buffer with no negotiated description) — its samples carry no verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<ColorDescription>,
     /// `wl_shm` pixel format the buffer used, e.g. `"xrgb8888"` or
     /// `"xbgr16161616f"`.
     pub pixel_format: String,
@@ -270,7 +272,7 @@ mod tests {
                 supported_render_intents: vec!["perceptual".into()],
             },
             trials: vec![FormatTrial {
-                requested: ColorDescription {
+                requested: Some(ColorDescription {
                     transfer_function: "st2084_pq".to_string(),
                     primaries: "bt2020".to_string(),
                     reference_white_nits: Some(203.0),
@@ -280,7 +282,7 @@ mod tests {
                         max_cll_nits: 400.0,
                         max_fall_nits: 200.0,
                     }),
-                },
+                }),
                 pixel_format: "xbgr16161616f".to_string(),
                 outcome: Negotiation::Accepted { identity: 42 },
                 samples: vec![Sample {
@@ -313,12 +315,12 @@ mod tests {
         let mut capture = sample_capture();
         capture.trials[0].outcome = Negotiation::Unmanaged;
         capture.trials.push(FormatTrial {
-            requested: ColorDescription {
+            requested: Some(ColorDescription {
                 transfer_function: "srgb".to_string(),
                 primaries: "dci_p3".to_string(),
                 reference_white_nits: None,
                 mastering: None,
-            },
+            }),
             pixel_format: "xrgb8888".to_string(),
             outcome: Negotiation::Rejected {
                 cause: "unsupported_primaries".to_string(),
@@ -336,12 +338,14 @@ mod tests {
         let mut capture = sample_capture();
         capture.tool.git_revision = None;
         capture.output.mode = None;
-        capture.trials[0].requested.reference_white_nits = None;
-        capture.trials[0].requested.mastering = None;
+        if let Some(d) = &mut capture.trials[0].requested {
+            d.reference_white_nits = None;
+            d.mastering = None;
+        }
         let json = capture.to_json_pretty().expect("serialize");
         assert!(!json.contains("git_revision"));
         assert!(!json.contains("\"mode\""));
         assert!(!json.contains("reference_white_nits"));
-        assert!(!json.contains("mastering"));
+        assert!(!json.contains("\"mastering\""));
     }
 }
