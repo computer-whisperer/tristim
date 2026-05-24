@@ -47,8 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "opening patch on output '{}' with color {:?} for {}s",
         output, rgb, secs
     );
-    let mut patch = PatchSurface::open(&output)?;
-    patch.set_color(rgb)?;
+    let mut patch = PatchSurface::open_sdr(&output)?;
+    patch.set_code_values(rgb)?;
     std::thread::sleep(Duration::from_secs(secs));
     drop(patch);
     Ok(())

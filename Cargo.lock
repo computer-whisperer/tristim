@@ -474,6 +474,7 @@ dependencies = [
 name = "tristim-cli"
 version = "0.1.0"
 dependencies = [
+ "tristim-capture",
  "tristim-display",
  "tristim-driver",
 ]

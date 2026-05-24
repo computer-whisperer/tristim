@@ -21,37 +21,69 @@ use wayland_protocols::wp::color_management::v1::client::{
     wp_image_description_v1::{self, WpImageDescriptionV1},
 };
 
-/// Parameters for the PQ + BT.2020 description we attach to an HDR
-/// patch surface. Values match what the OLED expects (and what the
-/// compositor advertises as its preferred description for that
-/// output) — feeding mastering metadata that disagrees with the
-/// compositor's expectations would still validate, but produces a
-/// description the compositor's renderer might tone-map.
-#[derive(Clone, Copy, Debug)]
-pub struct PqDescriptionParams {
-    /// Mastering display minimum luminance, in cd/m² × 10000 (the
-    /// protocol's `min_lum` argument unit).
-    pub mastering_min_lum_ticks: u32,
-    /// Mastering display peak luminance, in cd/m².
-    pub mastering_max_lum: u32,
-    /// Max content light level, in cd/m².
-    pub max_cll: u32,
-    /// Max frame-average light level, in cd/m².
-    pub max_fall: u32,
+/// A parametric color description to negotiate with the compositor.
+///
+/// Transfer function and primaries are named by their protocol-enum
+/// strings (e.g. `"st2084_pq"`, `"bt2020"`) — see [`tf_named`] /
+/// [`primaries_named`] for the supported set. Luminances and mastering
+/// metadata are optional and given in semantic units (cd/m²); they are
+/// converted to the protocol's tick units at attach time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DescriptionRequest {
+    pub transfer_function: String,
+    pub primaries: String,
+    pub luminances: Option<Luminances>,
+    pub mastering: Option<Mastering>,
 }
 
-impl PqDescriptionParams {
-    /// Reasonable default for measurement: 400-nit peak (matches the
-    /// ASUS PG27UCDM OLED's certified HDR400 True Black), min ~0.0005
-    /// nits (OLED black). Caller may override per panel.
-    pub fn pg27ucdm_default() -> Self {
-        Self {
-            mastering_min_lum_ticks: 5, // 0.0005 cd/m²
-            mastering_max_lum: 400,
-            max_cll: 400,
-            max_fall: 200,
-        }
-    }
+/// Reference luminances for the description, in cd/m².
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Luminances {
+    pub min_nits: f64,
+    pub max_nits: f64,
+    pub reference_nits: f64,
+}
+
+/// Mastering-display metadata for the description, in cd/m².
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mastering {
+    pub min_nits: f64,
+    pub max_nits: f64,
+    pub max_cll_nits: f64,
+    pub max_fall_nits: f64,
+}
+
+/// Map a transfer-function name to the protocol enum, or `None` if this
+/// build doesn't map it. Extend as needed — names are the protocol's own
+/// `transfer_function` enum entries.
+pub fn tf_named(name: &str) -> Option<wp_color_manager_v1::TransferFunction> {
+    use wp_color_manager_v1::TransferFunction as T;
+    Some(match name {
+        "bt1886" => T::Bt1886,
+        "gamma22" => T::Gamma22,
+        "gamma28" => T::Gamma28,
+        "srgb" => T::Srgb,
+        "ext_srgb" => T::ExtSrgb,
+        "st2084_pq" => T::St2084Pq,
+        "hlg" => T::Hlg,
+        _ => return None,
+    })
+}
+
+/// Map a primaries name to the protocol enum, or `None` if this build
+/// doesn't map it. Names are the protocol's own `primaries` enum entries.
+pub fn primaries_named(name: &str) -> Option<wp_color_manager_v1::Primaries> {
+    use wp_color_manager_v1::Primaries as P;
+    Some(match name {
+        "srgb" => P::Srgb,
+        "pal" => P::Pal,
+        "ntsc" => P::Ntsc,
+        "bt2020" => P::Bt2020,
+        "dci_p3" => P::DciP3,
+        "display_p3" => P::DisplayP3,
+        "adobe_rgb" => P::AdobeRgb,
+        _ => return None,
+    })
 }
 
 /// Outcome of building the parametric description. Updated by the
@@ -97,6 +129,11 @@ fn wenum_str<T: std::fmt::Debug>(w: WEnum<T>) -> String {
     }
 }
 
+/// nits → the protocol's `min_lum` tick unit (0.0001 cd/m²).
+fn nits_to_min_ticks(nits: f64) -> u32 {
+    (nits * 10_000.0).round().max(0.0) as u32
+}
+
 /// Wraps the lifetime of a color-management binding for one patch
 /// surface. Holds the manager + description + per-surface extension
 /// objects; dropping detaches the description (and the surface
@@ -108,65 +145,90 @@ pub struct ColorManagedSurface {
     pub state: Arc<Mutex<DescriptionState>>,
 }
 
+/// Reason a description couldn't even be requested (before the compositor
+/// weighs in via ready/failed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachError {
+    UnknownTransferFunction(String),
+    UnknownPrimaries(String),
+}
+
+impl std::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttachError::UnknownTransferFunction(n) => {
+                write!(f, "unsupported transfer function name: {n:?}")
+            }
+            AttachError::UnknownPrimaries(n) => write!(f, "unsupported primaries name: {n:?}"),
+        }
+    }
+}
+
+impl std::error::Error for AttachError {}
+
 impl ColorManagedSurface {
-    /// Build a parametric description + attach it to `wl_surface`.
-    /// Caller must roundtrip the event queue afterwards to flush the
-    /// create + set requests and pick up the `ready`/`failed` event.
+    /// Build a parametric description from `req` + attach it to
+    /// `wl_surface`. Caller must roundtrip the event queue afterwards to
+    /// flush the create + set requests and pick up the `ready`/`failed`
+    /// event.
     pub fn attach<D>(
         manager: WpColorManagerV1,
         qh: &QueueHandle<D>,
         wl_surface: &WlSurface,
-        params: PqDescriptionParams,
-    ) -> Self
+        req: &DescriptionRequest,
+    ) -> Result<Self, AttachError>
     where
         D: Dispatch<WpImageDescriptionCreatorParamsV1, ()> + 'static,
         D: Dispatch<WpImageDescriptionV1, Arc<Mutex<DescriptionState>>> + 'static,
         D: Dispatch<WpColorManagementSurfaceV1, ()> + 'static,
     {
+        let tf = tf_named(&req.transfer_function)
+            .ok_or_else(|| AttachError::UnknownTransferFunction(req.transfer_function.clone()))?;
+        let primaries = primaries_named(&req.primaries)
+            .ok_or_else(|| AttachError::UnknownPrimaries(req.primaries.clone()))?;
+
         // 1) Build a parametric creator.
         let creator = manager.create_parametric_creator(qh, ());
 
-        // 2) Required fields: TF + primaries. (luminances /
-        //    mastering / max_cll / max_fall are optional but we set
-        //    them all because the compositor's preferred description
-        //    for the HDR output includes them — matching identities
-        //    cleanly is the easier debug path.)
-        creator.set_tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
-        creator.set_primaries_named(wp_color_manager_v1::Primaries::Bt2020);
+        // 2) Required fields: TF + primaries.
+        creator.set_tf_named(tf);
+        creator.set_primaries_named(primaries);
 
-        // luminances: PQ defaults per spec are min 0.005, max ignored
-        // (always min + 10000), reference 203. We pass them explicitly.
-        creator.set_luminances(
-            50,     // 0.005 cd/m² × 10000
-            10_000, // ignored for st2084_pq
-            203,    // reference white
-        );
+        // 3) Optional luminances + mastering metadata.
+        if let Some(l) = req.luminances {
+            creator.set_luminances(
+                nits_to_min_ticks(l.min_nits),
+                l.max_nits.round().max(0.0) as u32,
+                l.reference_nits.round().max(0.0) as u32,
+            );
+        }
+        if let Some(m) = req.mastering {
+            creator.set_mastering_luminance(
+                nits_to_min_ticks(m.min_nits),
+                m.max_nits.round().max(0.0) as u32,
+            );
+            creator.set_max_cll(m.max_cll_nits.round().max(0.0) as u32);
+            creator.set_max_fall(m.max_fall_nits.round().max(0.0) as u32);
+        }
 
-        // mastering display — primaries default to the primary color
-        // volume (BT.2020), so we only need to set luminances + cll
-        // + fall.
-        creator.set_mastering_luminance(params.mastering_min_lum_ticks, params.mastering_max_lum);
-        creator.set_max_cll(params.max_cll);
-        creator.set_max_fall(params.max_fall);
-
-        // 3) Materialize the description. The state Mutex is the
+        // 4) Materialize the description. The state Mutex is the
         //    side-channel the dispatch impl updates from ready/failed.
         let state = Arc::new(Mutex::new(DescriptionState::Pending));
         let description = creator.create(qh, state.clone());
 
-        // 4) Get the surface extension + set the description on it
-        //    with perceptual intent. Compositors must support
-        //    perceptual; everything else is optional.
+        // 5) Get the surface extension + set the description on it with
+        //    perceptual intent. Compositors must support perceptual;
+        //    everything else is optional.
         let surface_ext = manager.get_surface(wl_surface, qh, ());
         surface_ext
             .set_image_description(&description, wp_color_manager_v1::RenderIntent::Perceptual);
 
-        Self {
+        Ok(Self {
             manager,
             description,
             surface_ext,
             state,
-        }
+        })
     }
 
     /// Snapshot the current description state. Useful for polling

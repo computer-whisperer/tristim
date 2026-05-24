@@ -1,24 +1,30 @@
-//! `tristim` — orchestrate a Datacolor Spyder colorimeter + a Wayland
-//! test-patch surface to characterize displays.
+//! `tristim` — the data gatherer.
+//!
+//! Drives a Datacolor Spyder colorimeter + a Wayland patch surface to
+//! capture how a compositor reproduces color, and writes the result to a
+//! `tristim-capture` JSON file. It records *facts only* — what the
+//! compositor advertised, what color description we negotiated (and
+//! whether it accepted), and the code-value→measurement samples. All
+//! interpretation (computing the expected output, scoring error) is the
+//! analysis tool's job.
 //!
 //! Subcommands:
-//!   tristim list-outputs                          enumerate connected outputs
-//!   tristim info                                  open the colorimeter, print HW info
-//!   tristim measure [--cal N]                     take one XYZ measurement
-//!                                                 (puck must be aimed manually)
-//!   tristim sweep --output NAME [opts]            walk a color set on NAME,
-//!                                                 measure each, write CSV
-//!   tristim analyze FILE.csv [FILE.csv ...]       summarize sweep(s)
+//!   tristim list-outputs                 enumerate connected outputs
+//!   tristim info                         open the colorimeter, print HW info
+//!   tristim measure [--cal N]            take one XYZ measurement (aim manually)
+//!   tristim capture --output NAME ...    run a capture session, write JSON
 
-mod analyze;
-
+use std::collections::HashMap;
 use std::error::Error;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
-use std::time::Duration;
-use tristim_display::{PatchSurface, list_outputs};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tristim_capture as cap;
+use tristim_display::{
+    self as display, BufferFormat, DescriptionRequest, DescriptionState, PatchSurface, list_outputs,
+};
 use tristim_driver::Colorimeter;
+use tristim_driver::measurement::raw_to_xyz;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let argv: Vec<String> = std::env::args().collect();
@@ -28,8 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "list-outputs" | "outputs" | "ls" => cmd_list_outputs(),
         "info" => cmd_info(),
         "measure" => cmd_measure(&argv[2..]),
-        "sweep" => cmd_sweep(&argv[2..]),
-        "analyze" | "analyse" => analyze::run(&argv[2..]),
+        "capture" => cmd_capture(&argv[2..]),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -48,32 +53,41 @@ fn print_usage() {
     eprintln!("  list-outputs              enumerate Wayland outputs");
     eprintln!("  info                      open the colorimeter, print HW info");
     eprintln!("  measure [--cal N]         take one XYZ measurement (aim puck manually)");
-    eprintln!("  sweep --output NAME [opts]");
-    eprintln!("        Walk a color set on NAME, measuring each. Options:");
-    eprintln!("          --out FILE           write CSV (default: sweep.csv)");
-    eprintln!("          --cal N              calibration index (default: 0)");
-    eprintln!("          --grey-steps N       grayscale ramp size (default: 11)");
-    eprintln!("          --prep-secs N        seconds to wait for puck placement (default: 6)");
-    eprintln!("          --settle-ms N        ms to wait after each color change (default: 250)");
+    eprintln!("  capture --output NAME [opts]");
+    eprintln!("        Run a capture session and write a tristim-capture JSON file.");
+    eprintln!("        Options:");
+    eprintln!("          --out FILE         output path (default: capture.json)");
+    eprintln!("          --cal N            calibration index (default: 0)");
+    eprintln!("          --settle-ms N      ms to wait after each patch (default: 250)");
+    eprintln!("          --prep-secs N      seconds to wait for puck placement (default: 6)");
+    eprintln!("          --window F         centered-window area fraction (default: 1.0)");
+    eprintln!("          --border R,G,B     surround code values for windowed/anti-CABL use");
+    eprintln!("          --format SPEC      color format to negotiate (repeatable, >=1 required)");
+    eprintln!("          --seq SPEC         color sequence to run (repeatable, >=1 required)");
+    eprintln!();
+    eprintln!("        --format SPEC (name[:k=v,...]):");
+    eprintln!("          unmanaged                      plain 8-bit buffer, no description");
+    eprintln!("          srgb                           8-bit, sRGB TF + sRGB primaries");
+    eprintln!("          srgb-p3                        8-bit, sRGB TF + Display-P3 primaries");
+    eprintln!("          pq-bt2020[:peak=,maxcll=,maxfall=,min=]   fp16, PQ + BT.2020");
+    eprintln!("          pq-p3[:...]                    fp16, PQ + Display-P3");
+    eprintln!("        mastering params are in cd/m² (peak default 400).");
+    eprintln!();
+    eprintln!("        --seq SPEC:");
+    eprintln!("          grey:N            N-step grey ramp 0..1 (default N=11)");
+    eprintln!("          primaries:N       per-channel R/G/B ramps, N steps (default 5)");
     eprintln!(
-        "          --hdr                run an HDR PQ sweep (fp16 + wp_color_management_v1);"
+        "          scatter:N         N uniform code-value points (deterministic; default 32)"
     );
-    eprintln!(
-        "                               patch values are absolute cd/m². Requires a compositor"
-    );
-    eprintln!("                               that advertises both (e.g. prism).");
-    eprintln!("          --peak-nits N        HDR mastering peak luminance, cd/m² (default: 400)");
-    eprintln!("          --max-cll N          HDR max content light level, cd/m² (default: peak)");
-    eprintln!(
-        "          --max-fall N         HDR max frame-average light, cd/m² (default: peak/2)"
-    );
-    eprintln!("          --window F           centered bright window covering fraction F of");
-    eprintln!("                               output area on a black background (default: 1.0 =");
-    eprintln!("                               fullscreen). Use ~0.04–0.10 to measure OLED peak");
-    eprintln!("                               brightness past ABL.");
-    eprintln!("  analyze FILE.csv [FILE.csv ...]");
-    eprintln!("        Summarize one sweep (detailed) or compare several (table + ΔuV matrix).");
+    eprintln!();
+    eprintln!("        Each --format runs every --seq (the same code values under each");
+    eprintln!("        encoding). Example:");
+    eprintln!("          tristim capture --output DP-4 --out s.json \\");
+    eprintln!("              --format unmanaged --format srgb --format pq-bt2020:peak=400 \\");
+    eprintln!("              --seq grey:11 --seq primaries:5 --seq scatter:64");
 }
+
+// ── diagnostics ─────────────────────────────────────────────────────────────
 
 fn cmd_list_outputs() -> Result<(), Box<dyn Error>> {
     for o in list_outputs()? {
@@ -82,7 +96,7 @@ fn cmd_list_outputs() -> Result<(), Box<dyn Error>> {
             o.name,
             o.model,
             o.size
-                .map(|(w, h)| format!("{}x{}", w, h))
+                .map(|(w, h)| format!("{w}x{h}"))
                 .unwrap_or_else(|| "?".into()),
             o.description
         );
@@ -110,299 +124,561 @@ fn cmd_info() -> Result<(), Box<dyn Error>> {
 }
 
 fn cmd_measure(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let cal: u8 = arg_value(args, "--cal")
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
+    let cal: u8 = parse_opt(args, "--cal", 0);
     let mut device = Colorimeter::open_any()?;
     let info = device.get_info()?;
     println!(
-        "Spyder 2024 SN {} — HW {}.{:02}",
-        info.serial, info.hw_version.0, info.hw_version.1
+        "{} SN {} — HW {}.{:02}",
+        if device.is_spyder_2024() {
+            "Spyder 2024"
+        } else {
+            "SpyderX2"
+        },
+        info.serial,
+        info.hw_version.0,
+        info.hw_version.1
     );
-
-    println!("Measuring (cal {})... aim the puck.", cal);
+    println!("Measuring (cal {cal})... aim the puck.");
     let (xyz, raw, _, _) = device.measure_xyz(cal)?;
     println!("Raw  : {:?}", raw.0);
     println!("X={:.4}  Y={:.4} cd/m²  Z={:.4}", xyz.x, xyz.y, xyz.z);
     if let Some((x, y)) = xyz.chromaticity() {
-        println!("xy   : ({:.4}, {:.4})", x, y);
+        println!("xy   : ({x:.4}, {y:.4})");
     }
     Ok(())
 }
 
-fn cmd_sweep(args: &[String]) -> Result<(), Box<dyn Error>> {
+// ── capture ───────────────────────────────────────────────────────────────
+
+fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
     let output = arg_value(args, "--output")
         .ok_or("--output NAME is required (try `tristim list-outputs`)")?;
-    let out_path: PathBuf = arg_value(args, "--out")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "sweep.csv".into());
-    let cal_index: u8 = arg_value(args, "--cal")
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let grey_steps: usize = arg_value(args, "--grey-steps")
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(11);
-    let prep_secs: u64 = arg_value(args, "--prep-secs")
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(6);
-    let settle_ms: u64 = arg_value(args, "--settle-ms")
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(250);
+    let out_path = arg_value(args, "--out").unwrap_or_else(|| "capture.json".into());
+    let cal_index: u8 = parse_opt(args, "--cal", 0);
+    let settle_ms: u64 = parse_opt(args, "--settle-ms", 250);
+    let prep_secs: u64 = parse_opt(args, "--prep-secs", 6);
+    let window_fraction: f64 = parse_opt(args, "--window", 1.0);
+    let border: Option<[f64; 3]> = match arg_value(args, "--border") {
+        Some(s) => Some(parse_rgb(&s)?),
+        None => None,
+    };
 
-    // HDR mode: write PQ-encoded fp16 patches via the compositor's
-    // wp_color_management_v1 protocol. Requires prism (or any
-    // compositor advertising the protocol + fp16 shm formats).
-    // Patches are specified in absolute cd/m²; CSV r_in/g_in/b_in
-    // columns carry nits values instead of 0..=1.
-    let hdr_mode = args.iter().any(|a| a == "--hdr");
-    let peak_nits: u32 = arg_value(args, "--peak-nits")
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(400);
-    let max_cll: u32 = arg_value(args, "--max-cll")
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(peak_nits);
-    let max_fall: u32 = arg_value(args, "--max-fall")
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(peak_nits / 2);
-    // Centered-window fraction: 1.0 = fullscreen (default), <1.0 paints a
-    // smaller bright region on a black surround so the panel's ABL doesn't
-    // throttle high-luminance patches.
-    let window_fraction: f64 = arg_value(args, "--window")
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1.0);
-
-    // Build the color set. Values are cd/m² when --hdr, else 0..=1.
-    let mut patches: Vec<Patch> = Vec::new();
-    if hdr_mode {
-        // Grayscale ramp at perceptually-meaningful nits levels.
-        // Skew low — PQ packs most of its precision into the dark
-        // range, so verification is most interesting there.
-        let nits_steps: Vec<f64> = if grey_steps == 11 {
-            vec![
-                0.0,
-                1.0,
-                5.0,
-                10.0,
-                25.0,
-                50.0,
-                100.0,
-                150.0,
-                200.0,
-                300.0,
-                peak_nits as f64,
-            ]
-        } else {
-            // Geometric ramp 0.5..peak.
-            let mut v = vec![0.0];
-            let peak = peak_nits as f64;
-            for k in 1..grey_steps {
-                let t = k as f64 / (grey_steps - 1) as f64;
-                v.push(0.5 * (peak / 0.5).powf(t));
-            }
-            v
-        };
-        for nits in nits_steps {
-            patches.push(Patch::new(
-                format!("grey_{:04}n", nits as i32),
-                [nits, nits, nits],
-            ));
-        }
-        for &nits in &[50.0, 100.0, 200.0, peak_nits as f64] {
-            patches.push(Patch::new(
-                format!("red_{:04}n", nits as i32),
-                [nits, 0.0, 0.0],
-            ));
-            patches.push(Patch::new(
-                format!("grn_{:04}n", nits as i32),
-                [0.0, nits, 0.0],
-            ));
-            patches.push(Patch::new(
-                format!("blu_{:04}n", nits as i32),
-                [0.0, 0.0, nits],
-            ));
-        }
-    } else {
-        for k in 0..grey_steps {
-            let v = k as f64 / (grey_steps - 1) as f64;
-            patches.push(Patch::new(
-                format!("grey_{:03}", (v * 1000.0) as i32),
-                [v, v, v],
-            ));
-        }
-        for &v in &[0.25, 0.5, 0.75, 1.0] {
-            patches.push(Patch::new(
-                format!("red_{:03}", (v * 1000.0) as i32),
-                [v, 0.0, 0.0],
-            ));
-            patches.push(Patch::new(
-                format!("grn_{:03}", (v * 1000.0) as i32),
-                [0.0, v, 0.0],
-            ));
-            patches.push(Patch::new(
-                format!("blu_{:03}", (v * 1000.0) as i32),
-                [0.0, 0.0, v],
-            ));
-        }
+    let format_specs = collect_values(args, "--format")
+        .iter()
+        .map(|s| parse_format(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    if format_specs.is_empty() {
+        return Err("at least one --format is required (see `tristim help`)".into());
     }
 
-    eprintln!(
-        "sweep: output={}, mode={}, cal={}, {} patches, settle {}ms, window={}, csv -> {}",
-        output,
-        if hdr_mode { "HDR PQ" } else { "SDR sRGB" },
-        cal_index,
-        patches.len(),
-        settle_ms,
-        if (window_fraction - 1.0).abs() < 1e-6 {
-            "fullscreen".to_string()
-        } else {
-            format!("{:.1}% area", window_fraction * 100.0)
-        },
-        out_path.display()
-    );
+    let seq_specs = collect_values(args, "--seq");
+    if seq_specs.is_empty() {
+        return Err("at least one --seq is required (see `tristim help`)".into());
+    }
+    let mut sequence = Vec::new();
+    for s in &seq_specs {
+        sequence.extend(parse_sequence(s)?);
+    }
 
-    // Open device + display surface up front so we fail fast if either is broken.
+    // Colorimeter up front so we fail fast.
     let mut device = Colorimeter::open_any()?;
     let info = device.get_info()?;
-    eprintln!(
-        "Spyder SN {} HW {}.{:02}",
-        info.serial, info.hw_version.0, info.hw_version.1
-    );
-
-    // Pre-fetch calibration + setup once. (We re-fetch setup before each
-    // measure inside the driver, but downloading the cal matrix is slow.)
     let cal = device.get_calibration(cal_index)?;
+    let setup = device.get_setup(&cal)?;
     eprintln!(
-        "cal[{}] downloaded: gain={:?}, offset={:?}",
-        cal_index, cal.gain, cal.offset
+        "{} SN {} HW {}.{:02}, cal[{cal_index}]",
+        if device.is_spyder_2024() {
+            "Spyder 2024"
+        } else {
+            "SpyderX2"
+        },
+        info.serial,
+        info.hw_version.0,
+        info.hw_version.1,
     );
 
-    let mut patch_surface = if hdr_mode {
-        use tristim_display::PqDescriptionParams;
-        let params = PqDescriptionParams {
-            mastering_min_lum_ticks: 5, // 0.0005 cd/m² — OLED black
-            mastering_max_lum: peak_nits,
-            max_cll,
-            max_fall,
-        };
-        PatchSurface::open_hdr(&output, params)?
-    } else {
-        PatchSurface::open(&output)?
+    let out_desc = list_outputs()?.into_iter().find(|o| o.name == output);
+    eprintln!(
+        "capture: output={output}, {} formats, {} samples/format, window={window_fraction}, -> {out_path}",
+        format_specs.len(),
+        sequence.len(),
+    );
+
+    // Probe surface: collect capabilities + run the one-time puck-placement
+    // countdown with a black patch on screen.
+    let capabilities = {
+        let mut probe = PatchSurface::open_sdr(&output)?;
+        probe.set_code_values([0.0, 0.0, 0.0])?;
+        let caps = to_cap_capabilities(probe.color_capabilities());
+        eprintln!("Place the puck flat against '{output}'. Capture starts in {prep_secs}s.");
+        for s in (1..=prep_secs).rev() {
+            eprintln!("  starting in {s}s...");
+            sleep(Duration::from_secs(1));
+        }
+        caps
     };
-    patch_surface.set_window_fraction(window_fraction)?;
-
-    // Initial dark patch so the user knows where to put the puck.
-    if hdr_mode {
-        patch_surface.set_nits([0.0, 0.0, 0.0])?;
-    } else {
-        patch_surface.set_color([0.0, 0.0, 0.0])?;
-    }
-    eprintln!(
-        "Place the puck flat against output '{}' now. Sweep starts in {}s.",
-        output, prep_secs
-    );
-    for sec in (1..=prep_secs).rev() {
-        eprintln!("  starting in {sec}s...");
-        std::thread::sleep(Duration::from_secs(1));
-    }
-
-    // CSV
-    let csv_file = File::create(&out_path)?;
-    let mut csv = BufWriter::new(csv_file);
-    writeln!(
-        csv,
-        "name,r_in,g_in,b_in,raw0,raw1,raw2,raw3,raw4,raw5,X,Y,Z,x,y"
-    )?;
 
     let settle = Duration::from_millis(settle_ms);
-    let mut max_y = 0.0f64;
-    for (idx, patch) in patches.iter().enumerate() {
-        eprint!(
-            "[{:>2}/{}] {:10} ({:.2}, {:.2}, {:.2}) ... ",
-            idx + 1,
-            patches.len(),
-            patch.name,
-            patch.rgb[0],
-            patch.rgb[1],
-            patch.rgb[2]
-        );
-        if hdr_mode {
-            patch_surface.set_nits(patch.rgb)?;
-        } else {
-            patch_surface.set_color(patch.rgb)?;
+    let mut trials = Vec::new();
+    for fs in &format_specs {
+        eprintln!("── format {} ({}) ──", fs.token, fs.pixel_format_str());
+        let (surface, outcome) =
+            match PatchSurface::open(&output, fs.buffer_format, fs.description.clone()) {
+                Ok(s) => {
+                    let outcome = match s.description_state() {
+                        None => cap::Negotiation::Unmanaged,
+                        Some(DescriptionState::Ready { identity }) => {
+                            cap::Negotiation::Accepted { identity }
+                        }
+                        // open() only returns Ok once Ready, so these are
+                        // defensive — record them as best we can.
+                        Some(DescriptionState::Failed { cause, message }) => {
+                            cap::Negotiation::Rejected { cause, message }
+                        }
+                        Some(DescriptionState::Pending) => cap::Negotiation::Unmanaged,
+                    };
+                    (Some(s), outcome)
+                }
+                Err(display::Error::DescriptionFailed { cause, message }) => {
+                    eprintln!("  compositor rejected this format: {cause}: {message}");
+                    (None, cap::Negotiation::Rejected { cause, message })
+                }
+                Err(display::Error::NoColorManager) => {
+                    eprintln!("  compositor advertises no color manager — recording as rejected");
+                    (
+                        None,
+                        cap::Negotiation::Rejected {
+                            cause: "no_color_manager".into(),
+                            message: "compositor does not advertise wp_color_manager_v1".into(),
+                        },
+                    )
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+        let mut samples = Vec::new();
+        if let Some(mut surface) = surface {
+            surface.set_window_fraction(window_fraction)?;
+            if let Some(b) = border {
+                surface.set_border(b)?;
+            }
+            for (i, cv) in sequence.iter().enumerate() {
+                surface.set_code_values(*cv)?;
+                sleep(settle);
+                let raw = device.measure_raw(&setup)?;
+                let xyz = raw_to_xyz(&raw, &setup, &cal);
+                let xy = xyz.chromaticity().map(|(x, y)| [x, y]);
+                eprintln!(
+                    "  [{:>3}/{}] cv=({:.3},{:.3},{:.3}) -> X={:.3} Y={:.3} Z={:.3}",
+                    i + 1,
+                    sequence.len(),
+                    cv[0],
+                    cv[1],
+                    cv[2],
+                    xyz.x,
+                    xyz.y,
+                    xyz.z,
+                );
+                samples.push(cap::Sample {
+                    requested: *cv,
+                    measured: cap::Measured {
+                        raw: raw.0,
+                        xyz: [xyz.x, xyz.y, xyz.z],
+                        xy,
+                    },
+                    context: cap::SampleContext {
+                        window_fraction,
+                        border,
+                        settle_ms,
+                    },
+                });
+            }
+            // Leave the panel dark before the next format.
+            let _ = surface.set_code_values([0.0, 0.0, 0.0]);
         }
-        std::thread::sleep(settle);
 
-        // Take one measurement.
-        let setup = device.get_setup(&cal)?;
-        let raw = device.measure_raw(&setup)?;
-        let xyz = tristim_driver::measurement::raw_to_xyz(&raw, &setup, &cal);
-        let chroma = xyz.chromaticity().unwrap_or((0.0, 0.0));
-
-        eprintln!(
-            "X={:.3} Y={:.3} Z={:.3}  xy=({:.4},{:.4})",
-            xyz.x, xyz.y, xyz.z, chroma.0, chroma.1
-        );
-        max_y = max_y.max(xyz.y);
-
-        writeln!(
-            csv,
-            "{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6}",
-            patch.name,
-            patch.rgb[0],
-            patch.rgb[1],
-            patch.rgb[2],
-            raw.0[0],
-            raw.0[1],
-            raw.0[2],
-            raw.0[3],
-            raw.0[4],
-            raw.0[5],
-            xyz.x,
-            xyz.y,
-            xyz.z,
-            chroma.0,
-            chroma.1,
-        )?;
+        trials.push(cap::FormatTrial {
+            requested: fs.color_description(),
+            pixel_format: fs.pixel_format_str().to_string(),
+            outcome,
+            samples,
+        });
     }
 
-    // Black patch on the way out so the panel isn't left glaring.
-    if hdr_mode {
-        let _ = patch_surface.set_nits([0.0, 0.0, 0.0]);
-    } else {
-        let _ = patch_surface.set_color([0.0, 0.0, 0.0]);
-    }
+    let capture = cap::Capture {
+        schema_version: cap::SCHEMA_VERSION,
+        timestamp: rfc3339_utc_now(),
+        tool: cap::ToolInfo {
+            name: "tristim".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            git_revision: None,
+        },
+        device: cap::DeviceInfo {
+            product: if device.is_spyder_2024() {
+                "Spyder 2024".into()
+            } else {
+                "SpyderX2".into()
+            },
+            usb_pid: device.pid(),
+            serial: info.serial.clone(),
+            hw_version: info.hw_version,
+            cal_index,
+        },
+        output: cap::OutputInfo {
+            name: output.clone(),
+            make: out_desc
+                .as_ref()
+                .map(|o| o.make.clone())
+                .unwrap_or_default(),
+            model: out_desc
+                .as_ref()
+                .map(|o| o.model.clone())
+                .unwrap_or_default(),
+            description: out_desc
+                .as_ref()
+                .map(|o| o.description.clone())
+                .unwrap_or_default(),
+            mode: out_desc
+                .as_ref()
+                .and_then(|o| o.size)
+                .map(|(w, h)| cap::OutputMode {
+                    width: w,
+                    height: h,
+                    refresh_mhz: None,
+                }),
+        },
+        capabilities,
+        trials,
+    };
 
-    eprintln!();
-    eprintln!(
-        "Done. Peak measured Y = {:.2} cd/m². CSV at {}.",
-        max_y,
-        out_path.display()
-    );
+    capture.save(&out_path)?;
+    eprintln!("Done. Wrote capture to {out_path}.");
     Ok(())
 }
 
-struct Patch {
-    name: String,
-    rgb: [f64; 3],
-}
-
-impl Patch {
-    fn new(name: String, rgb: [f64; 3]) -> Self {
-        Self { name, rgb }
+fn to_cap_capabilities(c: &display::ColorCapabilities) -> cap::Capabilities {
+    cap::Capabilities {
+        supported_transfer_functions: c.transfer_functions.clone(),
+        supported_primaries: c.primaries.clone(),
+        supported_features: c.features.clone(),
+        supported_render_intents: c.render_intents.clone(),
     }
 }
+
+// ── format / sequence parsing ───────────────────────────────────────────────
+
+/// A parsed `--format` spec: the buffer format + the description to
+/// negotiate (None = unmanaged).
+struct FormatSpec {
+    token: String,
+    buffer_format: BufferFormat,
+    description: Option<DescriptionRequest>,
+}
+
+impl FormatSpec {
+    fn pixel_format_str(&self) -> &'static str {
+        match self.buffer_format {
+            BufferFormat::Xrgb8888 => "xrgb8888",
+            BufferFormat::Xbgr16161616f => "xbgr16161616f",
+        }
+    }
+
+    /// The capture-schema description mirroring what we requested.
+    fn color_description(&self) -> Option<cap::ColorDescription> {
+        self.description.as_ref().map(|d| cap::ColorDescription {
+            transfer_function: d.transfer_function.clone(),
+            primaries: d.primaries.clone(),
+            reference_white_nits: d.luminances.map(|l| l.reference_nits),
+            mastering: d.mastering.map(|m| cap::Mastering {
+                min_luminance_nits: m.min_nits,
+                max_luminance_nits: m.max_nits,
+                max_cll_nits: m.max_cll_nits,
+                max_fall_nits: m.max_fall_nits,
+            }),
+        })
+    }
+}
+
+fn parse_format(spec: &str) -> Result<FormatSpec, String> {
+    let (name, params_str) = spec.split_once(':').unwrap_or((spec, ""));
+    let params = parse_params(params_str)?;
+    let token = spec.to_string();
+
+    let mk_mastering = |default_peak: f64| {
+        let peak = params.get("peak").copied().unwrap_or(default_peak);
+        display::Mastering {
+            min_nits: params.get("min").copied().unwrap_or(0.0005),
+            max_nits: peak,
+            max_cll_nits: params.get("maxcll").copied().unwrap_or(peak),
+            max_fall_nits: params.get("maxfall").copied().unwrap_or(peak / 2.0),
+        }
+    };
+    let managed = |bf, tf: &str, prim: &str, mastering| FormatSpec {
+        token: token.clone(),
+        buffer_format: bf,
+        description: Some(DescriptionRequest {
+            transfer_function: tf.to_string(),
+            primaries: prim.to_string(),
+            luminances: None,
+            mastering,
+        }),
+    };
+
+    Ok(match name {
+        "unmanaged" => FormatSpec {
+            token: token.clone(),
+            buffer_format: BufferFormat::Xrgb8888,
+            description: None,
+        },
+        "srgb" => managed(BufferFormat::Xrgb8888, "srgb", "srgb", None),
+        "srgb-p3" => managed(BufferFormat::Xrgb8888, "srgb", "display_p3", None),
+        "pq-bt2020" => managed(
+            BufferFormat::Xbgr16161616f,
+            "st2084_pq",
+            "bt2020",
+            Some(mk_mastering(400.0)),
+        ),
+        "pq-p3" => managed(
+            BufferFormat::Xbgr16161616f,
+            "st2084_pq",
+            "display_p3",
+            Some(mk_mastering(400.0)),
+        ),
+        other => {
+            return Err(format!(
+                "unknown format {other:?} (known: unmanaged, srgb, srgb-p3, pq-bt2020, pq-p3)"
+            ));
+        }
+    })
+}
+
+fn parse_params(s: &str) -> Result<HashMap<String, f64>, String> {
+    let mut m = HashMap::new();
+    if s.is_empty() {
+        return Ok(m);
+    }
+    for kv in s.split(',') {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("bad param {kv:?} (expected key=value)"))?;
+        let val: f64 = v
+            .parse()
+            .map_err(|_| format!("bad number in param {kv:?}"))?;
+        m.insert(k.to_string(), val);
+    }
+    Ok(m)
+}
+
+/// Parse a `--seq` spec into a list of `0..=1` code-value triples.
+fn parse_sequence(spec: &str) -> Result<Vec<[f64; 3]>, String> {
+    let (name, arg) = spec.split_once(':').unwrap_or((spec, ""));
+    match name {
+        "grey" | "gray" => Ok(grey_ramp(parse_count(arg, 11)?)),
+        "primaries" => Ok(primary_ramps(parse_count(arg, 5)?)),
+        // Fixed seed → reproducible scatter across runs.
+        "scatter" => Ok(scatter(parse_count(arg, 32)?, 0x7472_6973_7469_6d01)),
+        other => Err(format!(
+            "unknown sequence {other:?} (known: grey, primaries, scatter)"
+        )),
+    }
+}
+
+fn parse_count(arg: &str, default: usize) -> Result<usize, String> {
+    if arg.is_empty() {
+        return Ok(default);
+    }
+    arg.parse()
+        .map_err(|_| format!("bad count {arg:?} (expected a positive integer)"))
+}
+
+/// N-step grey ramp from 0 to 1 inclusive.
+fn grey_ramp(n: usize) -> Vec<[f64; 3]> {
+    let n = n.max(2);
+    (0..n)
+        .map(|k| {
+            let v = k as f64 / (n - 1) as f64;
+            [v, v, v]
+        })
+        .collect()
+}
+
+/// Per-channel R/G/B ramps, `n - 1` steps each from `1/(n-1)` to `1.0`
+/// (skipping 0, the shared black already covered by grey ramps).
+fn primary_ramps(n: usize) -> Vec<[f64; 3]> {
+    let n = n.max(2);
+    let mut out = Vec::new();
+    for ch in 0..3 {
+        for k in 1..n {
+            let v = k as f64 / (n - 1) as f64;
+            let mut rgb = [0.0; 3];
+            rgb[ch] = v;
+            out.push(rgb);
+        }
+    }
+    out
+}
+
+/// `n` uniform code-value triples in `[0, 1)`, deterministic from `seed`
+/// (splitmix64) so captures are reproducible and comparable across runs.
+fn scatter(n: usize, seed: u64) -> Vec<[f64; 3]> {
+    let mut state = seed;
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    };
+    (0..n).map(|_| [next(), next(), next()]).collect()
+}
+
+// ── arg helpers ─────────────────────────────────────────────────────────────
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
     let i = args.iter().position(|a| a == flag)?;
     args.get(i + 1).cloned()
+}
+
+/// All values for a flag that may be repeated (e.g. `--format`).
+fn collect_values(args: &[String], flag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == flag {
+            if let Some(v) = args.get(i + 1) {
+                out.push(v.clone());
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn parse_opt<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> T {
+    arg_value(args, flag)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_rgb(s: &str) -> Result<[f64; 3], String> {
+    let parts = s
+        .split(',')
+        .map(|p| p.trim().parse::<f64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| format!("bad RGB triple {s:?}"))?;
+    if parts.len() != 3 {
+        return Err(format!("expected R,G,B (three values), got {s:?}"));
+    }
+    Ok([parts[0], parts[1], parts[2]])
+}
+
+// ── time ────────────────────────────────────────────────────────────────────
+
+/// Current UTC time as an RFC 3339 string (second precision). Dependency-free
+/// civil-date conversion (Howard Hinnant's algorithm).
+fn rfc3339_utc_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Days since 1970-01-01 → (year, month, day). Valid across the Gregorian
+/// range we care about.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (y + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_unmanaged_has_no_description() {
+        let f = parse_format("unmanaged").unwrap();
+        assert!(f.description.is_none());
+        assert_eq!(f.pixel_format_str(), "xrgb8888");
+        assert!(f.color_description().is_none());
+    }
+
+    #[test]
+    fn format_srgb_declares_srgb() {
+        let f = parse_format("srgb").unwrap();
+        let d = f.description.unwrap();
+        assert_eq!(d.transfer_function, "srgb");
+        assert_eq!(d.primaries, "srgb");
+        assert!(d.mastering.is_none());
+    }
+
+    #[test]
+    fn format_pq_params_override_mastering() {
+        let f = parse_format("pq-bt2020:peak=600,maxfall=300").unwrap();
+        assert_eq!(f.pixel_format_str(), "xbgr16161616f");
+        let d = f.description.unwrap();
+        assert_eq!(d.transfer_function, "st2084_pq");
+        assert_eq!(d.primaries, "bt2020");
+        let m = d.mastering.unwrap();
+        assert_eq!(m.max_nits, 600.0);
+        assert_eq!(m.max_cll_nits, 600.0); // defaults to peak
+        assert_eq!(m.max_fall_nits, 300.0);
+    }
+
+    #[test]
+    fn format_unknown_errors() {
+        assert!(parse_format("nope").is_err());
+        assert!(parse_format("pq-bt2020:peak=x").is_err());
+    }
+
+    #[test]
+    fn grey_ramp_spans_zero_to_one() {
+        let r = grey_ramp(11);
+        assert_eq!(r.len(), 11);
+        assert_eq!(r[0], [0.0, 0.0, 0.0]);
+        assert_eq!(r[10], [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn primary_ramps_cover_three_channels() {
+        let r = primary_ramps(5);
+        assert_eq!(r.len(), 3 * 4); // (n-1) per channel
+        assert_eq!(r[3], [1.0, 0.0, 0.0]); // last red step = full red
+        assert_eq!(r[7], [0.0, 1.0, 0.0]); // last green step = full green
+    }
+
+    #[test]
+    fn scatter_is_deterministic_and_in_range() {
+        let a = scatter(16, 0x1234);
+        let b = scatter(16, 0x1234);
+        assert_eq!(a, b);
+        assert_ne!(scatter(16, 0x1234), scatter(16, 0x5678));
+        for p in a {
+            for c in p {
+                assert!((0.0..1.0).contains(&c), "{c} out of range");
+            }
+        }
+    }
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 2026-05-24 is 20597 days after the epoch.
+        assert_eq!(civil_from_days(20_597), (2026, 5, 24));
+    }
 }

@@ -51,8 +51,11 @@ working from the documented wire format, not a code translation.
 - `tristim-display/` — Wayland layer-shell client that renders known SDR/HDR
   patches on a chosen output, with optional centered-window mode for
   ABL-limited OLED peak measurement.
-- `tristim-cli/` — orchestrator binary `tristim` (`info`, `measure`, `sweep`,
-  `analyze`).
+- `tristim-capture/` — serde schema for capture files: the contract between
+  the gatherer and the analysis/presentation tools. No heavy deps.
+- `tristim-cli/` — the gatherer binary `tristim` (`list-outputs`, `info`,
+  `measure`, `capture`). `capture` drives a format × color-sequence sweep and
+  writes a capture JSON.
 
 ArgyllCMS source is referenced (read-only) under `refs/argyll/` for
 protocol-decoding purposes. We don't link it.
