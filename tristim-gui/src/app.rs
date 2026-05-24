@@ -11,6 +11,8 @@ use tristim_analyze::{AnalyzedCapture, AnalyzedTrial, GroundTruth, GroundTruthSo
 use tristim_capture::Capture;
 use tristim_color::metrics;
 
+use crate::chart::chromaticity_chart;
+
 /// The loaded capture, its analysis, and which trial is in focus.
 pub struct PresenterApp {
     capture: Capture,
@@ -132,8 +134,16 @@ impl PresenterApp {
                 text(ground_truth_line(t)).muted().font_size(13.0),
             ])
             .gap(2.0),
-            summary_card(t),
-            plot_placeholder(),
+            row([
+                chromaticity_chart(t),
+                column([summary_card(t).width(Size::Fill(1.0)), chart_legend()])
+                    .gap(tokens::SPACE_3)
+                    .width(Size::Fill(1.0)),
+            ])
+            .gap(tokens::SPACE_4)
+            .align(Align::Start)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0)),
         ])
         .gap(tokens::SPACE_4)
         .width(Size::Fill(1.0))
@@ -193,7 +203,7 @@ fn stat_row(label: &str, value: impl Into<String>) -> El {
         text(label)
             .muted()
             .font_size(13.0)
-            .width(Size::Fixed(150.0)),
+            .width(Size::Fixed(130.0)),
         mono(value).font_size(13.0),
     ])
     .gap(tokens::SPACE_3)
@@ -205,7 +215,7 @@ fn stat_row_colored(label: &str, value: impl Into<String>, color: Color) -> El {
         text(label)
             .muted()
             .font_size(13.0)
-            .width(Size::Fixed(150.0)),
+            .width(Size::Fixed(130.0)),
         mono(value).font_size(13.0).text_color(color),
     ])
     .gap(tokens::SPACE_3)
@@ -264,21 +274,19 @@ fn measured_white(t: &AnalyzedTrial) -> Option<([f64; 2], Option<f64>)> {
     Some((xy, metrics::cct_mccamy(xy)))
 }
 
-fn plot_placeholder() -> El {
-    column([
-        text("Chromaticity plot").muted(),
-        text("Visualization lands next — CIE u'v' field with per-sample error vectors.")
-            .muted()
-            .font_size(12.0),
-    ])
+fn chart_legend() -> El {
+    titled_card(
+        "Legend",
+        [
+            text("dot — measured chromaticity").muted().font_size(12.0),
+            text("line — error from the target").muted().font_size(12.0),
+            text("triangle — target gamut").muted().font_size(12.0),
+            text("ring — target white point").muted().font_size(12.0),
+            text("color — ΔE*ab, green → red").muted().font_size(12.0),
+            text("CIE 1976 u'v' diagram").muted().font_size(11.0),
+        ],
+    )
     .gap(tokens::SPACE_2)
-    .padding(tokens::SPACE_6)
-    .align(Align::Center)
-    .justify(Justify::Center)
-    .width(Size::Fill(1.0))
-    .height(Size::Fill(1.0))
-    .fill(tokens::CARD)
-    .radius(tokens::RADIUS_MD)
 }
 
 fn ground_truth_line(t: &AnalyzedTrial) -> String {

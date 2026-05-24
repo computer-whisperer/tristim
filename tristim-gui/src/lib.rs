@@ -5,4 +5,6 @@
 //! (`src/bin/dump.rs`), which runs aetna's lint pass over the same tree.
 
 pub mod app;
+pub mod chart;
+pub mod plot;
 pub use app::PresenterApp;
