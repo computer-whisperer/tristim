@@ -15,3 +15,4 @@ path = "src/main.rs"
 tristim-driver = { path = "../tristim-driver" }
 tristim-display = { path = "../tristim-display" }
 tristim-capture = { path = "../tristim-capture" }
+tristim-analyze = { path = "../tristim-analyze" }

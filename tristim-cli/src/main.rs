@@ -19,6 +19,7 @@ use std::error::Error;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tristim_analyze::{GroundTruth, GroundTruthSource, analyze};
 use tristim_capture as cap;
 use tristim_display::{
     self as display, BufferFormat, DescriptionRequest, DescriptionState, PatchSurface, list_outputs,
@@ -35,6 +36,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "info" => cmd_info(),
         "measure" => cmd_measure(&argv[2..]),
         "capture" => cmd_capture(&argv[2..]),
+        "report" => cmd_report(&argv[2..]),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -85,6 +87,10 @@ fn print_usage() {
     eprintln!("          tristim capture --output DP-4 --out s.json \\");
     eprintln!("              --format unmanaged --format srgb --format pq-bt2020:peak=400 \\");
     eprintln!("              --seq grey:11 --seq primaries:5 --seq scatter:64");
+    eprintln!();
+    eprintln!("  report FILE.json [--top N]");
+    eprintln!("        Analyze a capture and print per-trial error (Δu'v', ΔE) and the");
+    eprintln!("        worst-offending samples (default N=8).");
 }
 
 // ── diagnostics ─────────────────────────────────────────────────────────────
@@ -146,6 +152,138 @@ fn cmd_measure(args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("xy   : ({x:.4}, {y:.4})");
     }
     Ok(())
+}
+
+// ── report ──────────────────────────────────────────────────────────────────
+
+fn cmd_report(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .ok_or("usage: tristim report FILE.json [--top N]")?;
+    let top: usize = parse_opt(args, "--top", 8);
+
+    let capture = cap::Capture::load(path)?;
+    let analyzed = analyze(&capture);
+
+    println!("{path}");
+    println!(
+        "  {} {} | {} SN {} cal {} | {} {} | {}",
+        capture.tool.name,
+        capture.tool.version,
+        capture.device.product,
+        capture.device.serial,
+        capture.device.cal_index,
+        capture.output.name,
+        capture
+            .output
+            .mode
+            .map(|m| format!("{}x{}", m.width, m.height))
+            .unwrap_or_else(|| "?".into()),
+        capture.timestamp,
+    );
+    let caps = &capture.capabilities;
+    if caps.supported_transfer_functions.is_empty() && caps.supported_primaries.is_empty() {
+        println!("  color management: none advertised");
+    } else {
+        println!(
+            "  color management: {} TFs, {} primaries, intents {:?}",
+            caps.supported_transfer_functions.len(),
+            caps.supported_primaries.len(),
+            caps.supported_render_intents,
+        );
+    }
+
+    for (ct, at) in capture.trials.iter().zip(&analyzed.trials) {
+        let label = ct
+            .requested
+            .as_ref()
+            .map(|d| format!("{}/{}", d.transfer_function, d.primaries))
+            .unwrap_or_else(|| "unmanaged".into());
+        let basis = match &at.ground_truth {
+            GroundTruth::Known {
+                source: GroundTruthSource::Negotiated,
+                ..
+            } => "negotiated".to_string(),
+            GroundTruth::Known {
+                source: GroundTruthSource::AssumedSrgb,
+                ..
+            } => "assumed sRGB".to_string(),
+            GroundTruth::Unscored { reason } => format!("unscored — {reason}"),
+        };
+        println!();
+        println!("  ── {label} [{}] — {basis} ──", at.pixel_format);
+
+        let Some(summary) = at.summary else {
+            println!("     {} samples, not scored", at.samples.len());
+            continue;
+        };
+        println!(
+            "     {} samples | measured white Y = {:.2} cd/m²",
+            summary.scored_samples, summary.measured_white_y
+        );
+        println!(
+            "     Δu'v'   mean {:.4}  max {:.4}   {}",
+            summary.mean_delta_uv,
+            summary.max_delta_uv,
+            duv_verdict(summary.max_delta_uv),
+        );
+        println!(
+            "     ΔE*ab   mean {:.2}    max {:.2}",
+            summary.mean_delta_e, summary.max_delta_e,
+        );
+
+        // Worst offenders by ΔE.
+        let mut scored: Vec<&tristim_analyze::AnalyzedSample> =
+            at.samples.iter().filter(|s| s.delta_e.is_some()).collect();
+        scored.sort_by(|a, b| b.delta_e.unwrap().total_cmp(&a.delta_e.unwrap()));
+        if !scored.is_empty() {
+            println!("     worst {} by ΔE:", top.min(scored.len()));
+            println!(
+                "        {:>21}  {:>15}  {:>15}  {:>7}  {:>6}",
+                "requested cv", "measured xy", "expected xy", "Δu'v'", "ΔE"
+            );
+            for s in scored.iter().take(top) {
+                println!(
+                    "        ({:.3},{:.3},{:.3})  {}  {}  {}  {:>6.2}",
+                    s.requested[0],
+                    s.requested[1],
+                    s.requested[2],
+                    fmt_xy(s.measured_xy),
+                    fmt_xy(s.expected_xy),
+                    fmt_opt(s.delta_uv, 4),
+                    s.delta_e.unwrap(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn duv_verdict(max: f64) -> &'static str {
+    if max < 0.005 {
+        "(imperceptible)"
+    } else if max < 0.015 {
+        "(perceptible)"
+    } else if max < 0.030 {
+        "(obvious)"
+    } else {
+        "(severe)"
+    }
+}
+
+fn fmt_xy(xy: Option<[f64; 2]>) -> String {
+    match xy {
+        Some([x, y]) => format!("({x:.3},{y:.3})"),
+        None => "       —       ".to_string(),
+    }
+}
+
+fn fmt_opt(v: Option<f64>, prec: usize) -> String {
+    match v {
+        Some(v) => format!("{v:>7.prec$}"),
+        None => format!("{:>7}", "—"),
+    }
 }
 
 // ── capture ───────────────────────────────────────────────────────────────
