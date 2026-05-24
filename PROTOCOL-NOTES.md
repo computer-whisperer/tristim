@@ -52,7 +52,7 @@ ArgyllCMS V3.5.0's bugfix was for the low-level fallback (per changelog).
 
 ## Key files in the V3.5.0 reference
 
-All under `/home/christian/workspace/spyder/refs/argyll-3.5.0/spectro/`:
+All under `refs/argyll-3.5.0/spectro/` in this repo:
 
 - `spydX2.c` (1836 lines) — driver implementation
 - `spydX2.h` (164 lines) — types + state struct
@@ -72,4 +72,4 @@ All under `/home/christian/workspace/spyder/refs/argyll-3.5.0/spectro/`:
 3. ~~Implement `measure()` using `0xF2`.~~ Done — `Colorimeter::measure_raw`.
 4. ~~Convert raw → XYZ.~~ Done — `measurement::raw_to_xyz`.
 5. ~~Write `tristim-display`.~~ Done — SDR + HDR PQ via `wp_color_management_v1`, windowed-patch mode.
-6. ~~Write `tristim-cli`.~~ Done — `info` / `measure` / `sweep` / `analyze` subcommands; closed-loop calibration via prism IPC is the current work.
+6. ~~Write `tristim-cli`.~~ Done — `info` / `measure` / `sweep` / `analyze` subcommands. (Closed-loop calibration is *not* part of tristim — it lives in the consuming project, e.g. prism's `prism-tune`. The current work here is the general-purpose display-characterization analysis.)
