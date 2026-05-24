@@ -240,18 +240,28 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
                     (Some(s), outcome)
                 }
                 Err(display::Error::DescriptionFailed { cause, message }) => {
+                    // The compositor has color management but refused this
+                    // description. Record the refusal; don't send it anyway.
                     eprintln!("  compositor rejected this format: {cause}: {message}");
                     (None, cap::Negotiation::Rejected { cause, message })
                 }
                 Err(display::Error::NoColorManager) => {
-                    eprintln!("  compositor advertises no color manager — recording as rejected");
-                    (
-                        None,
-                        cap::Negotiation::Rejected {
-                            cause: "no_color_manager".into(),
-                            message: "compositor does not advertise wp_color_manager_v1".into(),
-                        },
-                    )
+                    // The compositor exposes no color management at all. Still
+                    // useful: send a plain buffer of the same pixel format and
+                    // measure. The outcome is Unmanaged (the analysis tool
+                    // assumes sRGB for unmanaged); `requested` still records
+                    // what we intended.
+                    eprintln!("  no color manager — sending unmanaged buffer (assumed sRGB)");
+                    match PatchSurface::open(&output, fs.buffer_format, None) {
+                        Ok(s) => (Some(s), cap::Negotiation::Unmanaged),
+                        Err(e) => (
+                            None,
+                            cap::Negotiation::Rejected {
+                                cause: "unmanaged_fallback_failed".into(),
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
                 }
                 Err(e) => return Err(e.into()),
             };
