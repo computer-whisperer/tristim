@@ -16,3 +16,7 @@ refs/
 
 # Headless bundle-dump artifacts from the presenter (SVG / tree / draw-ops).
 /tristim-gui/out/
+
+# Auto-saved captures from the GUI's in-process capture flow
+# (capture-<timestamp>.json, written to the working directory).
+capture-*.json
