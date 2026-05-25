@@ -313,7 +313,11 @@ impl PresenterApp {
             let b = button(self.trial_label(p, i))
                 .key(format!("trial:{i}"))
                 .width(Size::Fill(1.0));
-            items.push(if i == p.selected { b } else { b.secondary() });
+            items.push(if i == p.selected {
+                b.primary()
+            } else {
+                b.secondary()
+            });
         }
         if p.analyzed.trials.is_empty() {
             items.push(text("(capture has no trials)").muted().font_size(12.0));
@@ -690,7 +694,7 @@ fn field_toggle(on: bool) -> El {
         "color fill: off"
     })
     .key("field-toggle");
-    if on { b } else { b.secondary() }
+    if on { b.primary() } else { b.secondary() }
 }
 
 /// Toggle between the two chromaticity projections, labeled with the current.
@@ -702,7 +706,7 @@ fn space_toggle(space: Space) -> El {
 fn view_selector(view: Tab) -> El {
     let tab = |label: &str, key: &str, active: bool| {
         let b = button(label).key(key.to_string());
-        if active { b } else { b.secondary() }
+        if active { b.primary() } else { b.secondary() }
     };
     row([
         tab("Chromaticity", "view:chroma", view == Tab::Chromaticity),

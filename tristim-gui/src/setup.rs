@@ -281,7 +281,7 @@ impl CaptureForm {
             row([
                 text(plan).muted().font_size(12.0),
                 spacer(),
-                button("Start capture").key("start"),
+                button("Start capture").key("start").primary(),
             ])
             .align(Align::Center)
             .width(Size::Fill(1.0)),
@@ -305,7 +305,7 @@ impl CaptureForm {
                     .key(format!("out:{i}"))
                     .width(Size::Fill(1.0));
                 if Some(i) == self.selected_output {
-                    b
+                    b.primary()
                 } else {
                     b.secondary()
                 }
@@ -315,7 +315,8 @@ impl CaptureForm {
             items.push(text("(no outputs found)").muted().font_size(12.0));
         }
         items.push(
-            row([button("Refresh").key("out-refresh").secondary(), spacer()]).width(Size::Fill(1.0)),
+            row([button("Refresh").key("out-refresh").secondary(), spacer()])
+                .width(Size::Fill(1.0)),
         );
         column(items).gap(tokens::SPACE_2).width(Size::Fill(1.0))
     }
@@ -326,7 +327,7 @@ impl CaptureForm {
             .iter()
             .map(|f| {
                 let b = button(f.token).key(format!("fmt:{}", f.token));
-                if f.on { b } else { b.secondary() }
+                if f.on { b.primary() } else { b.secondary() }
             })
             .collect();
         row(items).gap(tokens::SPACE_2)
@@ -341,7 +342,7 @@ impl CaptureForm {
                     let b = button(s.name)
                         .key(format!("seq:{}", s.name))
                         .width(Size::Fixed(100.0));
-                    if s.on { b } else { b.secondary() }
+                    if s.on { b.primary() } else { b.secondary() }
                 };
                 row([
                     toggle,
