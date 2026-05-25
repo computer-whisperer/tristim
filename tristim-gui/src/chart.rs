@@ -1,17 +1,16 @@
-//! Render an analyzed trial as an aetna vector chart: the CIE 1976 u'v'
-//! chromaticity diagram with the spectral locus, the target gamut triangle and
-//! white point, and each measured sample joined by an error vector to where it
-//! should have landed — colored by ΔE\*ab.
+//! Render an analyzed trial as an aetna vector chart: a chromaticity diagram
+//! (CIE 1931 xy or 1976 u'v') with the spectral locus, the target gamut
+//! triangle and white point, and each measured sample joined by an error vector
+//! to where it should have landed — colored by ΔE\*ab.
 //!
 //! The plot is a fixed-size square (the vector view_box), so it stays
 //! aspect-correct regardless of where layout places it.
 
 use aetna_core::prelude::*;
 use tristim_analyze::{AnalyzedTrial, GroundTruth};
-use tristim_color::metrics::{uv_prime_to_xy, xy_to_uv_prime};
 use tristim_color::{ColorSpace, chromaticity_to_xyz, mat3_mul_vec};
 
-use crate::plot::{Projector, UvView, gamut_uv, locus_uv, subdivide_triangle, white_uv};
+use crate::plot::{Projector, Space, gamut_in, locus_in, subdivide_triangle, white_in};
 
 /// Side length (px) of the square plot; also the vector view_box extent.
 const SIZE: f32 = 440.0;
@@ -50,37 +49,37 @@ impl PresenterGamut {
     }
 }
 
-/// Build the chromaticity chart El for `t`. Always draws the locus and the
-/// measured samples; the gamut triangle, white marker, and error vectors
-/// appear only when the trial has a known ground-truth color space. When
-/// `field` is `Some`, paints a color backdrop bounded to that (the presenter's)
-/// gamut, behind everything else.
-pub fn chromaticity_chart(t: &AnalyzedTrial, field: Option<PresenterGamut>) -> El {
-    let proj = Projector::new([0.0, 0.0, SIZE, SIZE], UvView::DEFAULT);
+/// Build the chromaticity chart El for `t` in the chosen `space`. Always draws
+/// the locus and the measured samples; the gamut triangle, white marker, and
+/// error vectors appear only when the trial has a known ground-truth color
+/// space. When `field` is `Some`, paints a color backdrop bounded to that (the
+/// presenter's) gamut, behind everything else.
+pub fn chromaticity_chart(t: &AnalyzedTrial, space: Space, field: Option<PresenterGamut>) -> El {
+    let proj = Projector::new([0.0, 0.0, SIZE, SIZE], space.view());
     let mut paths: Vec<VectorPath> = Vec::new();
 
     // Color field backdrop (under everything), bounded to the presenter gamut.
     if let Some(gamut) = field {
-        field_paths(&proj, gamut, &mut paths);
+        field_paths(&proj, space, gamut, &mut paths);
     }
 
     // Plot frame + spectral locus outline.
     paths.push(frame_path());
-    paths.push(locus_path(&proj));
+    paths.push(locus_path(&proj, space));
 
     // Target gamut triangle + white point, when we have a basis.
-    if let GroundTruth::Known { space, .. } = &t.ground_truth {
-        paths.push(triangle_path(&proj, &gamut_uv(space)));
-        white_marker(&proj, white_uv(space), &mut paths);
+    if let GroundTruth::Known { space: target, .. } = &t.ground_truth {
+        paths.push(triangle_path(&proj, &gamut_in(space, target)));
+        white_marker(&proj, white_in(space, target), &mut paths);
     }
 
     // Per-sample: error vector (target → measured) + measured dot, by ΔE.
     for s in &t.samples {
         let Some(m_xy) = s.measured_xy else { continue };
-        let m = proj.project(xy_to_uv_prime(m_xy));
+        let m = proj.project(space.project(m_xy));
         let color = s.delta_e.map_or(UNSCORED, heat);
         if let Some(e_xy) = s.expected_xy {
-            let e = proj.project(xy_to_uv_prime(e_xy));
+            let e = proj.project(space.project(e_xy));
             paths.push(line_path(e, m, color, 1.5));
         }
         paths.push(circle(m, 4.0).fill_solid(color).build());
@@ -108,11 +107,11 @@ fn frame_path() -> VectorPath {
         .build()
 }
 
-fn locus_path(proj: &Projector) -> VectorPath {
-    let uv = locus_uv();
-    let p0 = proj.project(uv[0]);
+fn locus_path(proj: &Projector, space: Space) -> VectorPath {
+    let pts = locus_in(space);
+    let p0 = proj.project(pts[0]);
     let mut pb = PathBuilder::new().move_to(p0[0], p0[1]);
-    for &c in &uv[1..] {
+    for &c in &pts[1..] {
         let p = proj.project(c);
         pb = pb.line_to(p[0], p[1]);
     }
@@ -133,8 +132,8 @@ fn triangle_path(proj: &Projector, g: &[[f64; 2]; 3]) -> VectorPath {
 }
 
 /// A hollow ring + center dot at the target white point.
-fn white_marker(proj: &Projector, uv: [f64; 2], out: &mut Vec<VectorPath>) {
-    let c = proj.project(uv);
+fn white_marker(proj: &Projector, p: [f64; 2], out: &mut Vec<VectorPath>) {
+    let c = proj.project(p);
     out.push(circle(c, 5.0).stroke_solid(WHITE, 1.5).build());
     out.push(circle(c, 1.5).fill_solid(WHITE).build());
 }
@@ -142,14 +141,14 @@ fn white_marker(proj: &Projector, uv: [f64; 2], out: &mut Vec<VectorPath>) {
 /// Tile the presenter gamut triangle with flat-filled cells, each colored by
 /// the true chromaticity at its centroid. Every cell is inside the gamut, so
 /// its color is exactly representable — no clipping.
-fn field_paths(proj: &Projector, gamut: PresenterGamut, out: &mut Vec<VectorPath>) {
-    let space = gamut.space();
-    for cell in subdivide_triangle(gamut_uv(&space), FIELD_SUBDIV) {
+fn field_paths(proj: &Projector, space: Space, gamut: PresenterGamut, out: &mut Vec<VectorPath>) {
+    let cs = gamut.space();
+    for cell in subdivide_triangle(gamut_in(space, &cs), FIELD_SUBDIV) {
         let centroid = [
             (cell[0][0] + cell[1][0] + cell[2][0]) / 3.0,
             (cell[0][1] + cell[1][1] + cell[2][1]) / 3.0,
         ];
-        let color = field_color(gamut, &space, centroid);
+        let color = field_color(gamut, space, centroid);
         let a = proj.project(cell[0]);
         let b = proj.project(cell[1]);
         let c = proj.project(cell[2]);
@@ -165,12 +164,12 @@ fn field_paths(proj: &Projector, gamut: PresenterGamut, out: &mut Vec<VectorPath
     }
 }
 
-/// The displayed color of a u'v' point: invert to xy, take XYZ at unit
+/// The displayed color of a plot-space point: invert to xy, take XYZ at unit
 /// luminance, convert to the gamut's linear RGB, and normalize so the brightest
 /// channel is full (the conventional vivid chromaticity-diagram fill).
-fn field_color(gamut: PresenterGamut, space: &ColorSpace, uv: [f64; 2]) -> Color {
-    let xyz = chromaticity_to_xyz(uv_prime_to_xy(uv));
-    let rgb = mat3_mul_vec(&space.xyz_to_rgb(), &xyz);
+fn field_color(gamut: PresenterGamut, space: Space, p: [f64; 2]) -> Color {
+    let xyz = chromaticity_to_xyz(space.to_xy(p));
+    let rgb = mat3_mul_vec(&gamut.space().xyz_to_rgb(), &xyz);
     let m = rgb[0].max(rgb[1]).max(rgb[2]).max(1e-9);
     let norm = |c: f64| (c / m).clamp(0.0, 1.0) as f32;
     gamut.linear_color(norm(rgb[0]), norm(rgb[1]), norm(rgb[2]))

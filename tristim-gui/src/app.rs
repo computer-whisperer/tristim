@@ -12,12 +12,15 @@ use tristim_capture::Capture;
 use tristim_color::metrics;
 
 use crate::chart::{PresenterGamut, chromaticity_chart};
+use crate::plot::Space;
 
 /// The loaded capture, its analysis, and which trial is in focus.
 pub struct PresenterApp {
     capture: Capture,
     analyzed: AnalyzedCapture,
     selected: usize,
+    /// Chromaticity projection for the diagram.
+    space: Space,
     /// Whether to paint the chromaticity color-field backdrop (opt-in).
     show_field: bool,
 }
@@ -29,8 +32,15 @@ impl PresenterApp {
             capture,
             analyzed,
             selected: 0,
+            space: Space::UvPrime,
             show_field: false,
         }
+    }
+
+    /// Set the chromaticity projection. Used by the headless dump to render
+    /// both spaces.
+    pub fn set_space(&mut self, space: Space) {
+        self.space = space;
     }
 
     /// Number of trials in the loaded capture.
@@ -151,18 +161,25 @@ impl PresenterApp {
             ])
             .gap(2.0),
             spacer(),
+            space_toggle(self.space),
         ];
         if gamut.is_some() {
             heading.push(field_toggle(self.show_field));
         }
 
         column([
-            row(heading).align(Align::Center).width(Size::Fill(1.0)),
+            row(heading)
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
             row([
-                chromaticity_chart(t, field),
-                column([summary_card(t).width(Size::Fill(1.0)), chart_legend()])
-                    .gap(tokens::SPACE_3)
-                    .width(Size::Fill(1.0)),
+                chromaticity_chart(t, self.space, field),
+                column([
+                    summary_card(t).width(Size::Fill(1.0)),
+                    chart_legend(self.space),
+                ])
+                .gap(tokens::SPACE_3)
+                .width(Size::Fill(1.0)),
             ])
             .gap(tokens::SPACE_4)
             .align(Align::Start)
@@ -210,6 +227,7 @@ impl App for PresenterApp {
         }
         match e.route() {
             Some("field-toggle") => self.show_field = !self.show_field,
+            Some("space-toggle") => self.space = self.space.toggled(),
             Some(k) => {
                 if let Some(i) = k
                     .strip_prefix("trial:")
@@ -240,6 +258,11 @@ fn field_toggle(on: bool) -> El {
     })
     .key("field-toggle");
     if on { b } else { b.secondary() }
+}
+
+/// Toggle between the two chromaticity projections, labeled with the current.
+fn space_toggle(space: Space) -> El {
+    button(space.label()).key("space-toggle").secondary()
 }
 
 /// A stacked label/value field for the narrow sidebar: a muted label over a
@@ -344,7 +367,7 @@ fn measured_white(t: &AnalyzedTrial) -> Option<([f64; 2], Option<f64>)> {
     Some((xy, metrics::cct_mccamy(xy)))
 }
 
-fn chart_legend() -> El {
+fn chart_legend(space: Space) -> El {
     titled_card(
         "Legend",
         [
@@ -353,7 +376,9 @@ fn chart_legend() -> El {
             text("triangle — target gamut").muted().font_size(12.0),
             text("ring — target white point").muted().font_size(12.0),
             text("color — ΔE*ab, green → red").muted().font_size(12.0),
-            text("CIE 1976 u'v' diagram").muted().font_size(11.0),
+            text(format!("{} diagram", space.label()))
+                .muted()
+                .font_size(11.0),
         ],
     )
     .gap(tokens::SPACE_2)

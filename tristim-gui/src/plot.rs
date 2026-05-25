@@ -1,11 +1,12 @@
-//! Pure geometry for the CIE 1976 u'v' chromaticity plot: the data→screen
-//! projection, the spectral-locus outline, and color-space gamut triangles.
+//! Pure geometry for the chromaticity plot: the chromaticity-space choice
+//! (CIE 1931 xy or CIE 1976 u'v'), the data→screen projection, the embedded
+//! spectral locus, and color-space gamut triangles.
 //!
 //! Deliberately free of any aetna types so it can be unit tested in isolation;
 //! the [`crate::chart`] module turns these coordinates into aetna vector paths.
 
 use tristim_color::ColorSpace;
-use tristim_color::metrics::xy_to_uv_prime;
+use tristim_color::metrics::{uv_prime_to_xy, xy_to_uv_prime};
 
 /// CIE 1931 2° standard-observer chromaticity coordinates `(x, y)` of the
 /// spectral locus, 380–700 nm at 5 nm steps. Reference data for drawing the
@@ -83,45 +84,97 @@ pub const LOCUS_XY: &[[f64; 2]] = &[
     [0.7347, 0.2653], // 700
 ];
 
-/// The spectral locus in CIE 1976 u'v' (a closed polygon when the ends are
-/// joined by the line of purples).
-pub fn locus_uv() -> Vec<[f64; 2]> {
-    LOCUS_XY.iter().map(|&xy| xy_to_uv_prime(xy)).collect()
+/// Which chromaticity projection the plot uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Space {
+    /// CIE 1931 xy — the familiar diagram.
+    Xy,
+    /// CIE 1976 u'v' UCS — perceptually uniform, so a Δu'v' error reads as a
+    /// proportional on-screen distance.
+    UvPrime,
 }
 
-/// The u'v' window the plot shows, with a little padding past the locus
-/// extremes (u' spans ~0–0.62, v' ~0–0.59).
+impl Space {
+    /// Map a CIE xy chromaticity into this space's plot coordinate.
+    pub fn project(self, xy: [f64; 2]) -> [f64; 2] {
+        match self {
+            Space::Xy => xy,
+            Space::UvPrime => xy_to_uv_prime(xy),
+        }
+    }
+
+    /// Inverse of [`Self::project`]: a plot coordinate back to CIE xy.
+    pub fn to_xy(self, p: [f64; 2]) -> [f64; 2] {
+        match self {
+            Space::Xy => p,
+            Space::UvPrime => uv_prime_to_xy(p),
+        }
+    }
+
+    /// The plot domain (with a little padding past the locus) for this space.
+    pub fn view(self) -> View {
+        match self {
+            Space::Xy => View {
+                x_min: -0.02,
+                x_max: 0.75,
+                y_min: -0.02,
+                y_max: 0.87,
+            },
+            Space::UvPrime => View {
+                x_min: -0.02,
+                x_max: 0.65,
+                y_min: -0.02,
+                y_max: 0.62,
+            },
+        }
+    }
+
+    /// Short human label for legends/toggles.
+    pub fn label(self) -> &'static str {
+        match self {
+            Space::Xy => "CIE 1931 xy",
+            Space::UvPrime => "CIE 1976 u'v'",
+        }
+    }
+
+    /// The other projection (for a toggle).
+    pub fn toggled(self) -> Space {
+        match self {
+            Space::Xy => Space::UvPrime,
+            Space::UvPrime => Space::Xy,
+        }
+    }
+}
+
+/// The plot's coordinate window: `[min, max]` on each axis, in plot space.
 #[derive(Clone, Copy, Debug)]
-pub struct UvView {
-    pub u_min: f64,
-    pub u_max: f64,
-    pub v_min: f64,
-    pub v_max: f64,
+pub struct View {
+    pub x_min: f64,
+    pub x_max: f64,
+    pub y_min: f64,
+    pub y_max: f64,
 }
 
-impl UvView {
-    pub const DEFAULT: UvView = UvView {
-        u_min: -0.02,
-        u_max: 0.65,
-        v_min: -0.02,
-        v_max: 0.62,
-    };
+/// The spectral locus in `space` (a closed polygon when the ends are joined by
+/// the line of purples).
+pub fn locus_in(space: Space) -> Vec<[f64; 2]> {
+    LOCUS_XY.iter().map(|&xy| space.project(xy)).collect()
 }
 
-/// Maps u'v' coordinates into a screen rectangle, flipping v' (which increases
-/// upward) onto screen-y (which increases downward).
+/// Maps plot-space coordinates into a screen rectangle, flipping y (which
+/// increases upward in chromaticity space) onto screen-y (downward).
 #[derive(Clone, Copy, Debug)]
 pub struct Projector {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
-    view: UvView,
+    view: View,
 }
 
 impl Projector {
     /// `rect` is `[x, y, w, h]` in the target (screen / view_box) space.
-    pub fn new(rect: [f32; 4], view: UvView) -> Self {
+    pub fn new(rect: [f32; 4], view: View) -> Self {
         Self {
             x: rect[0],
             y: rect[1],
@@ -131,26 +184,26 @@ impl Projector {
         }
     }
 
-    /// Project a u'v' coordinate to a screen-space `[x, y]` in pixels.
-    pub fn project(&self, uv: [f64; 2]) -> [f32; 2] {
-        let fu = ((uv[0] - self.view.u_min) / (self.view.u_max - self.view.u_min)) as f32;
-        let fv = ((uv[1] - self.view.v_min) / (self.view.v_max - self.view.v_min)) as f32;
-        [self.x + fu * self.w, self.y + (1.0 - fv) * self.h]
+    /// Project a plot-space coordinate to a screen-space `[x, y]` in pixels.
+    pub fn project(&self, p: [f64; 2]) -> [f32; 2] {
+        let fx = ((p[0] - self.view.x_min) / (self.view.x_max - self.view.x_min)) as f32;
+        let fy = ((p[1] - self.view.y_min) / (self.view.y_max - self.view.y_min)) as f32;
+        [self.x + fx * self.w, self.y + (1.0 - fy) * self.h]
     }
 }
 
-/// The three primary vertices (R, G, B) of a color space, in u'v'.
-pub fn gamut_uv(space: &ColorSpace) -> [[f64; 2]; 3] {
+/// The three primary vertices (R, G, B) of a color space, in `space`.
+pub fn gamut_in(space: Space, cs: &ColorSpace) -> [[f64; 2]; 3] {
     [
-        xy_to_uv_prime(space.red),
-        xy_to_uv_prime(space.green),
-        xy_to_uv_prime(space.blue),
+        space.project(cs.red),
+        space.project(cs.green),
+        space.project(cs.blue),
     ]
 }
 
-/// A color space's reference white, in u'v'.
-pub fn white_uv(space: &ColorSpace) -> [f64; 2] {
-    xy_to_uv_prime(space.white)
+/// A color space's reference white, in `space`.
+pub fn white_in(space: Space, cs: &ColorSpace) -> [f64; 2] {
+    space.project(cs.white)
 }
 
 /// Subdivide a triangle into `n²` smaller triangles by barycentric subdivision,
@@ -191,13 +244,13 @@ mod tests {
     }
 
     #[test]
-    fn projects_view_corners_to_rect_corners_with_v_flip() {
-        let view = UvView::DEFAULT;
+    fn projects_view_corners_to_rect_corners_with_y_flip() {
+        let view = Space::UvPrime.view();
         let p = Projector::new([0.0, 0.0, 100.0, 100.0], view);
-        // (u_min, v_min) → bottom-left; (u_max, v_max) → top-right.
-        let bl = p.project([view.u_min, view.v_min]);
-        let tr = p.project([view.u_max, view.v_max]);
-        let tl = p.project([view.u_min, view.v_max]);
+        // (x_min, y_min) → bottom-left; (x_max, y_max) → top-right.
+        let bl = p.project([view.x_min, view.y_min]);
+        let tr = p.project([view.x_max, view.y_max]);
+        let tl = p.project([view.x_min, view.y_max]);
         assert!(
             close(bl[0], 0.0, 1e-3) && close(bl[1], 100.0, 1e-3),
             "{bl:?}"
@@ -210,20 +263,51 @@ mod tests {
     }
 
     #[test]
-    fn locus_uv_has_one_point_per_xy() {
-        assert_eq!(locus_uv().len(), LOCUS_XY.len());
+    fn locus_has_one_point_per_xy_in_both_spaces() {
+        assert_eq!(locus_in(Space::Xy).len(), LOCUS_XY.len());
+        assert_eq!(locus_in(Space::UvPrime).len(), LOCUS_XY.len());
     }
 
     #[test]
     fn srgb_gamut_uv_matches_known_values() {
         // sRGB red xy (0.640, 0.330) → u'v' (0.4507, 0.5229) by hand.
-        let g = gamut_uv(&ColorSpace::SRGB);
+        let g = gamut_in(Space::UvPrime, &ColorSpace::SRGB);
         assert!((g[0][0] - 0.4507).abs() < 1e-3, "red u' = {}", g[0][0]);
         assert!((g[0][1] - 0.5229).abs() < 1e-3, "red v' = {}", g[0][1]);
         // D65 white (0.3127, 0.3290) → u'v' (0.1978, 0.4683).
-        let w = white_uv(&ColorSpace::SRGB);
+        let w = white_in(Space::UvPrime, &ColorSpace::SRGB);
         assert!((w[0] - 0.1978).abs() < 1e-3, "white u' = {}", w[0]);
         assert!((w[1] - 0.4683).abs() < 1e-3, "white v' = {}", w[1]);
+    }
+
+    #[test]
+    fn xy_space_is_identity() {
+        // In xy the gamut vertices are just the primaries themselves.
+        let g = gamut_in(Space::Xy, &ColorSpace::SRGB);
+        assert_eq!(g[0], ColorSpace::SRGB.red);
+        assert_eq!(g[1], ColorSpace::SRGB.green);
+        assert_eq!(g[2], ColorSpace::SRGB.blue);
+    }
+
+    #[test]
+    fn locus_stays_within_view_in_both_spaces() {
+        for space in [Space::Xy, Space::UvPrime] {
+            let v = space.view();
+            for p in locus_in(space) {
+                assert!(
+                    p[0] >= v.x_min && p[0] <= v.x_max,
+                    "{:?}: x {} out",
+                    space,
+                    p[0]
+                );
+                assert!(
+                    p[1] >= v.y_min && p[1] <= v.y_max,
+                    "{:?}: y {} out",
+                    space,
+                    p[1]
+                );
+            }
+        }
     }
 
     #[test]
@@ -242,23 +326,6 @@ mod tests {
             for [x, y] in cell {
                 assert!(x >= -1e-9 && y >= -1e-9 && x + y <= 1.0 + 1e-9, "({x},{y})");
             }
-        }
-    }
-
-    #[test]
-    fn locus_stays_within_default_view() {
-        let view = UvView::DEFAULT;
-        for uv in locus_uv() {
-            assert!(
-                uv[0] >= view.u_min && uv[0] <= view.u_max,
-                "u' {} out of view",
-                uv[0]
-            );
-            assert!(
-                uv[1] >= view.v_min && uv[1] <= view.v_max,
-                "v' {} out of view",
-                uv[1]
-            );
         }
     }
 }

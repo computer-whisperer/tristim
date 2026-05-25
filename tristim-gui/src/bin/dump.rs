@@ -15,6 +15,7 @@ use std::process::ExitCode;
 
 use aetna_core::prelude::*;
 use tristim_gui::PresenterApp;
+use tristim_gui::plot::Space;
 
 const VIEWPORT: (f32, f32) = (1280.0, 800.0);
 
@@ -72,34 +73,37 @@ fn main() -> ExitCode {
         ..HostDiagnostics::default()
     };
 
-    // Lay out and lint every trial's panel, not just the default selection.
+    // Lay out and lint every trial's panel in both chromaticity projections.
     let count = app.trial_count().max(1);
     let mut total_findings = 0usize;
-    for i in 0..count {
-        app.select(i);
-        let cx = BuildCx::new(&theme).with_diagnostics(&diags);
-        let mut root = app.build(&cx);
-        let bundle = render_bundle_themed(&mut root, viewport, &theme);
+    for (space, tag) in [(Space::UvPrime, "uv"), (Space::Xy, "xy")] {
+        app.set_space(space);
+        for i in 0..count {
+            app.select(i);
+            let cx = BuildCx::new(&theme).with_diagnostics(&diags);
+            let mut root = app.build(&cx);
+            let bundle = render_bundle_themed(&mut root, viewport, &theme);
 
-        let name = format!("trial-{i}");
-        match write_bundle(&bundle, Path::new(&out_dir), &name) {
-            Ok(written) => {
-                for p in &written {
-                    println!("wrote {}", p.display());
+            let name = format!("trial-{i}-{tag}");
+            match write_bundle(&bundle, Path::new(&out_dir), &name) {
+                Ok(written) => {
+                    for p in &written {
+                        println!("wrote {}", p.display());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("dump: write_bundle({name}): {e}");
+                    return ExitCode::FAILURE;
                 }
             }
-            Err(e) => {
-                eprintln!("dump: write_bundle({name}): {e}");
-                return ExitCode::FAILURE;
-            }
-        }
 
-        if bundle.lint.findings.is_empty() {
-            println!("[{name}] lint clean ({} draw ops)", bundle.draw_ops.len());
-        } else {
-            total_findings += bundle.lint.findings.len();
-            eprintln!("[{name}] {} lint finding(s):", bundle.lint.findings.len());
-            eprint!("{}", bundle.lint.text());
+            if bundle.lint.findings.is_empty() {
+                println!("[{name}] lint clean ({} draw ops)", bundle.draw_ops.len());
+            } else {
+                total_findings += bundle.lint.findings.len();
+                eprintln!("[{name}] {} lint finding(s):", bundle.lint.findings.len());
+                eprint!("{}", bundle.lint.text());
+            }
         }
     }
 
