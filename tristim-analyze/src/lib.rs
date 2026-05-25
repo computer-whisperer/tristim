@@ -39,6 +39,11 @@ pub struct AnalyzedTrial {
     pub samples: Vec<AnalyzedSample>,
     /// Aggregate error over the scored samples (`None` if nothing was scored).
     pub summary: Option<TrialSummary>,
+    /// XYZ of the reference white used to place samples in L\*a\*b\* (the
+    /// brightest measured patch). `None` for an unscored trial. Lets a
+    /// presenter embed both the samples and an ideal-gamut reference in the
+    /// *same* Lab frame the ΔE\*ab scores live in.
+    pub reference_white_xyz: Option<[f64; 3]>,
 }
 
 /// What "expected" was derived from for a trial.
@@ -73,6 +78,12 @@ pub struct AnalyzedSample {
     pub measured_xy: Option<[f64; 2]>,
     /// Expected chromaticity (`None` for an unscored trial or pure black).
     pub expected_xy: Option<[f64; 2]>,
+    /// Measured colour in CIE L\*a\*b\* (against the trial's reference white).
+    /// `None` when the trial is unscored. The same value that feeds `delta_e`.
+    pub measured_lab: Option<[f64; 3]>,
+    /// Expected colour in CIE L\*a\*b\* (same reference white as `measured_lab`),
+    /// so the displacement between them *is* the reported ΔE\*ab.
+    pub expected_lab: Option<[f64; 3]>,
     /// Δu'v' between measured and expected chromaticity.
     pub delta_uv: Option<f64>,
     /// ΔE\*ab (CIE76) against the trial's measured white.
@@ -175,6 +186,8 @@ fn analyze_trial(trial: &FormatTrial) -> AnalyzedTrial {
                     measured_xyz: s.measured.xyz,
                     measured_xy: s.measured.xy,
                     expected_xy: None,
+                    measured_lab: None,
+                    expected_lab: None,
                     delta_uv: None,
                     delta_e: None,
                     luminance: None,
@@ -185,6 +198,7 @@ fn analyze_trial(trial: &FormatTrial) -> AnalyzedTrial {
                 ground_truth,
                 samples,
                 summary: None,
+                reference_white_xyz: None,
             };
         }
     };
@@ -244,13 +258,15 @@ fn analyze_trial(trial: &FormatTrial) -> AnalyzedTrial {
                     expected_xyz[2] * anchor_y,
                 ]
             };
-            let delta_e = if white_xyz[1] > 0.0 {
-                Some(metrics::delta_e76(
-                    metrics::xyz_to_lab(s.measured.xyz, white_xyz),
-                    metrics::xyz_to_lab(expected_abs, white_xyz),
-                ))
+            // Both Labs share the trial's reference white, so their Euclidean
+            // separation *is* the ΔE*ab below — and a presenter can plot the
+            // pair directly. Computed once here, then reused for the score.
+            let (measured_lab, expected_lab, delta_e) = if white_xyz[1] > 0.0 {
+                let m = metrics::xyz_to_lab(s.measured.xyz, white_xyz);
+                let e = metrics::xyz_to_lab(expected_abs, white_xyz);
+                (Some(m), Some(e), Some(metrics::delta_e76(m, e)))
             } else {
-                None
+                (None, None, None)
             };
 
             // expected_xyz[1] is absolute cd/m² for PQ, else already a
@@ -274,6 +290,8 @@ fn analyze_trial(trial: &FormatTrial) -> AnalyzedTrial {
                 measured_xyz: s.measured.xyz,
                 measured_xy: s.measured.xy,
                 expected_xy,
+                measured_lab,
+                expected_lab,
                 delta_uv,
                 delta_e,
                 luminance,
@@ -288,6 +306,7 @@ fn analyze_trial(trial: &FormatTrial) -> AnalyzedTrial {
         ground_truth,
         samples,
         summary,
+        reference_white_xyz: Some(white_xyz),
     }
 }
 

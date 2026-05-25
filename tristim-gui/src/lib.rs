@@ -9,4 +9,5 @@ pub mod chart;
 pub mod luminance;
 pub mod plot;
 pub mod setup;
+pub mod space3d;
 pub use app::PresenterApp;

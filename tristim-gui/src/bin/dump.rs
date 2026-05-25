@@ -135,6 +135,22 @@ fn main() -> ExitCode {
                 }
             }
         }
+
+        // The 3D sample space. The scene itself can't rasterize headlessly
+        // (the SVG/bundle path degrades 3D to a placeholder), but this still
+        // exercises `Space3dScene::build` on real samples and lints the tab +
+        // legend layout. `set_view` rebuilds the cached scene for the focus.
+        for i in 0..count {
+            app.select(i);
+            app.set_view(Tab::Space3D);
+            match render(&app, &format!("space3d-trial{i}-{}w", vw as u32)) {
+                Ok(n) => total_findings += n,
+                Err(e) => {
+                    eprintln!("dump: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
     }
 
     if total_findings == 0 {

@@ -25,12 +25,15 @@ use crate::chart::{PresenterGamut, chromaticity_chart};
 use crate::luminance::{luminance_chart, luminance_units};
 use crate::plot::Space;
 use crate::setup::{CaptureForm, FormAction};
+use crate::space3d::{Space3dScene, space_chart, space_legend};
 
 /// Which plot the content panel shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Chromaticity,
     Luminance,
+    /// The 3D CIELAB sample space (see [`crate::space3d`]).
+    Space3D,
 }
 
 /// Top-level app mode.
@@ -46,6 +49,10 @@ struct Presented {
     capture: Capture,
     analyzed: AnalyzedCapture,
     selected: usize,
+    /// Cached 3D-space geometry for the selected trial. Built lazily by
+    /// [`Presented::ensure_space3d`] (handles must outlive a single frame, or
+    /// the backend re-uploads geometry every frame); `None` until first shown.
+    space3d: Option<Space3dScene>,
 }
 
 impl Presented {
@@ -55,6 +62,25 @@ impl Presented {
             capture,
             analyzed,
             selected: 0,
+            space3d: None,
+        }
+    }
+
+    /// Index of the trial in focus, clamped to the available trials.
+    fn focused(&self) -> usize {
+        self.selected.min(self.analyzed.trials.len().saturating_sub(1))
+    }
+
+    /// Ensure the cached 3D scene matches the focused trial, rebuilding its
+    /// geometry handles only when the focus moved.
+    fn ensure_space3d(&mut self) {
+        if self.analyzed.trials.is_empty() {
+            self.space3d = None;
+            return;
+        }
+        let i = self.focused();
+        if self.space3d.as_ref().map(|s| s.trial) != Some(i) {
+            self.space3d = Some(Space3dScene::build(&self.analyzed.trials[i], i));
         }
     }
 }
@@ -193,6 +219,7 @@ impl Running {
             capture,
             analyzed,
             selected,
+            space3d: None,
         });
     }
 }
@@ -314,6 +341,7 @@ impl PresenterApp {
                 capture,
                 analyzed,
                 selected: 0,
+                space3d: None,
             }),
         };
         Self {
@@ -345,6 +373,13 @@ impl PresenterApp {
     /// Set the active view. Used by the headless dump to render each plot.
     pub fn set_view(&mut self, view: Tab) {
         self.view = view;
+        // The 3D view reads cached geometry handles; build them up front so a
+        // headless render (which never calls `before_build`) still has a scene.
+        if view == Tab::Space3D {
+            if let Some(p) = self.presented.as_mut() {
+                p.ensure_space3d();
+            }
+        }
     }
 
     /// Set the chromaticity projection. Used by the headless dump to render
@@ -655,6 +690,17 @@ impl PresenterApp {
                 )
             }
             Tab::Luminance => (luminance_chart(t, plot_px), luminance_legend(t)),
+            Tab::Space3D => {
+                // The geometry handles are cached on `Presented` and refreshed
+                // in `before_build`; `None` only during a transient first frame.
+                let chart = match &p.space3d {
+                    Some(scene) => space_chart(scene, plot_px),
+                    None => column([text("Preparing 3D space…").muted()])
+                        .width(Size::Fixed(plot_px))
+                        .height(Size::Fixed(plot_px)),
+                };
+                (chart, space_legend())
+            }
         };
 
         column([
@@ -810,6 +856,10 @@ impl PresenterApp {
                     self.view = Tab::Luminance;
                     self.hovered_sample = None; // hover is chromaticity-only
                 }
+                Some("view:space3d") => {
+                    self.view = Tab::Space3D;
+                    self.hovered_sample = None; // 2D hover is N/A in the 3D view
+                }
                 Some("new-capture") => {
                     self.form.refresh_outputs();
                     self.mode = Mode::Setup;
@@ -892,6 +942,17 @@ impl App for PresenterApp {
         // Drain background work before laying out the frame.
         self.drain_capture();
         self.drain_open();
+        // Keep the 3D scene's cached geometry handles current with the focused
+        // trial. Done here (not in `build`, which is `&self`) so the handles
+        // persist across frames and the backend re-uploads nothing on orbit.
+        if self.view == Tab::Space3D {
+            if let Some(p) = self.presented.as_mut() {
+                p.ensure_space3d();
+            }
+            if let Some(live) = self.running.as_mut().and_then(|r| r.live.as_mut()) {
+                live.ensure_space3d();
+            }
+        }
     }
 
     fn build(&self, cx: &BuildCx) -> El {
@@ -1012,6 +1073,7 @@ fn view_selector(view: Tab) -> El {
     row([
         tab("Chromaticity", "view:chroma", view == Tab::Chromaticity),
         tab("Luminance", "view:lum", view == Tab::Luminance),
+        tab("3D Space", "view:space3d", view == Tab::Space3D),
     ])
     .gap(tokens::SPACE_2)
 }
