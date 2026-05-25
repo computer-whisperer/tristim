@@ -290,7 +290,14 @@ impl CaptureForm {
             rows.push(text(e).font_size(12.0).text_color(tokens::DESTRUCTIVE));
         }
 
-        titled_card("New capture", rows).gap(tokens::SPACE_3)
+        // Gap the body ourselves: `titled_card` drops the rows into
+        // `card_content`, which sets no default gap, so chaining `.gap()` on the
+        // card would only space the header from the content — not the fields
+        // from each other (they'd stack flush, steppers touching).
+        titled_card(
+            "New capture",
+            [column(rows).gap(tokens::SPACE_3).width(Size::Fill(1.0))],
+        )
     }
 
     fn outputs_view(&self) -> El {
