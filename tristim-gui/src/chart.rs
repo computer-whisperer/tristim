@@ -14,7 +14,9 @@ use tristim_color::ColorSpace;
 
 use crate::plot::{Projector, Space, gamut_in, locus_in, white_in};
 
-/// Side length (px) of the square plot; also the vector view_box extent.
+/// The plot's *design* coordinate system: geometry is built in this square
+/// view_box and the renderer scales it to the laid-out (responsive) rect. The
+/// rendered size is the `plot_px` passed to [`chromaticity_chart`].
 const SIZE: f32 = 440.0;
 
 /// Name shared by the registered shader and its binding (see [`field_shader`]).
@@ -50,15 +52,22 @@ pub fn field_shader() -> AppShader {
     }
 }
 
-/// Build the chromaticity chart El for `t` in the chosen `space`. When `field`
-/// is `Some`, a shader-painted color backdrop bounded to that (the presenter's)
-/// gamut sits behind the vector overlays.
-pub fn chromaticity_chart(t: &AnalyzedTrial, space: Space, field: Option<PresenterGamut>) -> El {
-    let overlays = vector_chart(t, space);
+/// Build the chromaticity chart El for `t` in the chosen `space`, rendered as a
+/// `plot_px`-square. When `field` is `Some`, a shader-painted color backdrop
+/// bounded to that (the presenter's) gamut sits behind the vector overlays.
+pub fn chromaticity_chart(
+    t: &AnalyzedTrial,
+    space: Space,
+    field: Option<PresenterGamut>,
+    plot_px: f32,
+) -> El {
+    let overlays = vector_chart(t, space)
+        .width(Size::Fixed(plot_px))
+        .height(Size::Fixed(plot_px));
     match field {
-        Some(gamut) => stack([field_el(gamut, space), overlays])
-            .width(Size::Fixed(SIZE))
-            .height(Size::Fixed(SIZE)),
+        Some(gamut) => stack([field_el(gamut, space, plot_px), overlays])
+            .width(Size::Fixed(plot_px))
+            .height(Size::Fixed(plot_px)),
         None => overlays,
     }
 }
@@ -67,7 +76,7 @@ pub fn chromaticity_chart(t: &AnalyzedTrial, space: Space, field: Option<Present
 /// pixel to its chromaticity's color and clips to the gamut (see the WGSL). All
 /// it needs is the gamut's XYZ→RGB matrix, the plot view window, and which
 /// projection is in use — packed into the generic vec slots.
-fn field_el(gamut: PresenterGamut, space: Space) -> El {
+fn field_el(gamut: PresenterGamut, space: Space, plot_px: f32) -> El {
     let mat = gamut.space().xyz_to_rgb();
     let e = |r: usize, c: usize| mat[r][c] as f32;
     let v = space.view();
@@ -76,8 +85,8 @@ fn field_el(gamut: PresenterGamut, space: Space) -> El {
         Space::UvPrime => 1.0,
     };
     El::new(Kind::Custom(FIELD_SHADER))
-        .width(Size::Fixed(SIZE))
-        .height(Size::Fixed(SIZE))
+        .width(Size::Fixed(plot_px))
+        .height(Size::Fixed(plot_px))
         .shader(
             ShaderBinding::custom(FIELD_SHADER)
                 .vec4("vec_a", [e(0, 0), e(0, 1), e(0, 2), e(1, 0)])

@@ -17,7 +17,9 @@ use aetna_core::prelude::*;
 use tristim_gui::PresenterApp;
 use tristim_gui::plot::Space;
 
-const VIEWPORT: (f32, f32) = (1280.0, 800.0);
+/// Window sizes to lay out under (default + a large display), so responsive
+/// plot sizing is exercised and lint-checked at both.
+const VIEWPORTS: [(f32, f32); 2] = [(1280.0, 800.0), (2560.0, 1440.0)];
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -42,7 +44,6 @@ fn main() -> ExitCode {
     let mut app = PresenterApp::new(capture);
     app.set_show_field(true); // exercise the (heavier) color-field layout
     let theme = Theme::default();
-    let viewport = Rect::new(0.0, 0.0, VIEWPORT.0, VIEWPORT.1);
 
     // Feed representative host diagnostics so the dump exercises the *populated*
     // "Presenter display" panel — the path the live window takes. Without this
@@ -73,36 +74,42 @@ fn main() -> ExitCode {
         ..HostDiagnostics::default()
     };
 
-    // Lay out and lint every trial's panel in both chromaticity projections.
+    // Lay out and lint every trial's panel in both chromaticity projections,
+    // at each window size (responsive plot sizing reads the viewport).
     let count = app.trial_count().max(1);
     let mut total_findings = 0usize;
-    for (space, tag) in [(Space::UvPrime, "uv"), (Space::Xy, "xy")] {
-        app.set_space(space);
-        for i in 0..count {
-            app.select(i);
-            let cx = BuildCx::new(&theme).with_diagnostics(&diags);
-            let mut root = app.build(&cx);
-            let bundle = render_bundle_themed(&mut root, viewport, &theme);
+    for (vw, vh) in VIEWPORTS {
+        let viewport = Rect::new(0.0, 0.0, vw, vh);
+        for (space, tag) in [(Space::UvPrime, "uv"), (Space::Xy, "xy")] {
+            app.set_space(space);
+            for i in 0..count {
+                app.select(i);
+                let cx = BuildCx::new(&theme)
+                    .with_viewport(vw, vh)
+                    .with_diagnostics(&diags);
+                let mut root = app.build(&cx);
+                let bundle = render_bundle_themed(&mut root, viewport, &theme);
 
-            let name = format!("trial-{i}-{tag}");
-            match write_bundle(&bundle, Path::new(&out_dir), &name) {
-                Ok(written) => {
-                    for p in &written {
-                        println!("wrote {}", p.display());
+                let name = format!("trial-{i}-{tag}-{}w", vw as u32);
+                match write_bundle(&bundle, Path::new(&out_dir), &name) {
+                    Ok(written) => {
+                        for p in &written {
+                            println!("wrote {}", p.display());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("dump: write_bundle({name}): {e}");
+                        return ExitCode::FAILURE;
                     }
                 }
-                Err(e) => {
-                    eprintln!("dump: write_bundle({name}): {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
 
-            if bundle.lint.findings.is_empty() {
-                println!("[{name}] lint clean ({} draw ops)", bundle.draw_ops.len());
-            } else {
-                total_findings += bundle.lint.findings.len();
-                eprintln!("[{name}] {} lint finding(s):", bundle.lint.findings.len());
-                eprint!("{}", bundle.lint.text());
+                if bundle.lint.findings.is_empty() {
+                    println!("[{name}] lint clean ({} draw ops)", bundle.draw_ops.len());
+                } else {
+                    total_findings += bundle.lint.findings.len();
+                    eprintln!("[{name}] {} lint finding(s):", bundle.lint.findings.len());
+                    eprint!("{}", bundle.lint.text());
+                }
             }
         }
     }

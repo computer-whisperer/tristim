@@ -173,7 +173,7 @@ impl PresenterApp {
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
             row([
-                chromaticity_chart(t, self.space, field),
+                chromaticity_chart(t, self.space, field, plot_size(cx)),
                 column([
                     summary_card(t).width(Size::Fill(1.0)),
                     chart_legend(self.space),
@@ -190,6 +190,27 @@ impl PresenterApp {
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
     }
+}
+
+/// Responsive square side (px) for the plot, derived from the window viewport.
+/// Grows the diagram to fill the content area — leaving the stat/legend column
+/// its minimum width — and is bounded vertically so it always fits on screen.
+/// Falls back to a sensible size when no viewport is attached (headless).
+fn plot_size(cx: &BuildCx) -> f32 {
+    const ROOT_PAD: f32 = 24.0; // SPACE_6, window padding each side
+    const SIDEBAR_W: f32 = 300.0;
+    const COL_GAP: f32 = 24.0; // sidebar ↔ content
+    const ROW_GAP: f32 = 16.0; // chart ↔ stat column
+    const RIGHT_MIN: f32 = 410.0; // keep the stat/legend column readable
+    const V_CHROME: f32 = 230.0; // header + heading + paddings/gaps above the chart
+    const PLOT_MIN: f32 = 360.0;
+    const PLOT_MAX: f32 = 920.0;
+
+    let (vw, vh) = cx.viewport().unwrap_or((1280.0, 800.0));
+    let content_w = vw - 2.0 * ROOT_PAD - SIDEBAR_W - COL_GAP;
+    let h_budget = content_w - ROW_GAP - RIGHT_MIN;
+    let v_budget = vh - V_CHROME;
+    h_budget.min(v_budget).clamp(PLOT_MIN, PLOT_MAX)
 }
 
 /// The presenter window's negotiated gamut, mapped from host diagnostics.
