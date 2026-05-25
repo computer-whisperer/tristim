@@ -4,7 +4,8 @@
 //! display (read from the host's [`aetna_core::event::HostDiagnostics`]); the
 //! content panel shows the per-trial [`crate::chart`] chromaticity diagram
 //! beside the aggregate stat readout, with an opt-in color-field backdrop
-//! bounded to the presenter's negotiated gamut. Still to come: hover-to-inspect.
+//! bounded to the presenter's negotiated gamut. Hovering a sample swaps the
+//! legend for a per-sample inspector and highlights the point.
 
 use aetna_core::prelude::*;
 use tristim_analyze::{AnalyzedCapture, AnalyzedTrial, GroundTruth, GroundTruthSource, analyze};
@@ -23,6 +24,8 @@ pub struct PresenterApp {
     space: Space,
     /// Whether to paint the chromaticity color-field backdrop (opt-in).
     show_field: bool,
+    /// Index of the sample currently hovered in the plot, if any.
+    hovered_sample: Option<usize>,
 }
 
 impl PresenterApp {
@@ -34,7 +37,13 @@ impl PresenterApp {
             selected: 0,
             space: Space::UvPrime,
             show_field: false,
+            hovered_sample: None,
         }
+    }
+
+    /// Set the hovered sample. Used by the headless dump to render the inspector.
+    pub fn set_hovered_sample(&mut self, i: Option<usize>) {
+        self.hovered_sample = i;
     }
 
     /// Set the chromaticity projection. Used by the headless dump to render
@@ -173,10 +182,15 @@ impl PresenterApp {
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
             row([
-                chromaticity_chart(t, self.space, field, plot_size(cx)),
+                chromaticity_chart(t, self.space, field, plot_size(cx), self.hovered_sample),
+                // Show the inspector while hovering a sample, the legend otherwise.
                 column([
                     summary_card(t).width(Size::Fill(1.0)),
-                    chart_legend(self.space),
+                    match self.hovered_sample {
+                        Some(_) => sample_inspector(t, self.hovered_sample),
+                        None => chart_legend(self.space),
+                    }
+                    .width(Size::Fill(1.0)),
                 ])
                 .gap(tokens::SPACE_3)
                 .width(Size::Fill(1.0)),
@@ -247,23 +261,35 @@ impl App for PresenterApp {
     }
 
     fn on_event(&mut self, e: UiEvent) {
-        if !matches!(e.kind, UiEventKind::Click | UiEventKind::Activate) {
-            return;
-        }
-        match e.route() {
-            Some("field-toggle") => self.show_field = !self.show_field,
-            Some("space-toggle") => self.space = self.space.toggled(),
-            Some(k) => {
-                if let Some(i) = k
-                    .strip_prefix("trial:")
-                    .and_then(|r| r.parse::<usize>().ok())
-                {
-                    if i < self.analyzed.trials.len() {
+        match e.kind {
+            UiEventKind::Click | UiEventKind::Activate => match e.route() {
+                Some("field-toggle") => self.show_field = !self.show_field,
+                Some("space-toggle") => self.space = self.space.toggled(),
+                Some(k) => {
+                    if let Some(i) = k
+                        .strip_prefix("trial:")
+                        .and_then(|r| r.parse::<usize>().ok())
+                        && i < self.analyzed.trials.len()
+                    {
                         self.selected = i;
+                        self.hovered_sample = None; // sample indices are per-trial
                     }
                 }
+                None => {}
+            },
+            UiEventKind::PointerEnter => {
+                if let Some(i) = sample_key(e.target_key()) {
+                    self.hovered_sample = Some(i);
+                }
             }
-            None => {}
+            UiEventKind::PointerLeave => {
+                if let Some(i) = sample_key(e.target_key())
+                    && self.hovered_sample == Some(i)
+                {
+                    self.hovered_sample = None;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -390,6 +416,53 @@ fn measured_white(t: &AnalyzedTrial) -> Option<([f64; 2], Option<f64>)> {
         .max_by(|a, b| a.measured_xyz[1].total_cmp(&b.measured_xyz[1]))?;
     let xy = brightest.measured_xy?;
     Some((xy, metrics::cct_mccamy(xy)))
+}
+
+/// Parse a `sample:{i}` route/target key into its index.
+fn sample_key(key: Option<&str>) -> Option<usize> {
+    key?.strip_prefix("sample:")?.parse().ok()
+}
+
+fn fmt_xy(xy: Option<[f64; 2]>) -> String {
+    match xy {
+        Some([x, y]) => format!("({x:.4}, {y:.4})"),
+        None => "—".to_string(),
+    }
+}
+
+fn fmt_opt(v: Option<f64>, prec: usize) -> String {
+    match v {
+        Some(v) => format!("{v:.prec$}"),
+        None => "—".to_string(),
+    }
+}
+
+/// Inspector for the hovered sample: what was sent, what was measured, and the
+/// error from the target. Shows a hint when nothing is hovered.
+fn sample_inspector(t: &AnalyzedTrial, hovered: Option<usize>) -> El {
+    let Some(s) = hovered.and_then(|i| t.samples.get(i)) else {
+        return titled_card(
+            "Sample",
+            [text("hover a point to inspect it").muted().font_size(12.0)],
+        )
+        .gap(tokens::SPACE_2);
+    };
+    let [r, g, b] = s.requested;
+    let mut rows = vec![
+        stat_row("requested", format!("{r:.3}  {g:.3}  {b:.3}")),
+        stat_row("measured xy", fmt_xy(s.measured_xy)),
+        stat_row("target xy", fmt_xy(s.expected_xy)),
+        stat_row("Δu'v'", fmt_opt(s.delta_uv, 4)),
+        stat_row("ΔE*ab", fmt_opt(s.delta_e, 2)),
+    ];
+    if let Some(l) = s.luminance {
+        let unit = if l.absolute { "cd/m²" } else { "× white" };
+        rows.push(stat_row(
+            "luminance",
+            format!("{:.3} vs {:.3} {unit}", l.measured, l.expected),
+        ));
+    }
+    titled_card("Sample", rows).gap(tokens::SPACE_2)
 }
 
 fn chart_legend(space: Space) -> El {

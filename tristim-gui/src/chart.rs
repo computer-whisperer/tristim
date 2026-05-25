@@ -55,21 +55,52 @@ pub fn field_shader() -> AppShader {
 /// Build the chromaticity chart El for `t` in the chosen `space`, rendered as a
 /// `plot_px`-square. When `field` is `Some`, a shader-painted color backdrop
 /// bounded to that (the presenter's) gamut sits behind the vector overlays.
+/// `hover` is the index of the sample to highlight (driven by hit-testing the
+/// per-sample targets layered on top).
 pub fn chromaticity_chart(
     t: &AnalyzedTrial,
     space: Space,
     field: Option<PresenterGamut>,
     plot_px: f32,
+    hover: Option<usize>,
 ) -> El {
-    let overlays = vector_chart(t, space)
-        .width(Size::Fixed(plot_px))
-        .height(Size::Fixed(plot_px));
-    match field {
-        Some(gamut) => stack([field_el(gamut, space, plot_px), overlays])
+    let mut layers: Vec<El> = Vec::new();
+    if let Some(gamut) = field {
+        layers.push(field_el(gamut, space, plot_px));
+    }
+    layers.push(
+        vector_chart(t, space, hover)
             .width(Size::Fixed(plot_px))
             .height(Size::Fixed(plot_px)),
-        None => overlays,
-    }
+    );
+    layers.extend(hit_targets(t, space, plot_px));
+    stack(layers)
+        .width(Size::Fixed(plot_px))
+        .height(Size::Fixed(plot_px))
+}
+
+/// Side (px) of the invisible per-sample hover targets layered over the plot.
+const HIT: f32 = 18.0;
+
+/// One keyed, invisible hit target per measured sample, positioned (via
+/// `translate`, which moves the hit rect too) at the sample's screen point in
+/// `plot_px` space. Hovering one routes `PointerEnter`/`Leave` for `sample:{i}`.
+fn hit_targets(t: &AnalyzedTrial, space: Space, plot_px: f32) -> Vec<El> {
+    let proj = Projector::new([0.0, 0.0, plot_px, plot_px], space.view());
+    t.samples
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            let p = proj.project(space.project(s.measured_xy?));
+            Some(
+                El::default()
+                    .key(format!("sample:{i}"))
+                    .width(Size::Fixed(HIT))
+                    .height(Size::Fixed(HIT))
+                    .translate(p[0] - HIT / 2.0, p[1] - HIT / 2.0),
+            )
+        })
+        .collect()
 }
 
 /// The per-pixel color field: a custom-shader square. The shader maps each
@@ -105,8 +136,9 @@ fn field_el(gamut: PresenterGamut, space: Space, plot_px: f32) -> El {
 }
 
 /// The vector overlays: frame, spectral locus, target gamut triangle + white
-/// point (when the trial has a basis), and per-sample error vectors + dots.
-fn vector_chart(t: &AnalyzedTrial, space: Space) -> El {
+/// point (when the trial has a basis), per-sample error vectors + dots, and a
+/// highlight ring around the hovered sample.
+fn vector_chart(t: &AnalyzedTrial, space: Space, hover: Option<usize>) -> El {
     let proj = Projector::new([0.0, 0.0, SIZE, SIZE], space.view());
     let mut paths: Vec<VectorPath> = vec![frame_path(), locus_path(&proj, space)];
 
@@ -126,6 +158,15 @@ fn vector_chart(t: &AnalyzedTrial, space: Space) -> El {
         paths.push(circle(m, 4.0).fill_solid(color).build());
     }
 
+    // Highlight ring around the hovered sample.
+    if let Some(m_xy) = hover
+        .and_then(|i| t.samples.get(i))
+        .and_then(|s| s.measured_xy)
+    {
+        let m = proj.project(space.project(m_xy));
+        paths.push(circle(m, 7.0).stroke_solid(HIGHLIGHT, 2.0).build());
+    }
+
     vector(VectorAsset::from_paths([0.0, 0.0, SIZE, SIZE], paths))
 }
 
@@ -133,6 +174,7 @@ const LOCUS: Color = Color::srgb_u8(150, 150, 160);
 const TRIANGLE: Color = Color::srgb_u8(150, 190, 255);
 const WHITE: Color = Color::srgb_u8(245, 245, 245);
 const UNSCORED: Color = Color::srgb_u8(140, 140, 150);
+const HIGHLIGHT: Color = Color::srgb_u8(255, 255, 255);
 
 /// Faint border just inside the view_box so the stroke isn't clipped.
 fn frame_path() -> VectorPath {

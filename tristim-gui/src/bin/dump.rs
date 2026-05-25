@@ -43,6 +43,7 @@ fn main() -> ExitCode {
 
     let mut app = PresenterApp::new(capture);
     app.set_show_field(true); // exercise the (heavier) color-field layout
+    app.set_hovered_sample(Some(0)); // exercise the inspector + highlight + hit targets
     let theme = Theme::default();
 
     // Feed representative host diagnostics so the dump exercises the *populated*
