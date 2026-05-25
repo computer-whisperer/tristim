@@ -1,14 +1,17 @@
 # tristim-gui
 
-An [aetna](https://github.com/computer-whisperer/aetna)-based presenter for
-tristim captures. It loads a capture JSON, runs `tristim-analyze`, and opens a
-window visualizing how faithfully a compositor reproduced color on the output
-under test — per-trial aggregate statistics now, a CIE chromaticity field with
-per-sample error vectors and tone-response plots to follow.
+An [aetna](https://github.com/computer-whisperer/aetna)-based front end for
+tristim. Launched with a capture JSON it opens straight into the visualization
+of how faithfully a compositor reproduced color on the output under test — a CIE
+chromaticity field with per-sample error vectors, a measured-vs-expected
+luminance plot, and aggregate statistics. Launched with no argument it opens a
+**capture-setup form** to run a new capture in-process.
 
-This is the *presentation* half of tristim's gather/present split. It holds no
-measurement logic of its own; it is a view over an
-`tristim_analyze::AnalyzedCapture`.
+The visualization is a pure view over a `tristim_analyze::AnalyzedCapture` and
+holds no measurement logic of its own. The capture flow does not either: it
+drives the shared `tristim-gather` crate (the same loop the `tristim` CLI uses)
+on a background thread, so the GUI is a second front end over the gather libraries
+rather than a fork of them.
 
 ## Why this crate is outside the workspace
 
@@ -22,12 +25,29 @@ its own `Cargo.lock`, built independently:
 
 ```sh
 cd tristim-gui
-cargo run -- ../capture.json
+cargo run -- ../capture.json   # view an existing capture
+cargo run                      # capture-setup form (run a new capture)
 ```
 
 It expects a sibling aetna checkout at `../../aetna/aetna.main` relative to the
 tristim repo root. Adjust the path dependencies in `Cargo.toml` if yours lives
 elsewhere.
+
+## Running a capture
+
+Launched with no argument, the GUI opens a capture-setup form: pick the output
+to measure, toggle which color formats (`unmanaged`, `srgb`, `srgb-p3`,
+`pq-bt2020`, `pq-p3`) and sequences (`grey`, `primaries`, `scatter`, each with a
+step count) to run, and adjust settle / prep / window / calibration. The footer
+previews the total measurement count and a rough duration. **Start capture**
+runs `tristim_gather::run_capture` on a background thread; a live progress view
+shows the device, the current format and patch, and a cancellable progress bar.
+
+The patch is a fullscreen overlay on the **selected output** (where the puck
+sits), so run this window on a *different* display to watch progress during the
+run. When the run finishes (or you cancel — partial results are kept), the
+capture is **auto-saved** to `capture-<timestamp>.json` in the working directory
+and opened in the visualization; the saved path is shown in the header.
 
 ## Headless layout check (`dump`)
 

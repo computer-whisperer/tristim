@@ -8,4 +8,5 @@ pub mod app;
 pub mod chart;
 pub mod luminance;
 pub mod plot;
+pub mod setup;
 pub use app::PresenterApp;

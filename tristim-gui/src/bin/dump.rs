@@ -80,6 +80,10 @@ fn main() -> ExitCode {
     // (responsive plot sizing reads the viewport). Chromaticity is rendered in
     // both projections; luminance is projection-independent.
     let count = app.trial_count().max(1);
+    // Also lint the capture-setup form. It enumerates outputs (a Wayland
+    // roundtrip); without a compositor the list is just empty, which still
+    // exercises the form layout.
+    let setup_app = PresenterApp::setup();
     let mut total_findings = 0usize;
     for (vw, vh) in VIEWPORTS {
         let viewport = Rect::new(0.0, 0.0, vw, vh);
@@ -91,6 +95,14 @@ fn main() -> ExitCode {
             let bundle = render_bundle_themed(&mut root, viewport, &theme);
             emit(&bundle, &out_dir, name)
         };
+
+        match render(&setup_app, &format!("setup-{}w", vw as u32)) {
+            Ok(n) => total_findings += n,
+            Err(e) => {
+                eprintln!("dump: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
 
         app.set_view(Tab::Chromaticity);
         for (space, tag) in [(Space::UvPrime, "uv"), (Space::Xy, "xy")] {

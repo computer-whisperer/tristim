@@ -1,21 +1,30 @@
 //! The presenter application: state + tree.
 //!
-//! The shell is a trial selector plus a panel describing the presenter's own
-//! display (read from the host's [`aetna_core::event::HostDiagnostics`]); the
-//! content panel shows, per a view selector, either the [`crate::chart`]
-//! chromaticity diagram (with an opt-in color-field backdrop bounded to the
-//! presenter's negotiated gamut, and hover-to-inspect that swaps the legend for
-//! a per-sample inspector) or the [`crate::luminance`] measured-vs-expected
-//! plot — both beside the aggregate stat readout.
+//! The app has three modes. **Setup** ([`crate::setup`]) configures and
+//! launches an in-process capture run; **Running** shows live progress while
+//! `tristim_gather::run_capture` drives the colorimeter on a background thread;
+//! **Presenting** is the visualization — a trial selector plus a panel
+//! describing the presenter's own display (from the host's
+//! [`aetna_core::event::HostDiagnostics`]), beside a content panel that shows,
+//! per a view selector, either the [`crate::chart`] chromaticity diagram (with
+//! an opt-in color-field backdrop bounded to the presenter's negotiated gamut,
+//! and hover-to-inspect that swaps the legend for a per-sample inspector) or
+//! the [`crate::luminance`] measured-vs-expected plot.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use aetna_core::prelude::*;
 use tristim_analyze::{AnalyzedCapture, AnalyzedTrial, GroundTruth, GroundTruthSource, analyze};
-use tristim_capture::Capture;
+use tristim_capture::{self as cap, Capture};
 use tristim_color::metrics;
+use tristim_gather::{self as gather, CaptureConfig, GatherEvent};
 
 use crate::chart::{PresenterGamut, chromaticity_chart};
 use crate::luminance::{luminance_chart, luminance_units};
 use crate::plot::Space;
+use crate::setup::{CaptureForm, FormAction};
 
 /// Which plot the content panel shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,12 +33,101 @@ pub enum Tab {
     Luminance,
 }
 
-/// The loaded capture, its analysis, and which trial is in focus.
-pub struct PresenterApp {
+/// Top-level app mode.
+enum Mode {
+    Setup,
+    Running,
+    Presenting,
+}
+
+/// A capture being presented: the loaded record, its analysis, and which trial
+/// is in focus.
+struct Presented {
     capture: Capture,
     analyzed: AnalyzedCapture,
     selected: usize,
-    /// Which plot is shown.
+}
+
+impl Presented {
+    fn new(capture: Capture) -> Self {
+        let analyzed = analyze(&capture);
+        Self {
+            capture,
+            analyzed,
+            selected: 0,
+        }
+    }
+}
+
+/// A message from the background capture thread to the UI.
+enum CaptureMsg {
+    Progress(GatherEvent),
+    // Boxed: a `Capture` dwarfs a `GatherEvent`, so box it to keep the channel
+    // message small (clippy::large_enum_variant).
+    Finished(Result<Box<Capture>, String>),
+}
+
+/// Live state of an in-flight capture, updated from the thread's events.
+struct Running {
+    rx: Receiver<CaptureMsg>,
+    cancel: Arc<AtomicBool>,
+    device: Option<String>,
+    countdown: Option<u64>,
+    fmt_index: usize,
+    total_formats: usize,
+    fmt_token: String,
+    sample_in_fmt: usize,
+    per_format: usize,
+    measured: usize,
+    target: usize,
+    outcome: Option<cap::Negotiation>,
+    cancelling: bool,
+}
+
+impl Running {
+    /// Fold a progress event into the live state.
+    fn apply(&mut self, ev: GatherEvent) {
+        match ev {
+            GatherEvent::DeviceReady {
+                product, serial, ..
+            } => self.device = Some(format!("{product} · SN {serial}")),
+            GatherEvent::Countdown { remaining } => self.countdown = Some(remaining),
+            GatherEvent::FormatStart {
+                index,
+                total,
+                token,
+                ..
+            } => {
+                self.countdown = None;
+                self.fmt_index = index;
+                self.total_formats = total;
+                self.fmt_token = token;
+                self.sample_in_fmt = 0;
+                self.outcome = None;
+            }
+            GatherEvent::Negotiation(n) => self.outcome = Some(n),
+            GatherEvent::Sample { index, total, .. } => {
+                self.sample_in_fmt = index + 1;
+                self.per_format = total;
+                self.measured += 1;
+            }
+            GatherEvent::FormatDone { .. } => {}
+        }
+    }
+}
+
+/// The presenter application.
+pub struct PresenterApp {
+    mode: Mode,
+    /// Present-mode state (a loaded or just-captured record).
+    presented: Option<Presented>,
+    /// Setup-mode form.
+    form: CaptureForm,
+    /// Running-mode live state.
+    running: Option<Running>,
+    /// Where the most recent run auto-saved (shown in the present header).
+    saved_path: Option<String>,
+    /// Which plot is shown (present mode).
     view: Tab,
     /// Chromaticity projection for the diagram.
     space: Space,
@@ -40,12 +138,31 @@ pub struct PresenterApp {
 }
 
 impl PresenterApp {
+    /// Open straight into presenting a loaded capture (the file-arg path).
     pub fn new(capture: Capture) -> Self {
-        let analyzed = analyze(&capture);
         Self {
-            capture,
-            analyzed,
-            selected: 0,
+            mode: Mode::Presenting,
+            presented: Some(Presented::new(capture)),
+            form: CaptureForm::new(),
+            running: None,
+            saved_path: None,
+            view: Tab::Chromaticity,
+            space: Space::UvPrime,
+            show_field: false,
+            hovered_sample: None,
+        }
+    }
+
+    /// Open into the capture-setup form (no capture loaded).
+    pub fn setup() -> Self {
+        let mut form = CaptureForm::new();
+        form.refresh_outputs();
+        Self {
+            mode: Mode::Setup,
+            presented: None,
+            form,
+            running: None,
+            saved_path: None,
             view: Tab::Chromaticity,
             space: Space::UvPrime,
             show_field: false,
@@ -69,15 +186,19 @@ impl PresenterApp {
         self.space = space;
     }
 
-    /// Number of trials in the loaded capture.
+    /// Number of trials in the presented capture (0 if none).
     pub fn trial_count(&self) -> usize {
-        self.analyzed.trials.len()
+        self.presented
+            .as_ref()
+            .map_or(0, |p| p.analyzed.trials.len())
     }
 
     /// Focus trial `i` (clamped to the valid range). Used by the headless
     /// bundle dump to lay out every trial's panel, not just the default one.
     pub fn select(&mut self, i: usize) {
-        self.selected = i.min(self.trial_count().saturating_sub(1));
+        if let Some(p) = &mut self.presented {
+            p.selected = i.min(p.analyzed.trials.len().saturating_sub(1));
+        }
     }
 
     /// Enable/disable the color-field backdrop. Used by the headless dump to
@@ -86,53 +207,115 @@ impl PresenterApp {
         self.show_field = on;
     }
 
+    /// Spawn the capture on a background thread and switch to Running. Progress
+    /// flows back over a channel drained in [`Self::before_build`].
+    fn launch(&mut self, cfg: CaptureConfig) {
+        let total_formats = cfg.formats.len();
+        let per_format = cfg.sequence.len();
+        let (tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_thread = Arc::clone(&cancel);
+        let cfg_thread = cfg;
+        // Detached: the run owns the device + patch surface for its lifetime.
+        std::thread::spawn(move || {
+            let txp = tx.clone();
+            let result = gather::run_capture(
+                &cfg_thread,
+                move |ev| {
+                    let _ = txp.send(CaptureMsg::Progress(ev));
+                },
+                || cancel_thread.load(Ordering::Relaxed),
+            )
+            .map(Box::new)
+            .map_err(|e| e.to_string());
+            let _ = tx.send(CaptureMsg::Finished(result));
+        });
+
+        self.running = Some(Running {
+            rx,
+            cancel,
+            device: None,
+            countdown: None,
+            fmt_index: 0,
+            total_formats,
+            fmt_token: String::new(),
+            sample_in_fmt: 0,
+            per_format,
+            measured: 0,
+            target: total_formats * per_format,
+            outcome: None,
+            cancelling: false,
+        });
+        self.mode = Mode::Running;
+    }
+
+    /// A capture run finished: auto-save and switch to presenting it, or fall
+    /// back to setup with the error shown.
+    fn finish(&mut self, result: Result<Box<Capture>, String>) {
+        self.running = None;
+        match result {
+            Ok(capture) => {
+                let capture = *capture;
+                let fname = capture_filename(&capture.timestamp);
+                self.saved_path = Some(match capture.save(&fname) {
+                    Ok(()) => fname,
+                    Err(e) => format!("save failed: {e}"),
+                });
+                self.presented = Some(Presented::new(capture));
+                self.view = Tab::Chromaticity;
+                self.hovered_sample = None;
+                self.mode = Mode::Presenting;
+            }
+            Err(e) => {
+                self.form.set_error(e);
+                self.mode = Mode::Setup;
+            }
+        }
+    }
+
     /// Short label for trial `i`: the requested (or unmanaged) basis + format.
-    fn trial_label(&self, i: usize) -> String {
-        let fmt = &self.analyzed.trials[i].pixel_format;
-        let basis = match &self.capture.trials[i].requested {
+    fn trial_label(&self, p: &Presented, i: usize) -> String {
+        let fmt = &p.analyzed.trials[i].pixel_format;
+        let basis = match &p.capture.trials[i].requested {
             Some(d) => format!("{}/{}", d.transfer_function, d.primaries),
             None => "unmanaged".to_string(),
         };
         format!("{basis} · {fmt}")
     }
 
-    fn header(&self) -> El {
-        let dev = &self.capture.device;
-        let out = &self.capture.output;
+    fn present_header(&self, p: &Presented) -> El {
+        let dev = &p.capture.device;
+        let out = &p.capture.output;
         let out_label = match &out.mode {
             Some(m) => format!("{} · {}×{}", out.name, m.width, m.height),
             None => out.name.clone(),
         };
-        row([
-            column([
-                h2("tristim"),
-                text("color validation presenter").muted().font_size(12.0),
-            ])
-            .gap(2.0),
-            spacer(),
-            fact(
-                "device",
-                format!(
-                    "{} · SN {} · cal {}",
-                    dev.product, dev.serial, dev.cal_index
-                ),
+        let mut items = vec![brand("color validation presenter"), spacer()];
+        if let Some(path) = &self.saved_path {
+            items.push(fact("saved", path.clone()));
+        }
+        items.push(fact(
+            "device",
+            format!(
+                "{} · SN {} · cal {}",
+                dev.product, dev.serial, dev.cal_index
             ),
-            fact("output", out_label),
-            fact("captured", self.capture.timestamp.clone()),
-        ])
-        .gap(tokens::SPACE_6)
-        .align(Align::Center)
+        ));
+        items.push(fact("output", out_label));
+        items.push(fact("captured", p.capture.timestamp.clone()));
+        items.push(button("New capture").key("new-capture").secondary());
+        row(items).gap(tokens::SPACE_6).align(Align::Center)
     }
 
-    fn sidebar(&self, cx: &BuildCx) -> El {
+    fn sidebar(&self, p: &Presented, cx: &BuildCx) -> El {
         let mut items: Vec<El> = vec![section_label("Trials")];
-        for i in 0..self.analyzed.trials.len() {
-            let b = button(self.trial_label(i))
+        for i in 0..p.analyzed.trials.len() {
+            let b = button(self.trial_label(p, i))
                 .key(format!("trial:{i}"))
                 .width(Size::Fill(1.0));
-            items.push(if i == self.selected { b } else { b.secondary() });
+            items.push(if i == p.selected { b } else { b.secondary() });
         }
-        if self.analyzed.trials.is_empty() {
+        if p.analyzed.trials.is_empty() {
             items.push(text("(capture has no trials)").muted().font_size(12.0));
         }
         items.push(divider());
@@ -168,19 +351,19 @@ impl PresenterApp {
         column(rows).gap(tokens::SPACE_2)
     }
 
-    fn content_panel(&self, cx: &BuildCx) -> El {
-        if self.analyzed.trials.is_empty() {
+    fn content_panel(&self, p: &Presented, cx: &BuildCx) -> El {
+        if p.analyzed.trials.is_empty() {
             return column([text("Nothing to show.").muted()]).width(Size::Fill(1.0));
         }
-        let i = self.selected.min(self.analyzed.trials.len() - 1);
-        let t = &self.analyzed.trials[i];
+        let i = p.selected.min(p.analyzed.trials.len() - 1);
+        let t = &p.analyzed.trials[i];
 
         let plot_px = plot_size(cx);
 
         // Heading: title + view selector, plus chromaticity-only controls.
         let mut heading: Vec<El> = vec![
             column([
-                h3(self.trial_label(i)),
+                h3(self.trial_label(p, i)),
                 text(ground_truth_line(t)).muted().font_size(13.0),
             ])
             .gap(2.0),
@@ -233,6 +416,144 @@ impl PresenterApp {
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
     }
+
+    fn present_view(&self, p: &Presented, cx: &BuildCx) -> El {
+        column([
+            self.present_header(p),
+            divider(),
+            row([self.sidebar(p, cx), self.content_panel(p, cx)])
+                .gap(tokens::SPACE_6)
+                .align(Align::Stretch)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+        ])
+        .gap(tokens::SPACE_4)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+    }
+
+    fn setup_view(&self) -> El {
+        column([
+            row([brand("new capture"), spacer()]).align(Align::Center),
+            divider(),
+            // Scroll so the form fits any window / output count.
+            scroll([self.form.view().width(Size::Fixed(720.0))]).key("setup-scroll"),
+        ])
+        .gap(tokens::SPACE_4)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+    }
+
+    fn running_view(&self, r: &Running) -> El {
+        let frac = if r.target == 0 {
+            0.0
+        } else {
+            (r.measured as f32 / r.target as f32).clamp(0.0, 1.0)
+        };
+        let title = if r.cancelling {
+            "Cancelling…"
+        } else {
+            "Capturing…"
+        };
+        let device = r
+            .device
+            .clone()
+            .unwrap_or_else(|| "opening colorimeter…".to_string());
+        let detail = if let Some(c) = r.countdown {
+            format!("place the puck against the output — starting in {c}s")
+        } else if r.fmt_token.is_empty() {
+            "preparing…".to_string()
+        } else {
+            format!(
+                "format {} ({}/{}) · patch {}/{}",
+                r.fmt_token,
+                r.fmt_index + 1,
+                r.total_formats,
+                r.sample_in_fmt,
+                r.per_format,
+            )
+        };
+
+        let mut card_rows = vec![
+            text(device).muted().font_size(13.0),
+            text(detail).font_size(13.0),
+        ];
+        if let Some(o) = &r.outcome {
+            let s = match o {
+                cap::Negotiation::Accepted { .. } => "negotiation: accepted",
+                cap::Negotiation::Unmanaged => "negotiation: unmanaged (assumed sRGB)",
+                cap::Negotiation::Rejected { .. } => "negotiation: rejected",
+            };
+            card_rows.push(text(s).muted().font_size(12.0));
+        }
+        card_rows.push(progress(frac, tokens::PRIMARY).height(Size::Fixed(10.0)));
+        card_rows.push(
+            row([
+                mono(format!("{}/{} measurements", r.measured, r.target))
+                    .muted()
+                    .font_size(12.0),
+                spacer(),
+                button("Cancel").key("cancel").secondary(),
+            ])
+            .align(Align::Center)
+            .width(Size::Fill(1.0)),
+        );
+
+        column([
+            row([brand("running capture"), spacer()]).align(Align::Center),
+            divider(),
+            titled_card(title, card_rows)
+                .gap(tokens::SPACE_2)
+                .width(Size::Fixed(560.0)),
+        ])
+        .gap(tokens::SPACE_4)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+    }
+
+    /// Present-mode event routing (extracted so `on_event` can branch by mode).
+    fn on_present_event(&mut self, e: UiEvent) {
+        match e.kind {
+            UiEventKind::Click | UiEventKind::Activate => match e.route() {
+                Some("field-toggle") => self.show_field = !self.show_field,
+                Some("space-toggle") => self.space = self.space.toggled(),
+                Some("view:chroma") => self.view = Tab::Chromaticity,
+                Some("view:lum") => {
+                    self.view = Tab::Luminance;
+                    self.hovered_sample = None; // hover is chromaticity-only
+                }
+                Some("new-capture") => {
+                    self.form.refresh_outputs();
+                    self.mode = Mode::Setup;
+                }
+                Some(k) => {
+                    if let Some(i) = k
+                        .strip_prefix("trial:")
+                        .and_then(|r| r.parse::<usize>().ok())
+                        && let Some(p) = &mut self.presented
+                        && i < p.analyzed.trials.len()
+                    {
+                        p.selected = i;
+                        self.hovered_sample = None; // sample indices are per-trial
+                    }
+                }
+                None => {}
+            },
+            UiEventKind::PointerEnter => {
+                if let Some(i) = sample_key(e.target_key()) {
+                    self.hovered_sample = Some(i);
+                }
+            }
+            UiEventKind::PointerLeave => {
+                if let Some(i) = sample_key(e.target_key())
+                    && self.hovered_sample == Some(i)
+                {
+                    self.hovered_sample = None;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Responsive square side (px) for the plot, derived from the window viewport.
@@ -268,21 +589,58 @@ fn presenter_gamut(cx: &BuildCx) -> Option<PresenterGamut> {
     }
 }
 
+/// Filename for an auto-saved capture, derived from its RFC-3339 timestamp.
+fn capture_filename(timestamp: &str) -> String {
+    let stamp: String = timestamp
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    format!("capture-{stamp}.json")
+}
+
 impl App for PresenterApp {
+    fn before_build(&mut self) {
+        // Drain the capture thread's progress before laying out the frame.
+        if self.running.is_none() {
+            return;
+        }
+        let mut finished = None;
+        if let Some(r) = &mut self.running {
+            loop {
+                match r.rx.try_recv() {
+                    Ok(CaptureMsg::Progress(ev)) => r.apply(ev),
+                    Ok(CaptureMsg::Finished(res)) => {
+                        finished = Some(res);
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        finished = Some(Err("capture thread ended unexpectedly".to_string()));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(res) = finished {
+            self.finish(res);
+        }
+    }
+
     fn build(&self, cx: &BuildCx) -> El {
-        column([
-            self.header(),
-            divider(),
-            row([self.sidebar(cx), self.content_panel(cx)])
-                .gap(tokens::SPACE_6)
-                .align(Align::Stretch)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0)),
-        ])
-        .padding(tokens::SPACE_6)
-        .gap(tokens::SPACE_4)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
+        let body = match self.mode {
+            Mode::Setup => self.setup_view(),
+            Mode::Running => match &self.running {
+                Some(r) => self.running_view(r),
+                None => self.setup_view(),
+            },
+            Mode::Presenting => match &self.presented {
+                Some(p) => self.present_view(p, cx),
+                None => self.setup_view(),
+            },
+        };
+        body.padding(tokens::SPACE_6)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
     }
 
     fn shaders(&self) -> Vec<AppShader> {
@@ -290,45 +648,35 @@ impl App for PresenterApp {
     }
 
     fn on_event(&mut self, e: UiEvent) {
-        match e.kind {
-            UiEventKind::Click | UiEventKind::Activate => match e.route() {
-                Some("field-toggle") => self.show_field = !self.show_field,
-                Some("space-toggle") => self.space = self.space.toggled(),
-                Some("view:chroma") => self.view = Tab::Chromaticity,
-                Some("view:lum") => {
-                    self.view = Tab::Luminance;
-                    self.hovered_sample = None; // hover is chromaticity-only
-                }
-                Some(k) => {
-                    if let Some(i) = k
-                        .strip_prefix("trial:")
-                        .and_then(|r| r.parse::<usize>().ok())
-                        && i < self.analyzed.trials.len()
-                    {
-                        self.selected = i;
-                        self.hovered_sample = None; // sample indices are per-trial
-                    }
-                }
-                None => {}
-            },
-            UiEventKind::PointerEnter => {
-                if let Some(i) = sample_key(e.target_key()) {
-                    self.hovered_sample = Some(i);
-                }
-            }
-            UiEventKind::PointerLeave => {
-                if let Some(i) = sample_key(e.target_key())
-                    && self.hovered_sample == Some(i)
+        match self.mode {
+            Mode::Setup => {
+                if matches!(e.kind, UiEventKind::Click | UiEventKind::Activate)
+                    && let Some(route) = e.route()
+                    && let FormAction::Start(cfg) = self.form.handle(route)
                 {
-                    self.hovered_sample = None;
+                    self.launch(cfg);
                 }
             }
-            _ => {}
+            Mode::Running => {
+                if matches!(e.kind, UiEventKind::Click | UiEventKind::Activate)
+                    && e.route() == Some("cancel")
+                    && let Some(r) = &mut self.running
+                {
+                    r.cancel.store(true, Ordering::Relaxed);
+                    r.cancelling = true;
+                }
+            }
+            Mode::Presenting => self.on_present_event(e),
         }
     }
 }
 
 // ── view helpers ────────────────────────────────────────────────────────────
+
+/// The product wordmark + a muted subtitle, shared by every mode's header.
+fn brand(subtitle: &str) -> El {
+    column([h2("tristim"), text(subtitle).muted().font_size(12.0)]).gap(2.0)
+}
 
 fn section_label(s: &str) -> El {
     text(s).muted().font_size(12.0)

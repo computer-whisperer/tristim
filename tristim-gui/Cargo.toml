@@ -24,3 +24,8 @@ aetna-winit-wgpu = { path = "../../aetna/aetna.main/crates/aetna-winit-wgpu" }
 tristim-capture = { path = "../tristim-capture" }
 tristim-analyze = { path = "../tristim-analyze" }
 tristim-color = { path = "../tristim-color" }
+# Gather stack: run a capture in-process from the GUI. tristim-display is the
+# Wayland patch surface + output enumeration; tristim-gather is the shared
+# capture loop (also driven by the CLI). Both are aetna-free workspace members.
+tristim-display = { path = "../tristim-display" }
+tristim-gather = { path = "../tristim-gather" }
