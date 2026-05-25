@@ -16,3 +16,4 @@ tristim-driver = { path = "../tristim-driver" }
 tristim-display = { path = "../tristim-display" }
 tristim-capture = { path = "../tristim-capture" }
 tristim-analyze = { path = "../tristim-analyze" }
+tristim-gather = { path = "../tristim-gather" }

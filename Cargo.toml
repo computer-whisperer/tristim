@@ -6,6 +6,7 @@ members = [
     "tristim-capture",
     "tristim-color",
     "tristim-analyze",
+    "tristim-gather",
     "tristim-cli",
 ]
 # tristim-gui depends on aetna via a local path dep, which CI can't fetch.

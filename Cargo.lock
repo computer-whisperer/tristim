@@ -486,6 +486,7 @@ dependencies = [
  "tristim-capture",
  "tristim-display",
  "tristim-driver",
+ "tristim-gather",
 ]
 
 [[package]]
@@ -510,6 +511,16 @@ dependencies = [
  "rand",
  "rusb",
  "thiserror",
+]
+
+[[package]]
+name = "tristim-gather"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tristim-capture",
+ "tristim-display",
+ "tristim-driver",
 ]
 
 [[package]]

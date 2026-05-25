@@ -1,0 +1,14 @@
+[package]
+name = "tristim-gather"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Capture orchestration for tristim: drive a colorimeter + Wayland patch surface through a set of color formats and sequences, producing a tristim-capture Capture. Shared by the CLI gatherer and the GUI."
+
+[dependencies]
+tristim-driver = { path = "../tristim-driver" }
+tristim-display = { path = "../tristim-display" }
+tristim-capture = { path = "../tristim-capture" }
+thiserror.workspace = true
