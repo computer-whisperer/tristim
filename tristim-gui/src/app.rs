@@ -67,21 +67,48 @@ enum CaptureMsg {
     Finished(Result<Box<Capture>, String>),
 }
 
-/// Live state of an in-flight capture, updated from the thread's events.
+/// A format trial being measured right now: enough to assemble a `FormatTrial`
+/// and score it live, before the run finishes.
+struct LiveTrial {
+    index: usize,
+    token: String,
+    requested: Option<cap::ColorDescription>,
+    pixel_format: String,
+    outcome: Option<cap::Negotiation>,
+    samples: Vec<cap::Sample>,
+}
+
+impl LiveTrial {
+    fn to_trial(&self) -> cap::FormatTrial {
+        cap::FormatTrial {
+            requested: self.requested.clone(),
+            pixel_format: self.pixel_format.clone(),
+            // Negotiation always precedes samples; default until it arrives.
+            outcome: self.outcome.clone().unwrap_or(cap::Negotiation::Unmanaged),
+            samples: self.samples.clone(),
+        }
+    }
+}
+
+/// Live state of an in-flight capture, updated from the thread's events. As
+/// samples arrive they accumulate into `trials` + the in-progress `cur`, and
+/// `live` caches a re-analyzed snapshot so the plots fill in during the run.
 struct Running {
     rx: Receiver<CaptureMsg>,
     cancel: Arc<AtomicBool>,
     device: Option<String>,
     countdown: Option<u64>,
-    fmt_index: usize,
     total_formats: usize,
-    fmt_token: String,
-    sample_in_fmt: usize,
     per_format: usize,
     measured: usize,
     target: usize,
-    outcome: Option<cap::Negotiation>,
     cancelling: bool,
+    /// Completed format trials.
+    trials: Vec<cap::FormatTrial>,
+    /// The format currently being measured, if any.
+    cur: Option<LiveTrial>,
+    /// Re-analyzed snapshot of everything measured so far, for the plots.
+    live: Option<Presented>,
 }
 
 impl Running {
@@ -94,25 +121,100 @@ impl Running {
             GatherEvent::Countdown { remaining } => self.countdown = Some(remaining),
             GatherEvent::FormatStart {
                 index,
-                total,
                 token,
+                requested,
+                pixel_format,
                 ..
             } => {
                 self.countdown = None;
-                self.fmt_index = index;
-                self.total_formats = total;
-                self.fmt_token = token;
-                self.sample_in_fmt = 0;
-                self.outcome = None;
+                if let Some(done) = self.cur.take() {
+                    self.trials.push(done.to_trial());
+                }
+                self.cur = Some(LiveTrial {
+                    index,
+                    token,
+                    requested,
+                    pixel_format,
+                    outcome: None,
+                    samples: Vec::new(),
+                });
+                self.rebuild_live();
             }
-            GatherEvent::Negotiation(n) => self.outcome = Some(n),
-            GatherEvent::Sample { index, total, .. } => {
-                self.sample_in_fmt = index + 1;
-                self.per_format = total;
+            GatherEvent::Negotiation(n) => {
+                if let Some(c) = &mut self.cur {
+                    c.outcome = Some(n);
+                }
+                self.rebuild_live();
+            }
+            GatherEvent::Sample { sample, .. } => {
+                if let Some(c) = &mut self.cur {
+                    c.samples.push(sample);
+                }
                 self.measured += 1;
+                self.rebuild_live();
             }
-            GatherEvent::FormatDone { .. } => {}
+            GatherEvent::FormatDone { .. } => {
+                if let Some(done) = self.cur.take() {
+                    self.trials.push(done.to_trial());
+                }
+                self.rebuild_live();
+            }
         }
+    }
+
+    /// Rebuild the cached `live` snapshot from `trials` + `cur`, with the
+    /// in-progress (or most recent) trial in focus.
+    fn rebuild_live(&mut self) {
+        let mut trials = self.trials.clone();
+        let selected = match &self.cur {
+            Some(c) => {
+                trials.push(c.to_trial());
+                trials.len() - 1
+            }
+            None => trials.len().saturating_sub(1),
+        };
+        if trials.is_empty() {
+            self.live = None;
+            return;
+        }
+        let capture = live_capture(trials);
+        let analyzed = analyze(&capture);
+        self.live = Some(Presented {
+            capture,
+            analyzed,
+            selected,
+        });
+    }
+}
+
+/// A minimal `Capture` over just the measured trials, for live scoring. The
+/// device/output/capabilities metadata is irrelevant to `analyze` (it scores
+/// from each trial's `requested` + samples), so it's left empty.
+fn live_capture(trials: Vec<cap::FormatTrial>) -> Capture {
+    Capture {
+        schema_version: cap::SCHEMA_VERSION,
+        timestamp: String::new(),
+        tool: cap::ToolInfo {
+            name: "tristim".into(),
+            version: String::new(),
+            git_revision: None,
+        },
+        device: cap::DeviceInfo {
+            product: String::new(),
+            usb_pid: 0,
+            serial: String::new(),
+            hw_version: (0, 0),
+            cal_index: 0,
+        },
+        output: cap::OutputInfo {
+            name: String::new(),
+            make: String::new(),
+            model: String::new(),
+            description: String::new(),
+            mode: None,
+        },
+        capabilities: cap::Capabilities::default(),
+        trials,
     }
 }
 
@@ -162,6 +264,44 @@ impl PresenterApp {
             presented: None,
             form,
             running: None,
+            saved_path: None,
+            view: Tab::Chromaticity,
+            space: Space::UvPrime,
+            show_field: false,
+            hovered_sample: None,
+        }
+    }
+
+    /// Build the app in Running mode over an already-measured `capture`, with
+    /// no live thread — for the headless dump to lint the running layout (which
+    /// it otherwise can't construct, since `Running` owns a channel receiver).
+    pub fn debug_running(capture: Capture) -> Self {
+        let analyzed = analyze(&capture);
+        let total: usize = capture.trials.iter().map(|t| t.samples.len()).sum();
+        let (_tx, rx) = channel();
+        let running = Running {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            device: Some("Spyder 2024 · SN 87000216".to_string()),
+            countdown: None,
+            total_formats: capture.trials.len().max(1),
+            per_format: capture.trials.first().map_or(0, |t| t.samples.len()),
+            measured: total,
+            target: total.max(1),
+            cancelling: false,
+            trials: capture.trials.clone(),
+            cur: None,
+            live: Some(Presented {
+                capture,
+                analyzed,
+                selected: 0,
+            }),
+        };
+        Self {
+            mode: Mode::Running,
+            presented: None,
+            form: CaptureForm::new(),
+            running: Some(running),
             saved_path: None,
             view: Tab::Chromaticity,
             space: Space::UvPrime,
@@ -236,15 +376,14 @@ impl PresenterApp {
             cancel,
             device: None,
             countdown: None,
-            fmt_index: 0,
             total_formats,
-            fmt_token: String::new(),
-            sample_in_fmt: 0,
             per_format,
             measured: 0,
             target: total_formats * per_format,
-            outcome: None,
             cancelling: false,
+            trials: Vec::new(),
+            cur: None,
+            live: None,
         });
         self.mode = Mode::Running;
     }
@@ -355,14 +494,17 @@ impl PresenterApp {
         column(rows).gap(tokens::SPACE_2)
     }
 
-    fn content_panel(&self, p: &Presented, cx: &BuildCx) -> El {
+    /// The plot + stats panel for the in-focus trial. `extra_chrome` is added to
+    /// the vertical budget reserved above the plot (the running view sits a
+    /// progress strip there).
+    fn content_panel(&self, p: &Presented, cx: &BuildCx, extra_chrome: f32) -> El {
         if p.analyzed.trials.is_empty() {
             return column([text("Nothing to show.").muted()]).width(Size::Fill(1.0));
         }
         let i = p.selected.min(p.analyzed.trials.len() - 1);
         let t = &p.analyzed.trials[i];
 
-        let plot_px = plot_size(cx);
+        let plot_px = plot_size(cx, extra_chrome);
 
         // Heading: title + view selector, plus chromaticity-only controls.
         let mut heading: Vec<El> = vec![
@@ -425,7 +567,7 @@ impl PresenterApp {
         column([
             self.present_header(p),
             divider(),
-            row([self.sidebar(p, cx), self.content_panel(p, cx)])
+            row([self.sidebar(p, cx), self.content_panel(p, cx, 0.0)])
                 .gap(tokens::SPACE_6)
                 .align(Align::Stretch)
                 .width(Size::Fill(1.0))
@@ -448,7 +590,33 @@ impl PresenterApp {
         .height(Size::Fill(1.0))
     }
 
-    fn running_view(&self, r: &Running) -> El {
+    fn running_view(&self, r: &Running, cx: &BuildCx) -> El {
+        // Below the brand row + strip, show the live plots filling in as
+        // samples arrive; reserve their height in the plot's vertical budget.
+        const STRIP_CHROME: f32 = 64.0;
+        let body = match &r.live {
+            Some(p) => self.content_panel(p, cx, STRIP_CHROME),
+            None => column([text("Waiting for the first measurement…")
+                .muted()
+                .width(Size::Fill(1.0))])
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0)),
+        };
+
+        column([
+            row([brand("running capture"), spacer()]).align(Align::Center),
+            divider(),
+            self.progress_strip(r),
+            body,
+        ])
+        .gap(tokens::SPACE_4)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+    }
+
+    /// Compact one-line progress: status/countdown on the left, a progress bar
+    /// + measured count + Cancel on the right.
+    fn progress_strip(&self, r: &Running) -> El {
         let frac = if r.target == 0 {
             0.0
         } else {
@@ -459,60 +627,46 @@ impl PresenterApp {
         } else {
             "Capturing…"
         };
-        let device = r
-            .device
-            .clone()
-            .unwrap_or_else(|| "opening colorimeter…".to_string());
         let detail = if let Some(c) = r.countdown {
             format!("place the puck against the output — starting in {c}s")
-        } else if r.fmt_token.is_empty() {
-            "preparing…".to_string()
-        } else {
+        } else if let Some(cur) = &r.cur {
             format!(
-                "format {} ({}/{}) · patch {}/{}",
-                r.fmt_token,
-                r.fmt_index + 1,
+                "{} · {} ({}/{}) · patch {}/{}",
+                r.device.as_deref().unwrap_or("measuring"),
+                cur.token,
+                cur.index + 1,
                 r.total_formats,
-                r.sample_in_fmt,
+                cur.samples.len(),
                 r.per_format,
             )
+        } else {
+            r.device
+                .clone()
+                .unwrap_or_else(|| "opening colorimeter…".to_string())
         };
 
-        let mut card_rows = vec![
-            text(device).muted().font_size(13.0),
-            text(detail).font_size(13.0),
-        ];
-        if let Some(o) = &r.outcome {
-            let s = match o {
-                cap::Negotiation::Accepted { .. } => "negotiation: accepted",
-                cap::Negotiation::Unmanaged => "negotiation: unmanaged (assumed sRGB)",
-                cap::Negotiation::Rejected { .. } => "negotiation: rejected",
-            };
-            card_rows.push(text(s).muted().font_size(12.0));
-        }
-        card_rows.push(progress(frac, tokens::PRIMARY).height(Size::Fixed(10.0)));
-        card_rows.push(
-            row([
+        row([
+            column([
+                text(title).font_size(14.0),
+                text(detail).muted().font_size(12.0),
+            ])
+            .gap(2.0),
+            spacer(),
+            column([
+                progress(frac, tokens::PRIMARY)
+                    .width(Size::Fixed(220.0))
+                    .height(Size::Fixed(8.0)),
                 mono(format!("{}/{} measurements", r.measured, r.target))
                     .muted()
-                    .font_size(12.0),
-                spacer(),
-                button("Cancel").key("cancel").secondary(),
+                    .font_size(11.0),
             ])
-            .align(Align::Center)
-            .width(Size::Fill(1.0)),
-        );
-
-        column([
-            row([brand("running capture"), spacer()]).align(Align::Center),
-            divider(),
-            titled_card(title, card_rows)
-                .gap(tokens::SPACE_2)
-                .width(Size::Fixed(560.0)),
+            .gap(4.0)
+            .align(Align::End),
+            button("Cancel").key("cancel").secondary(),
         ])
         .gap(tokens::SPACE_4)
+        .align(Align::Center)
         .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
     }
 
     /// Present-mode event routing (extracted so `on_event` can branch by mode).
@@ -564,7 +718,7 @@ impl PresenterApp {
 /// Grows the diagram to fill the content area — leaving the stat/legend column
 /// its minimum width — and is bounded vertically so it always fits on screen.
 /// Falls back to a sensible size when no viewport is attached (headless).
-fn plot_size(cx: &BuildCx) -> f32 {
+fn plot_size(cx: &BuildCx, extra_chrome: f32) -> f32 {
     const ROOT_PAD: f32 = 24.0; // SPACE_6, window padding each side
     const SIDEBAR_W: f32 = 300.0;
     const COL_GAP: f32 = 24.0; // sidebar ↔ content
@@ -577,6 +731,7 @@ fn plot_size(cx: &BuildCx) -> f32 {
     let (vw, vh) = cx.viewport().unwrap_or((1280.0, 800.0));
     let content_w = vw - 2.0 * ROOT_PAD - SIDEBAR_W - COL_GAP;
     let h_budget = content_w - ROW_GAP - RIGHT_MIN;
+    let vh = vh - extra_chrome;
     let v_budget = vh - V_CHROME;
     h_budget.min(v_budget).clamp(PLOT_MIN, PLOT_MAX)
 }
@@ -634,7 +789,7 @@ impl App for PresenterApp {
         let body = match self.mode {
             Mode::Setup => self.setup_view(),
             Mode::Running => match &self.running {
-                Some(r) => self.running_view(r),
+                Some(r) => self.running_view(r, cx),
                 None => self.setup_view(),
             },
             Mode::Presenting => match &self.presented {
@@ -664,10 +819,16 @@ impl App for PresenterApp {
             Mode::Running => {
                 if matches!(e.kind, UiEventKind::Click | UiEventKind::Activate)
                     && e.route() == Some("cancel")
-                    && let Some(r) = &mut self.running
                 {
-                    r.cancel.store(true, Ordering::Relaxed);
-                    r.cancelling = true;
+                    if let Some(r) = &mut self.running {
+                        r.cancel.store(true, Ordering::Relaxed);
+                        r.cancelling = true;
+                    }
+                } else {
+                    // The live plots are interactive: reuse the present-mode
+                    // routing for the view selector, projection/fill toggles,
+                    // and hover-to-inspect.
+                    self.on_present_event(e);
                 }
             }
             Mode::Presenting => self.on_present_event(e),
@@ -942,5 +1103,94 @@ fn duv_color(v: f64) -> Color {
         tokens::WARNING
     } else {
         tokens::DESTRUCTIVE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(y: f64) -> cap::Sample {
+        cap::Sample {
+            requested: [0.5, 0.5, 0.5],
+            measured: cap::Measured {
+                raw: [0u16; 6],
+                xyz: [0.31 * y, y, 0.34 * y],
+                xy: Some([0.31, 0.33]),
+            },
+            context: cap::SampleContext {
+                window_fraction: 1.0,
+                border: None,
+                settle_ms: 0,
+            },
+        }
+    }
+
+    fn empty_running() -> Running {
+        let (_tx, rx) = channel();
+        Running {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            device: None,
+            countdown: None,
+            total_formats: 1,
+            per_format: 3,
+            measured: 0,
+            target: 3,
+            cancelling: false,
+            trials: Vec::new(),
+            cur: None,
+            live: None,
+        }
+    }
+
+    /// Progress events accumulate into a scored, presentable live snapshot.
+    #[test]
+    fn live_snapshot_accumulates_and_scores() {
+        let mut r = empty_running();
+        r.apply(GatherEvent::DeviceReady {
+            product: "Spyder 2024".into(),
+            serial: "x".into(),
+            hw_version: (6, 0),
+        });
+        // No trial has started, so nothing to show yet.
+        assert!(r.live.is_none());
+
+        r.apply(GatherEvent::FormatStart {
+            index: 0,
+            total: 1,
+            token: "srgb".into(),
+            pixel_format: "xrgb8888".into(),
+            requested: Some(cap::ColorDescription {
+                transfer_function: "srgb".into(),
+                primaries: "srgb".into(),
+                reference_white_nits: None,
+                mastering: None,
+            }),
+        });
+        r.apply(GatherEvent::Negotiation(cap::Negotiation::Unmanaged));
+        for i in 0..3 {
+            r.apply(GatherEvent::Sample {
+                format_index: 0,
+                index: i,
+                total: 3,
+                sample: sample(50.0 + i as f64),
+            });
+        }
+
+        let live = r.live.as_ref().expect("live snapshot present mid-run");
+        assert_eq!(live.analyzed.trials.len(), 1);
+        assert_eq!(live.capture.trials[0].samples.len(), 3);
+        assert_eq!(live.selected, 0);
+        assert_eq!(r.measured, 3);
+
+        // Closing the format keeps it presentable (cur folds into trials).
+        r.apply(GatherEvent::FormatDone {
+            index: 0,
+            samples: 3,
+        });
+        assert!(r.cur.is_none());
+        assert_eq!(r.trials.len(), 1);
+        assert_eq!(r.live.as_ref().unwrap().analyzed.trials.len(), 1);
     }
 }

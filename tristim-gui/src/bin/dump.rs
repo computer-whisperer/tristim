@@ -42,7 +42,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mut app = PresenterApp::new(capture);
+    let mut app = PresenterApp::new(capture.clone());
     app.set_show_field(true); // exercise the (heavier) color-field layout
     app.set_hovered_sample(Some(0)); // exercise the inspector + highlight + hit targets
     let theme = Theme::default();
@@ -84,6 +84,9 @@ fn main() -> ExitCode {
     // roundtrip); without a compositor the list is just empty, which still
     // exercises the form layout.
     let setup_app = PresenterApp::setup();
+    // And the live running view (progress strip + live plots), reusing the
+    // capture as if it were mid-run.
+    let running_app = PresenterApp::debug_running(capture.clone());
     let mut total_findings = 0usize;
     for (vw, vh) in VIEWPORTS {
         let viewport = Rect::new(0.0, 0.0, vw, vh);
@@ -96,11 +99,13 @@ fn main() -> ExitCode {
             emit(&bundle, &out_dir, name)
         };
 
-        match render(&setup_app, &format!("setup-{}w", vw as u32)) {
-            Ok(n) => total_findings += n,
-            Err(e) => {
-                eprintln!("dump: {e}");
-                return ExitCode::FAILURE;
+        for (probe, tag) in [(&setup_app, "setup"), (&running_app, "running")] {
+            match render(probe, &format!("{tag}-{}w", vw as u32)) {
+                Ok(n) => total_findings += n,
+                Err(e) => {
+                    eprintln!("dump: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
         }
 

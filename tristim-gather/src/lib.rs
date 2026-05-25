@@ -66,12 +66,15 @@ pub enum GatherEvent {
     /// Puck-placement countdown, fired once per second (`remaining` counts
     /// down to 1) with a black patch already on screen.
     Countdown { remaining: u64 },
-    /// Beginning a format trial (`index` of `total`).
+    /// Beginning a format trial (`index` of `total`). `requested` is the
+    /// description we'll negotiate (`None` = unmanaged) — carried so a live
+    /// consumer can score the trial's samples before the run finishes.
     FormatStart {
         index: usize,
         total: usize,
         token: String,
         pixel_format: String,
+        requested: Option<cap::ColorDescription>,
     },
     /// The compositor's response to the format's description.
     Negotiation(cap::Negotiation),
@@ -155,6 +158,7 @@ pub fn run_capture(
             total: format_count,
             token: fs.token().to_string(),
             pixel_format: fs.pixel_format_str().to_string(),
+            requested: fs.color_description(),
         });
 
         let (surface, outcome) = open_format(&config.output, fs)?;
