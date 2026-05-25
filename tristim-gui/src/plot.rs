@@ -153,6 +153,35 @@ pub fn white_uv(space: &ColorSpace) -> [f64; 2] {
     xy_to_uv_prime(space.white)
 }
 
+/// Subdivide a triangle into `n²` smaller triangles by barycentric subdivision,
+/// returning each as three vertices in the input space. Used to tile a gamut
+/// triangle for the chromaticity color fill — each cell can then be flat-filled
+/// with the true color of its centroid chromaticity.
+pub fn subdivide_triangle(verts: [[f64; 2]; 3], n: usize) -> Vec<[[f64; 2]; 3]> {
+    let n = n.max(1);
+    let nf = n as f64;
+    // Barycentric grid point: weights (1-a/n-b/n, a/n, b/n) over the vertices.
+    let point = |a: usize, b: usize| -> [f64; 2] {
+        let l1 = a as f64 / nf;
+        let l2 = b as f64 / nf;
+        let l0 = 1.0 - l1 - l2;
+        [
+            l0 * verts[0][0] + l1 * verts[1][0] + l2 * verts[2][0],
+            l0 * verts[0][1] + l1 * verts[1][1] + l2 * verts[2][1],
+        ]
+    };
+    let mut tris = Vec::with_capacity(n * n);
+    for a in 0..n {
+        for b in 0..(n - a) {
+            tris.push([point(a, b), point(a + 1, b), point(a, b + 1)]);
+            if a + b + 1 < n {
+                tris.push([point(a + 1, b), point(a + 1, b + 1), point(a, b + 1)]);
+            }
+        }
+    }
+    tris
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +224,25 @@ mod tests {
         let w = white_uv(&ColorSpace::SRGB);
         assert!((w[0] - 0.1978).abs() < 1e-3, "white u' = {}", w[0]);
         assert!((w[1] - 0.4683).abs() < 1e-3, "white v' = {}", w[1]);
+    }
+
+    #[test]
+    fn subdivide_triangle_produces_n_squared_cells() {
+        let tri = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        for n in [1, 2, 4, 8, 32] {
+            assert_eq!(subdivide_triangle(tri, n).len(), n * n, "n={n}");
+        }
+    }
+
+    #[test]
+    fn subdivide_triangle_keeps_cells_inside() {
+        // Every sub-vertex must stay within the unit triangle (x,y ≥ 0, x+y ≤ 1).
+        let tri = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        for cell in subdivide_triangle(tri, 8) {
+            for [x, y] in cell {
+                assert!(x >= -1e-9 && y >= -1e-9 && x + y <= 1.0 + 1e-9, "({x},{y})");
+            }
+        }
     }
 
     #[test]

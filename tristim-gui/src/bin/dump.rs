@@ -39,6 +39,7 @@ fn main() -> ExitCode {
     }
 
     let mut app = PresenterApp::new(capture);
+    app.set_show_field(true); // exercise the (heavier) color-field layout
     let theme = Theme::default();
     let viewport = Rect::new(0.0, 0.0, VIEWPORT.0, VIEWPORT.1);
 

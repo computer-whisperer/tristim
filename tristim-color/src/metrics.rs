@@ -17,6 +17,17 @@ pub fn xy_to_uv_prime(xy: Chromaticity) -> [f64; 2] {
     [4.0 * x / denom, 9.0 * y / denom]
 }
 
+/// CIE 1976 UCS u'v' → xy (inverse of [`xy_to_uv_prime`]). Returns NaNs for a
+/// degenerate denominator (shouldn't occur for real chromaticities).
+pub fn uv_prime_to_xy(uv: [f64; 2]) -> Chromaticity {
+    let [u, v] = uv;
+    let denom = 6.0 * u - 16.0 * v + 12.0;
+    if denom.abs() < 1e-12 {
+        return [f64::NAN, f64::NAN];
+    }
+    [9.0 * u / denom, 4.0 * v / denom]
+}
+
 /// Δu'v': Euclidean distance between two chromaticities in CIE 1976 UCS.
 /// `> 0.005` is perceptible, `> 0.015` obvious, `> 0.030` severe.
 pub fn delta_uv(a: Chromaticity, b: Chromaticity) -> f64 {
@@ -89,6 +100,15 @@ mod tests {
     #[test]
     fn delta_uv_zero_for_same_point() {
         assert_eq!(delta_uv(white::D65, white::D65), 0.0);
+    }
+
+    #[test]
+    fn uv_prime_round_trips_to_xy() {
+        for xy in [white::D65, [0.640, 0.330], [0.300, 0.600], [0.150, 0.060]] {
+            let back = uv_prime_to_xy(xy_to_uv_prime(xy));
+            close(back[0], xy[0], 1e-9);
+            close(back[1], xy[1], 1e-9);
+        }
     }
 
     #[test]

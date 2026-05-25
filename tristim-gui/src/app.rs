@@ -3,21 +3,23 @@
 //! The shell is a trial selector plus a panel describing the presenter's own
 //! display (read from the host's [`aetna_core::event::HostDiagnostics`]); the
 //! content panel shows the per-trial [`crate::chart`] chromaticity diagram
-//! beside the aggregate stat readout. Still to come: the per-pixel color-field
-//! background and hover-to-inspect.
+//! beside the aggregate stat readout, with an opt-in color-field backdrop
+//! bounded to the presenter's negotiated gamut. Still to come: hover-to-inspect.
 
 use aetna_core::prelude::*;
 use tristim_analyze::{AnalyzedCapture, AnalyzedTrial, GroundTruth, GroundTruthSource, analyze};
 use tristim_capture::Capture;
 use tristim_color::metrics;
 
-use crate::chart::chromaticity_chart;
+use crate::chart::{PresenterGamut, chromaticity_chart};
 
 /// The loaded capture, its analysis, and which trial is in focus.
 pub struct PresenterApp {
     capture: Capture,
     analyzed: AnalyzedCapture,
     selected: usize,
+    /// Whether to paint the chromaticity color-field backdrop (opt-in).
+    show_field: bool,
 }
 
 impl PresenterApp {
@@ -27,6 +29,7 @@ impl PresenterApp {
             capture,
             analyzed,
             selected: 0,
+            show_field: false,
         }
     }
 
@@ -39,6 +42,12 @@ impl PresenterApp {
     /// bundle dump to lay out every trial's panel, not just the default one.
     pub fn select(&mut self, i: usize) {
         self.selected = i.min(self.trial_count().saturating_sub(1));
+    }
+
+    /// Enable/disable the color-field backdrop. Used by the headless dump to
+    /// exercise the filled layout.
+    pub fn set_show_field(&mut self, on: bool) {
+        self.show_field = on;
     }
 
     /// Short label for trial `i`: the requested (or unmanaged) basis + format.
@@ -123,20 +132,34 @@ impl PresenterApp {
         column(rows).gap(tokens::SPACE_2)
     }
 
-    fn content_panel(&self) -> El {
+    fn content_panel(&self, cx: &BuildCx) -> El {
         if self.analyzed.trials.is_empty() {
             return column([text("Nothing to show.").muted()]).width(Size::Fill(1.0));
         }
         let i = self.selected.min(self.analyzed.trials.len() - 1);
         let t = &self.analyzed.trials[i];
-        column([
+
+        // The color fill is bounded to the presenter's own negotiated gamut, and
+        // only painted when toggled on. No gamut → the toggle is hidden.
+        let gamut = presenter_gamut(cx);
+        let field = if self.show_field { gamut } else { None };
+
+        let mut heading: Vec<El> = vec![
             column([
                 h3(self.trial_label(i)),
                 text(ground_truth_line(t)).muted().font_size(13.0),
             ])
             .gap(2.0),
+            spacer(),
+        ];
+        if gamut.is_some() {
+            heading.push(field_toggle(self.show_field));
+        }
+
+        column([
+            row(heading).align(Align::Center).width(Size::Fill(1.0)),
             row([
-                chromaticity_chart(t),
+                chromaticity_chart(t, field),
                 column([summary_card(t).width(Size::Fill(1.0)), chart_legend()])
                     .gap(tokens::SPACE_3)
                     .width(Size::Fill(1.0)),
@@ -152,12 +175,24 @@ impl PresenterApp {
     }
 }
 
+/// The presenter window's negotiated gamut, mapped from host diagnostics.
+/// `None` when no diagnostics are attached or the primaries aren't one we fill.
+fn presenter_gamut(cx: &BuildCx) -> Option<PresenterGamut> {
+    use aetna_core::color::Primaries;
+    match cx.diagnostics()?.working_color_space.primaries {
+        Primaries::Srgb => Some(PresenterGamut::Srgb),
+        Primaries::DisplayP3 => Some(PresenterGamut::DisplayP3),
+        Primaries::Bt2020 => Some(PresenterGamut::Bt2020),
+        Primaries::AdobeRgb => None,
+    }
+}
+
 impl App for PresenterApp {
     fn build(&self, cx: &BuildCx) -> El {
         column([
             self.header(),
             divider(),
-            row([self.sidebar(cx), self.content_panel()])
+            row([self.sidebar(cx), self.content_panel(cx)])
                 .gap(tokens::SPACE_6)
                 .align(Align::Stretch)
                 .width(Size::Fill(1.0))
@@ -173,12 +208,19 @@ impl App for PresenterApp {
         if !matches!(e.kind, UiEventKind::Click | UiEventKind::Activate) {
             return;
         }
-        if let Some(rest) = e.route().and_then(|k| k.strip_prefix("trial:")) {
-            if let Ok(i) = rest.parse::<usize>() {
-                if i < self.analyzed.trials.len() {
-                    self.selected = i;
+        match e.route() {
+            Some("field-toggle") => self.show_field = !self.show_field,
+            Some(k) => {
+                if let Some(i) = k
+                    .strip_prefix("trial:")
+                    .and_then(|r| r.parse::<usize>().ok())
+                {
+                    if i < self.analyzed.trials.len() {
+                        self.selected = i;
+                    }
                 }
             }
+            None => {}
         }
     }
 }
@@ -187,6 +229,17 @@ impl App for PresenterApp {
 
 fn section_label(s: &str) -> El {
     text(s).muted().font_size(12.0)
+}
+
+/// Toggle for the color-field backdrop. Labeled with its current state.
+fn field_toggle(on: bool) -> El {
+    let b = button(if on {
+        "color fill: on"
+    } else {
+        "color fill: off"
+    })
+    .key("field-toggle");
+    if on { b } else { b.secondary() }
 }
 
 /// A stacked label/value field for the narrow sidebar: a muted label over a
