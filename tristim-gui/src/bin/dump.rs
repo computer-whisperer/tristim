@@ -15,6 +15,7 @@ use std::process::ExitCode;
 
 use aetna_core::prelude::*;
 use tristim_gui::PresenterApp;
+use tristim_gui::app::Tab;
 use tristim_gui::plot::Space;
 
 /// Window sizes to lay out under (default + a large display), so responsive
@@ -75,41 +76,45 @@ fn main() -> ExitCode {
         ..HostDiagnostics::default()
     };
 
-    // Lay out and lint every trial's panel in both chromaticity projections,
-    // at each window size (responsive plot sizing reads the viewport).
+    // Lay out and lint every trial's panel for each view, at each window size
+    // (responsive plot sizing reads the viewport). Chromaticity is rendered in
+    // both projections; luminance is projection-independent.
     let count = app.trial_count().max(1);
     let mut total_findings = 0usize;
     for (vw, vh) in VIEWPORTS {
         let viewport = Rect::new(0.0, 0.0, vw, vh);
+        let render = |app: &PresenterApp, name: &str| {
+            let cx = BuildCx::new(&theme)
+                .with_viewport(vw, vh)
+                .with_diagnostics(&diags);
+            let mut root = app.build(&cx);
+            let bundle = render_bundle_themed(&mut root, viewport, &theme);
+            emit(&bundle, &out_dir, name)
+        };
+
+        app.set_view(Tab::Chromaticity);
         for (space, tag) in [(Space::UvPrime, "uv"), (Space::Xy, "xy")] {
             app.set_space(space);
             for i in 0..count {
                 app.select(i);
-                let cx = BuildCx::new(&theme)
-                    .with_viewport(vw, vh)
-                    .with_diagnostics(&diags);
-                let mut root = app.build(&cx);
-                let bundle = render_bundle_themed(&mut root, viewport, &theme);
-
-                let name = format!("trial-{i}-{tag}-{}w", vw as u32);
-                match write_bundle(&bundle, Path::new(&out_dir), &name) {
-                    Ok(written) => {
-                        for p in &written {
-                            println!("wrote {}", p.display());
-                        }
-                    }
+                match render(&app, &format!("chroma-{tag}-trial{i}-{}w", vw as u32)) {
+                    Ok(n) => total_findings += n,
                     Err(e) => {
-                        eprintln!("dump: write_bundle({name}): {e}");
+                        eprintln!("dump: {e}");
                         return ExitCode::FAILURE;
                     }
                 }
+            }
+        }
 
-                if bundle.lint.findings.is_empty() {
-                    println!("[{name}] lint clean ({} draw ops)", bundle.draw_ops.len());
-                } else {
-                    total_findings += bundle.lint.findings.len();
-                    eprintln!("[{name}] {} lint finding(s):", bundle.lint.findings.len());
-                    eprint!("{}", bundle.lint.text());
+        app.set_view(Tab::Luminance);
+        for i in 0..count {
+            app.select(i);
+            match render(&app, &format!("lum-trial{i}-{}w", vw as u32)) {
+                Ok(n) => total_findings += n,
+                Err(e) => {
+                    eprintln!("dump: {e}");
+                    return ExitCode::FAILURE;
                 }
             }
         }
@@ -121,4 +126,19 @@ fn main() -> ExitCode {
         eprintln!("dump: {total_findings} total lint finding(s)");
         ExitCode::FAILURE
     }
+}
+
+/// Write a bundle's artifacts and report its lint findings; returns the count.
+fn emit(bundle: &Bundle, out_dir: &str, name: &str) -> std::io::Result<usize> {
+    for p in write_bundle(bundle, Path::new(out_dir), name)? {
+        println!("wrote {}", p.display());
+    }
+    let n = bundle.lint.findings.len();
+    if n == 0 {
+        println!("[{name}] lint clean ({} draw ops)", bundle.draw_ops.len());
+    } else {
+        eprintln!("[{name}] {n} lint finding(s):");
+        eprint!("{}", bundle.lint.text());
+    }
+    Ok(n)
 }

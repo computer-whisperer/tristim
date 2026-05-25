@@ -46,6 +46,14 @@ cargo run --bin dump -- ../capture.json out
 This is the primary way to validate layout in a headless environment; the `out/`
 directory is git-ignored.
 
+## Views
+
+A view selector switches the main plot between **Chromaticity** (the CIE
+diagram) and **Luminance** (measured vs. expected luminance per sample, with the
+ideal `y = x` diagonal). The luminance plot doubles as a tone-response curve
+when fed a grey-ramp capture; per-channel peak emission needs a primary-ramp
+capture (`tristim capture --seq grey:N --seq primaries:N`).
+
 ## Color field
 
 The chromaticity diagram has an opt-in color-field backdrop (the "color fill"

@@ -230,7 +230,7 @@ fn line_path(a: [f32; 2], b: [f32; 2], color: Color, width: f32) -> VectorPath {
 
 /// An unbuilt circular path centered at `c` with radius `r`, approximated by
 /// four cubic Béziers. The caller adds the fill or stroke.
-fn circle(c: [f32; 2], r: f32) -> PathBuilder {
+pub(crate) fn circle(c: [f32; 2], r: f32) -> PathBuilder {
     const K: f32 = 0.552_285; // 4/3 * (sqrt(2) - 1)
     let (x, y) = (c[0], c[1]);
     let k = K * r;
@@ -245,7 +245,7 @@ fn circle(c: [f32; 2], r: f32) -> PathBuilder {
 
 /// ΔE\*ab → heat color: green (faithful) through amber to red (severe). The
 /// scale saturates near ΔE 15, well above the ~2.3 just-noticeable threshold.
-fn heat(de: f64) -> Color {
+pub(crate) fn heat(de: f64) -> Color {
     let good = Color::srgb_u8(90, 200, 130);
     let amber = Color::srgb_u8(240, 200, 70);
     let bad = Color::srgb_u8(235, 80, 80);

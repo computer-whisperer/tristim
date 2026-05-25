@@ -2,10 +2,11 @@
 //!
 //! The shell is a trial selector plus a panel describing the presenter's own
 //! display (read from the host's [`aetna_core::event::HostDiagnostics`]); the
-//! content panel shows the per-trial [`crate::chart`] chromaticity diagram
-//! beside the aggregate stat readout, with an opt-in color-field backdrop
-//! bounded to the presenter's negotiated gamut. Hovering a sample swaps the
-//! legend for a per-sample inspector and highlights the point.
+//! content panel shows, per a view selector, either the [`crate::chart`]
+//! chromaticity diagram (with an opt-in color-field backdrop bounded to the
+//! presenter's negotiated gamut, and hover-to-inspect that swaps the legend for
+//! a per-sample inspector) or the [`crate::luminance`] measured-vs-expected
+//! plot — both beside the aggregate stat readout.
 
 use aetna_core::prelude::*;
 use tristim_analyze::{AnalyzedCapture, AnalyzedTrial, GroundTruth, GroundTruthSource, analyze};
@@ -13,13 +14,23 @@ use tristim_capture::Capture;
 use tristim_color::metrics;
 
 use crate::chart::{PresenterGamut, chromaticity_chart};
+use crate::luminance::{luminance_chart, luminance_units};
 use crate::plot::Space;
+
+/// Which plot the content panel shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Chromaticity,
+    Luminance,
+}
 
 /// The loaded capture, its analysis, and which trial is in focus.
 pub struct PresenterApp {
     capture: Capture,
     analyzed: AnalyzedCapture,
     selected: usize,
+    /// Which plot is shown.
+    view: Tab,
     /// Chromaticity projection for the diagram.
     space: Space,
     /// Whether to paint the chromaticity color-field backdrop (opt-in).
@@ -35,6 +46,7 @@ impl PresenterApp {
             capture,
             analyzed,
             selected: 0,
+            view: Tab::Chromaticity,
             space: Space::UvPrime,
             show_field: false,
             hovered_sample: None,
@@ -44,6 +56,11 @@ impl PresenterApp {
     /// Set the hovered sample. Used by the headless dump to render the inspector.
     pub fn set_hovered_sample(&mut self, i: Option<usize>) {
         self.hovered_sample = i;
+    }
+
+    /// Set the active view. Used by the headless dump to render each plot.
+    pub fn set_view(&mut self, view: Tab) {
+        self.view = view;
     }
 
     /// Set the chromaticity projection. Used by the headless dump to render
@@ -158,11 +175,9 @@ impl PresenterApp {
         let i = self.selected.min(self.analyzed.trials.len() - 1);
         let t = &self.analyzed.trials[i];
 
-        // The color fill is bounded to the presenter's own negotiated gamut, and
-        // only painted when toggled on. No gamut → the toggle is hidden.
-        let gamut = presenter_gamut(cx);
-        let field = if self.show_field { gamut } else { None };
+        let plot_px = plot_size(cx);
 
+        // Heading: title + view selector, plus chromaticity-only controls.
         let mut heading: Vec<El> = vec![
             column([
                 h3(self.trial_label(i)),
@@ -170,11 +185,30 @@ impl PresenterApp {
             ])
             .gap(2.0),
             spacer(),
-            space_toggle(self.space),
+            view_selector(self.view),
         ];
-        if gamut.is_some() {
-            heading.push(field_toggle(self.show_field));
-        }
+
+        // The main plot + its detail card, per view.
+        let (plot, detail) = match self.view {
+            Tab::Chromaticity => {
+                // Color fill is bounded to the presenter's negotiated gamut.
+                let gamut = presenter_gamut(cx);
+                heading.push(space_toggle(self.space));
+                if gamut.is_some() {
+                    heading.push(field_toggle(self.show_field));
+                }
+                let field = if self.show_field { gamut } else { None };
+                let detail = match self.hovered_sample {
+                    Some(_) => sample_inspector(t, self.hovered_sample),
+                    None => chart_legend(self.space),
+                };
+                (
+                    chromaticity_chart(t, self.space, field, plot_px, self.hovered_sample),
+                    detail,
+                )
+            }
+            Tab::Luminance => (luminance_chart(t, plot_px), luminance_legend(t)),
+        };
 
         column([
             row(heading)
@@ -182,15 +216,10 @@ impl PresenterApp {
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
             row([
-                chromaticity_chart(t, self.space, field, plot_size(cx), self.hovered_sample),
-                // Show the inspector while hovering a sample, the legend otherwise.
+                plot,
                 column([
                     summary_card(t).width(Size::Fill(1.0)),
-                    match self.hovered_sample {
-                        Some(_) => sample_inspector(t, self.hovered_sample),
-                        None => chart_legend(self.space),
-                    }
-                    .width(Size::Fill(1.0)),
+                    detail.width(Size::Fill(1.0)),
                 ])
                 .gap(tokens::SPACE_3)
                 .width(Size::Fill(1.0)),
@@ -265,6 +294,11 @@ impl App for PresenterApp {
             UiEventKind::Click | UiEventKind::Activate => match e.route() {
                 Some("field-toggle") => self.show_field = !self.show_field,
                 Some("space-toggle") => self.space = self.space.toggled(),
+                Some("view:chroma") => self.view = Tab::Chromaticity,
+                Some("view:lum") => {
+                    self.view = Tab::Luminance;
+                    self.hovered_sample = None; // hover is chromaticity-only
+                }
                 Some(k) => {
                     if let Some(i) = k
                         .strip_prefix("trial:")
@@ -314,6 +348,39 @@ fn field_toggle(on: bool) -> El {
 /// Toggle between the two chromaticity projections, labeled with the current.
 fn space_toggle(space: Space) -> El {
     button(space.label()).key("space-toggle").secondary()
+}
+
+/// Segmented selector for the active view; the current view's button is primary.
+fn view_selector(view: Tab) -> El {
+    let tab = |label: &str, key: &str, active: bool| {
+        let b = button(label).key(key.to_string());
+        if active { b } else { b.secondary() }
+    };
+    row([
+        tab("Chromaticity", "view:chroma", view == Tab::Chromaticity),
+        tab("Luminance", "view:lum", view == Tab::Luminance),
+    ])
+    .gap(tokens::SPACE_2)
+}
+
+fn luminance_legend(t: &AnalyzedTrial) -> El {
+    let units = luminance_units(t);
+    titled_card(
+        "Legend",
+        [
+            text("dot — a sample's luminance").muted().font_size(12.0),
+            text("x — expected · y — measured").muted().font_size(12.0),
+            text("diagonal — ideal (measured = expected)")
+                .muted()
+                .font_size(12.0),
+            text("above the line → too bright, below → too dim")
+                .muted()
+                .font_size(12.0),
+            text("color — ΔE*ab, green → red").muted().font_size(12.0),
+            text(format!("units: {units}")).muted().font_size(11.0),
+        ],
+    )
+    .gap(tokens::SPACE_2)
 }
 
 /// A stacked label/value field for the narrow sidebar: a muted label over a
