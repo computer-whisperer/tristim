@@ -42,12 +42,41 @@ fn main() -> ExitCode {
     let theme = Theme::default();
     let viewport = Rect::new(0.0, 0.0, VIEWPORT.0, VIEWPORT.1);
 
+    // Feed representative host diagnostics so the dump exercises the *populated*
+    // "Presenter display" panel — the path the live window takes. Without this
+    // the panel collapses to a one-line placeholder and the dump never sees the
+    // long adapter/format strings that drive sidebar layout. The adapter name
+    // is a deliberate worst case (long, real-world string).
+    let diags = HostDiagnostics {
+        backend: "Vulkan",
+        surface_color: Some(SurfaceColorInfo {
+            adapter: "AMD Radeon RX 7900 XTX (RADV NAVI31)".to_string(),
+            driver: "Mesa 24.0.0".to_string(),
+            formats: vec![
+                SurfaceFormatInfo {
+                    name: "Bgra8UnormSrgb".to_string(),
+                    srgb: true,
+                    wide: false,
+                },
+                SurfaceFormatInfo {
+                    name: "Rgba16Float".to_string(),
+                    srgb: false,
+                    wide: true,
+                },
+            ],
+            chosen_format: "Bgra8UnormSrgb".to_string(),
+            present_mode: "Fifo".to_string(),
+            alpha_mode: "Opaque".to_string(),
+        }),
+        ..HostDiagnostics::default()
+    };
+
     // Lay out and lint every trial's panel, not just the default selection.
     let count = app.trial_count().max(1);
     let mut total_findings = 0usize;
     for i in 0..count {
         app.select(i);
-        let cx = BuildCx::new(&theme);
+        let cx = BuildCx::new(&theme).with_diagnostics(&diags);
         let mut root = app.build(&cx);
         let bundle = render_bundle_themed(&mut root, viewport, &theme);
 

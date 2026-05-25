@@ -1,10 +1,10 @@
 //! The presenter application: state + tree.
 //!
-//! Phase 1 is the shell — a trial selector, an aggregate stat readout per
-//! trial, and a panel describing the presenter's own display (read from the
-//! host's [`aetna_core::event::HostDiagnostics`]). The chromaticity field and
-//! per-sample error visualization land in later phases; their slot is the
-//! [`plot_placeholder`] in the content panel.
+//! The shell is a trial selector plus a panel describing the presenter's own
+//! display (read from the host's [`aetna_core::event::HostDiagnostics`]); the
+//! content panel shows the per-trial [`crate::chart`] chromaticity diagram
+//! beside the aggregate stat readout. Still to come: the per-pixel color-field
+//! background and hover-to-inspect.
 
 use aetna_core::prelude::*;
 use tristim_analyze::{AnalyzedCapture, AnalyzedTrial, GroundTruth, GroundTruthSource, analyze};
@@ -101,17 +101,18 @@ impl PresenterApp {
         let mut rows: Vec<El> = vec![section_label("Presenter display")];
         match cx.diagnostics() {
             Some(d) => {
-                rows.push(stat_row("backend", d.backend));
-                rows.push(stat_row(
+                rows.push(kv_field("backend", d.backend));
+                let ws = d.working_color_space;
+                rows.push(kv_field(
                     "working space",
-                    format!("{:?}", d.working_color_space),
+                    format!("{:?} / {:?}", ws.primaries, ws.transfer),
                 ));
-                rows.push(stat_row("color mgmt", format!("{:?}", d.color_management)));
+                rows.push(kv_field("color mgmt", format!("{:?}", d.color_management)));
                 if let Some(sc) = &d.surface_color {
-                    rows.push(stat_row("adapter", sc.adapter.clone()));
-                    rows.push(stat_row("swapchain", sc.chosen_format.clone()));
+                    rows.push(kv_field("adapter", sc.adapter.clone()));
+                    rows.push(kv_field("swapchain", sc.chosen_format.clone()));
                     let wide = sc.formats.iter().filter(|f| f.wide).count();
-                    rows.push(stat_row(
+                    rows.push(kv_field(
                         "wide formats",
                         format!("{wide}/{}", sc.formats.len()),
                     ));
@@ -186,6 +187,22 @@ impl App for PresenterApp {
 
 fn section_label(s: &str) -> El {
     text(s).muted().font_size(12.0)
+}
+
+/// A stacked label/value field for the narrow sidebar: a muted label over a
+/// monospaced value bounded to the column width and ellipsized, so arbitrarily
+/// long values (adapter names, format strings) can't overrun into the chart.
+fn kv_field(label: &str, value: impl Into<String>) -> El {
+    column([
+        text(label).muted().font_size(11.0),
+        mono(value)
+            .font_size(12.0)
+            .width(Size::Fill(1.0))
+            .nowrap_text()
+            .ellipsis(),
+    ])
+    .gap(1.0)
+    .width(Size::Fill(1.0))
 }
 
 /// A `label · value` column used in the header strip.
