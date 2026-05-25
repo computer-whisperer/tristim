@@ -221,6 +221,10 @@ impl App for PresenterApp {
         .height(Size::Fill(1.0))
     }
 
+    fn shaders(&self) -> Vec<AppShader> {
+        vec![crate::chart::field_shader()]
+    }
+
     fn on_event(&mut self, e: UiEvent) {
         if !matches!(e.kind, UiEventKind::Click | UiEventKind::Activate) {
             return;

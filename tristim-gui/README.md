@@ -46,6 +46,14 @@ cargo run --bin dump -- ../capture.json out
 This is the primary way to validate layout in a headless environment; the `out/`
 directory is git-ignored.
 
+## Color field
+
+The chromaticity diagram has an opt-in color-field backdrop (the "color fill"
+toggle in the trial heading), painted by a custom WGSL shader
+(`chroma_field.wgsl`) and clipped to the presenter window's negotiated gamut, so
+every painted color is actually displayable. Set `TRISTIM_GUI_FIELD=1` to start
+with it on. The `xy ⇄ u'v'` toggle switches the chromaticity projection.
+
 ## Color preferences
 
 The presenter declares `ColorPreferences::wide_gamut()` so it is ready to render

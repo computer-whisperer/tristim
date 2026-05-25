@@ -38,7 +38,12 @@ fn main() -> ExitCode {
         }
     };
 
-    let app = PresenterApp::new(capture);
+    let mut app = PresenterApp::new(capture);
+    // Convenience: start with the color-field backdrop on (otherwise it's an
+    // in-app toggle, off by default).
+    if std::env::var_os("TRISTIM_GUI_FIELD").is_some() {
+        app.set_show_field(true);
+    }
 
     // Declare wide-gamut intent. aetna's host treats `color_preferences` as
     // advisory today — it still composites in sRGB pending a wgpu
