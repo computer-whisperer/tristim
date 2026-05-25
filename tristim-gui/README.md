@@ -45,9 +45,17 @@ shows the device, the current format and patch, and a cancellable progress bar.
 
 The patch is a fullscreen overlay on the **selected output** (where the puck
 sits), so run this window on a *different* display to watch progress during the
-run. When the run finishes (or you cancel — partial results are kept), the
-capture is **auto-saved** to `capture-<timestamp>.json` in the working directory
-and opened in the visualization; the saved path is shown in the header.
+run, with the chromaticity / luminance plots filling in as each patch is read.
+When the run finishes (or you cancel — partial results are kept), the capture is
+**auto-saved** to `capture-<timestamp>.json` in the working directory and opened
+in the visualization; the file in focus is named in the header.
+
+## Opening a capture
+
+**Open…** (in the presenter header and on the setup screen) brings up a native
+file dialog to load another capture, replacing the one in view. The dialog uses
+the `xdg-desktop-portal` file chooser and runs off the main thread, so it works
+on Wayland without linking GTK and without freezing the window.
 
 ## Headless layout check (`dump`)
 

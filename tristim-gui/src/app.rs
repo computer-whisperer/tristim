@@ -67,6 +67,16 @@ enum CaptureMsg {
     Finished(Result<Box<Capture>, String>),
 }
 
+/// Result of the background open-file dialog.
+enum OpenOutcome {
+    /// The dialog was dismissed.
+    Cancelled,
+    /// A capture loaded from the chosen path (kept for the header).
+    Loaded(Box<Capture>, String),
+    /// The chosen file failed to load.
+    Failed(String),
+}
+
 /// A format trial being measured right now: enough to assemble a `FormatTrial`
 /// and score it live, before the run finishes.
 struct LiveTrial {
@@ -227,8 +237,13 @@ pub struct PresenterApp {
     form: CaptureForm,
     /// Running-mode live state.
     running: Option<Running>,
-    /// Where the most recent run auto-saved (shown in the present header).
-    saved_path: Option<String>,
+    /// Path of the capture in focus (auto-save target or opened file), shown
+    /// in the present header.
+    source_path: Option<String>,
+    /// Pending open-file dialog, resolved on a background thread.
+    open_rx: Option<Receiver<OpenOutcome>>,
+    /// Last open-file error, shown in the header / setup screen.
+    open_error: Option<String>,
     /// Which plot is shown (present mode).
     view: Tab,
     /// Chromaticity projection for the diagram.
@@ -247,7 +262,9 @@ impl PresenterApp {
             presented: Some(Presented::new(capture)),
             form: CaptureForm::new(),
             running: None,
-            saved_path: None,
+            source_path: None,
+            open_rx: None,
+            open_error: None,
             view: Tab::Chromaticity,
             space: Space::UvPrime,
             show_field: false,
@@ -264,7 +281,9 @@ impl PresenterApp {
             presented: None,
             form,
             running: None,
-            saved_path: None,
+            source_path: None,
+            open_rx: None,
+            open_error: None,
             view: Tab::Chromaticity,
             space: Space::UvPrime,
             show_field: false,
@@ -302,12 +321,20 @@ impl PresenterApp {
             presented: None,
             form: CaptureForm::new(),
             running: Some(running),
-            saved_path: None,
+            source_path: None,
+            open_rx: None,
+            open_error: None,
             view: Tab::Chromaticity,
             space: Space::UvPrime,
             show_field: false,
             hovered_sample: None,
         }
+    }
+
+    /// Record the path of the loaded capture (shown in the header). Used by the
+    /// windowed binary when launched with a file argument.
+    pub fn set_source_path(&mut self, path: String) {
+        self.source_path = Some(path);
     }
 
     /// Set the hovered sample. Used by the headless dump to render the inspector.
@@ -396,7 +423,7 @@ impl PresenterApp {
             Ok(capture) => {
                 let capture = *capture;
                 let fname = capture_filename(&capture.timestamp);
-                self.saved_path = Some(match capture.save(&fname) {
+                self.source_path = Some(match capture.save(&fname) {
                     Ok(()) => fname,
                     Err(e) => format!("save failed: {e}"),
                 });
@@ -410,6 +437,89 @@ impl PresenterApp {
                 self.mode = Mode::Setup;
             }
         }
+    }
+
+    /// Open a native file dialog on a background thread (so the Wayland event
+    /// loop keeps servicing while it's up) and load the chosen capture. The
+    /// result is drained in [`Self::before_build`].
+    fn open_dialog(&mut self) {
+        if self.open_rx.is_some() {
+            return; // a dialog is already in flight
+        }
+        self.open_error = None;
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let outcome = match rfd::FileDialog::new()
+                .add_filter("tristim capture", &["json"])
+                .set_title("Open a tristim capture")
+                .pick_file()
+            {
+                None => OpenOutcome::Cancelled,
+                Some(path) => match Capture::load(&path) {
+                    Ok(c) => OpenOutcome::Loaded(Box::new(c), path.display().to_string()),
+                    Err(e) => OpenOutcome::Failed(format!("{}: {e}", path.display())),
+                },
+            };
+            let _ = tx.send(outcome);
+        });
+        self.open_rx = Some(rx);
+    }
+
+    /// Switch to presenting a freshly opened capture, or record the error.
+    fn apply_open(&mut self, outcome: OpenOutcome) {
+        match outcome {
+            OpenOutcome::Cancelled => {}
+            OpenOutcome::Loaded(capture, path) => {
+                self.presented = Some(Presented::new(*capture));
+                self.source_path = Some(path);
+                self.open_error = None;
+                self.view = Tab::Chromaticity;
+                self.hovered_sample = None;
+                self.mode = Mode::Presenting;
+            }
+            OpenOutcome::Failed(e) => self.open_error = Some(e),
+        }
+    }
+
+    /// Drain the capture thread's progress, finishing the run if it completed.
+    fn drain_capture(&mut self) {
+        if self.running.is_none() {
+            return;
+        }
+        let mut finished = None;
+        if let Some(r) = &mut self.running {
+            loop {
+                match r.rx.try_recv() {
+                    Ok(CaptureMsg::Progress(ev)) => r.apply(ev),
+                    Ok(CaptureMsg::Finished(res)) => {
+                        finished = Some(res);
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        finished = Some(Err("capture thread ended unexpectedly".to_string()));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(res) = finished {
+            self.finish(res);
+        }
+    }
+
+    /// Drain a pending open-file dialog result.
+    fn drain_open(&mut self) {
+        let outcome = match &self.open_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(o) => o,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => OpenOutcome::Cancelled,
+            },
+            None => return,
+        };
+        self.open_rx = None;
+        self.apply_open(outcome);
     }
 
     /// Short label for trial `i`: the requested (or unmanaged) basis + format.
@@ -429,21 +539,29 @@ impl PresenterApp {
             Some(m) => format!("{} · {}×{}", out.name, m.width, m.height),
             None => out.name.clone(),
         };
-        let mut items = vec![brand("color validation presenter"), spacer()];
-        if let Some(path) = &self.saved_path {
-            items.push(fact("saved", path.clone()));
-        }
-        items.push(fact(
-            "device",
-            format!(
-                "{} · SN {} · cal {}",
-                dev.product, dev.serial, dev.cal_index
+        // The wordmark subtitle names the file in focus (bounded, leftmost).
+        let subtitle = self
+            .source_path
+            .as_deref()
+            .map(file_name)
+            .unwrap_or("color validation presenter");
+        row([
+            brand(subtitle),
+            spacer(),
+            fact(
+                "device",
+                format!(
+                    "{} · SN {} · cal {}",
+                    dev.product, dev.serial, dev.cal_index
+                ),
             ),
-        ));
-        items.push(fact("output", out_label));
-        items.push(fact("captured", p.capture.timestamp.clone()));
-        items.push(button("New capture").key("new-capture").secondary());
-        row(items).gap(tokens::SPACE_6).align(Align::Center)
+            fact("output", out_label),
+            fact("captured", p.capture.timestamp.clone()),
+            button("Open…").key("open").secondary(),
+            button("New capture").key("new-capture").secondary(),
+        ])
+        .gap(tokens::SPACE_4)
+        .align(Align::Center)
     }
 
     fn sidebar(&self, p: &Presented, cx: &BuildCx) -> El {
@@ -564,30 +682,42 @@ impl PresenterApp {
     }
 
     fn present_view(&self, p: &Presented, cx: &BuildCx) -> El {
-        column([
-            self.present_header(p),
-            divider(),
+        let mut items = vec![self.present_header(p), divider()];
+        if let Some(e) = &self.open_error {
+            items.push(open_error_banner(e));
+        }
+        items.push(
             row([self.sidebar(p, cx), self.content_panel(p, cx, 0.0)])
                 .gap(tokens::SPACE_6)
                 .align(Align::Stretch)
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0)),
-        ])
-        .gap(tokens::SPACE_4)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
+        );
+        column(items)
+            .gap(tokens::SPACE_4)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
     }
 
     fn setup_view(&self) -> El {
-        column([
-            row([brand("new capture"), spacer()]).align(Align::Center),
+        let mut items = vec![
+            row([
+                brand("new capture"),
+                spacer(),
+                button("Open…").key("open").secondary(),
+            ])
+            .align(Align::Center),
             divider(),
-            // Scroll so the form fits any window / output count.
-            scroll([self.form.view().width(Size::Fixed(720.0))]).key("setup-scroll"),
-        ])
-        .gap(tokens::SPACE_4)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
+        ];
+        if let Some(e) = &self.open_error {
+            items.push(open_error_banner(e));
+        }
+        // Scroll so the form fits any window / output count.
+        items.push(scroll([self.form.view().width(Size::Fixed(720.0))]).key("setup-scroll"));
+        column(items)
+            .gap(tokens::SPACE_4)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
     }
 
     fn running_view(&self, r: &Running, cx: &BuildCx) -> El {
@@ -759,30 +889,9 @@ fn capture_filename(timestamp: &str) -> String {
 
 impl App for PresenterApp {
     fn before_build(&mut self) {
-        // Drain the capture thread's progress before laying out the frame.
-        if self.running.is_none() {
-            return;
-        }
-        let mut finished = None;
-        if let Some(r) = &mut self.running {
-            loop {
-                match r.rx.try_recv() {
-                    Ok(CaptureMsg::Progress(ev)) => r.apply(ev),
-                    Ok(CaptureMsg::Finished(res)) => {
-                        finished = Some(res);
-                        break;
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        finished = Some(Err("capture thread ended unexpectedly".to_string()));
-                        break;
-                    }
-                }
-            }
-        }
-        if let Some(res) = finished {
-            self.finish(res);
-        }
+        // Drain background work before laying out the frame.
+        self.drain_capture();
+        self.drain_open();
     }
 
     fn build(&self, cx: &BuildCx) -> El {
@@ -807,6 +916,12 @@ impl App for PresenterApp {
     }
 
     fn on_event(&mut self, e: UiEvent) {
+        // "Open…" works from both the setup screen and the presenter.
+        if matches!(e.kind, UiEventKind::Click | UiEventKind::Activate) && e.route() == Some("open")
+        {
+            self.open_dialog();
+            return;
+        }
         match self.mode {
             Mode::Setup => {
                 if matches!(e.kind, UiEventKind::Click | UiEventKind::Activate)
@@ -838,9 +953,34 @@ impl App for PresenterApp {
 
 // ── view helpers ────────────────────────────────────────────────────────────
 
-/// The product wordmark + a muted subtitle, shared by every mode's header.
+/// The product wordmark + a muted subtitle, shared by every mode's header. The
+/// subtitle is bounded + ellipsized so a long filename can't widen the header.
 fn brand(subtitle: &str) -> El {
-    column([h2("tristim"), text(subtitle).muted().font_size(12.0)]).gap(2.0)
+    column([
+        h2("tristim"),
+        text(subtitle)
+            .muted()
+            .font_size(12.0)
+            .nowrap_text()
+            .ellipsis()
+            .width(Size::Fixed(220.0)),
+    ])
+    .gap(2.0)
+}
+
+/// The final path component of `path` (for the header subtitle).
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// A full-width wrapping banner for a failed open (wraps, so a long serde
+/// message can't overflow the row).
+fn open_error_banner(msg: &str) -> El {
+    text(format!("couldn't open capture — {msg}"))
+        .text_color(tokens::DESTRUCTIVE)
+        .font_size(12.0)
+        .wrap_text()
+        .width(Size::Fill(1.0))
 }
 
 fn section_label(s: &str) -> El {

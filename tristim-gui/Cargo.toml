@@ -29,3 +29,8 @@ tristim-color = { path = "../tristim-color" }
 # capture loop (also driven by the CLI). Both are aetna-free workspace members.
 tristim-display = { path = "../tristim-display" }
 tristim-gather = { path = "../tristim-gather" }
+
+# Native open-file dialog (for loading additional captures). The xdg-portal
+# backend runs out-of-process over D-Bus — Wayland-native and safe to call off
+# the main thread — so we avoid linking GTK into the binary.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }

@@ -32,7 +32,11 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some(path) => match tristim_capture::Capture::load(&path) {
-            Ok(capture) => PresenterApp::new(capture),
+            Ok(capture) => {
+                let mut app = PresenterApp::new(capture);
+                app.set_source_path(path);
+                app
+            }
             Err(e) => {
                 eprintln!("tristim-gui: failed to load {path}: {e}");
                 return ExitCode::FAILURE;
