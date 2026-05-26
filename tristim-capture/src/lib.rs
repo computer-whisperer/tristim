@@ -25,7 +25,11 @@ use thiserror::Error;
 
 /// Current schema version. Bump on any breaking change to the types below;
 /// readers should reject captures whose `schema_version` they don't understand.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 added the optional [`Capture::compositor`] section. It is
+/// `#[serde(default)]`, so v1 captures still load (with an empty
+/// `CompositorInfo`) and `load` does no version gate.
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -50,6 +54,10 @@ pub struct Capture {
     pub output: OutputInfo,
     /// What the compositor advertised it can do (color-management-wise).
     pub capabilities: Capabilities,
+    /// What we could learn about the compositor that served the session
+    /// (best-effort; added in schema v2). Empty for v1 captures.
+    #[serde(default)]
+    pub compositor: CompositorInfo,
     /// One entry per color format / description we put under test.
     pub trials: Vec<FormatTrial>,
 }
@@ -109,6 +117,40 @@ pub struct Capabilities {
     pub supported_primaries: Vec<String>,
     pub supported_features: Vec<String>,
     pub supported_render_intents: Vec<String>,
+}
+
+/// What we could learn about the Wayland compositor that served the session.
+///
+/// Every field is best-effort. There is **no** Wayland protocol that names the
+/// compositor, so these come from three independent signals: the socket peer
+/// process, the session environment, and the advertised global interfaces.
+/// Together they pin down "which compositor, which protocols, which versions"
+/// a capture was taken against.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CompositorInfo {
+    /// Compositor binary name from the Wayland socket's peer credentials
+    /// (`SO_PEERCRED` → `/proc/<pid>/comm`), e.g. `"niri"`, `"kwin_wayland"`.
+    /// The most authoritative signal. `None` when the peer isn't a local
+    /// process (e.g. behind a proxy like waypipe) or the lookup failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+    /// `XDG_CURRENT_DESKTOP` session hint (e.g. `"niri"`, `"GNOME"`). Set by
+    /// the session rather than the compositor, so it can be absent, generic,
+    /// or stale — a friendly cross-check, not a source of truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<String>,
+    /// Wayland globals the compositor advertised (`interface` + `version`).
+    /// The protocol-level fingerprint — what the compositor actually
+    /// implements, independent of branding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub globals: Vec<GlobalInfo>,
+}
+
+/// One advertised Wayland global: its interface name and version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GlobalInfo {
+    pub interface: String,
+    pub version: u32,
 }
 
 /// One color format put under test: the description we asked for, whether the
@@ -271,6 +313,20 @@ mod tests {
                 supported_features: vec!["parametric".into()],
                 supported_render_intents: vec!["perceptual".into()],
             },
+            compositor: CompositorInfo {
+                process: Some("niri".to_string()),
+                desktop: Some("niri".to_string()),
+                globals: vec![
+                    GlobalInfo {
+                        interface: "wl_compositor".to_string(),
+                        version: 6,
+                    },
+                    GlobalInfo {
+                        interface: "wp_color_manager_v1".to_string(),
+                        version: 1,
+                    },
+                ],
+            },
             trials: vec![FormatTrial {
                 requested: Some(ColorDescription {
                     transfer_function: "st2084_pq".to_string(),
@@ -347,5 +403,27 @@ mod tests {
         assert!(!json.contains("\"mode\""));
         assert!(!json.contains("reference_white_nits"));
         assert!(!json.contains("\"mastering\""));
+    }
+
+    /// A v1 capture (no `compositor` section) still loads — the field is
+    /// `#[serde(default)]`, so the missing section becomes an empty
+    /// `CompositorInfo` rather than a parse error.
+    #[test]
+    fn v1_capture_without_compositor_loads() {
+        let mut capture = sample_capture();
+        capture.compositor = CompositorInfo::default();
+        let json = capture.to_json_pretty().expect("serialize");
+        // An empty CompositorInfo serializes to `{}` (all fields skipped).
+        let back = Capture::from_json(&json).expect("deserialize");
+        assert_eq!(back.compositor, CompositorInfo::default());
+
+        // And a literal v1 document with the section entirely absent.
+        let stripped: serde_json::Value = {
+            let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            v.as_object_mut().unwrap().remove("compositor");
+            v
+        };
+        let back = Capture::from_json(&stripped.to_string()).expect("deserialize v1");
+        assert_eq!(back.compositor, CompositorInfo::default());
     }
 }

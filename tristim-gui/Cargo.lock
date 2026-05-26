@@ -3412,6 +3412,7 @@ name = "tristim-display"
 version = "0.1.0"
 dependencies = [
  "half",
+ "libc",
  "smithay-client-toolkit",
  "thiserror 1.0.69",
  "wayland-client",

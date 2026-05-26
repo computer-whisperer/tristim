@@ -143,6 +143,12 @@ pub struct PatchSurface {
     conn: Connection,
     state: AppState,
     event_queue: wayland_client::EventQueue<AppState>,
+    /// Every Wayland global the compositor advertised, as `(interface,
+    /// version)` — the protocol-level compositor fingerprint, captured at
+    /// connect. Recorded into the capture's `CompositorInfo`.
+    advertised_globals: Vec<(String, u32)>,
+    /// Compositor binary name from the socket peer credentials, if obtainable.
+    compositor_process: Option<String>,
 }
 
 /// Buffer pixel format for the patch surface.
@@ -198,6 +204,17 @@ impl PatchSurface {
         let conn = Connection::connect_to_env()?;
         let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)?;
         let qh = event_queue.handle();
+
+        // Compositor identity, captured up front: the full advertised-globals
+        // list (interface@version — the protocol fingerprint) and the peer
+        // process behind the Wayland socket. Both are best-effort facts for
+        // the capture; see `tristim_capture::CompositorInfo`.
+        let advertised_globals = globals.contents().with_list(|list| {
+            list.iter()
+                .map(|g| (g.interface.clone(), g.version))
+                .collect::<Vec<_>>()
+        });
+        let compositor_process = compositor_process_name(&conn);
 
         let registry_state = RegistryState::new(&globals);
         let output_state = OutputState::new(&globals, &qh);
@@ -324,7 +341,22 @@ impl PatchSurface {
             conn,
             state,
             event_queue,
+            advertised_globals,
+            compositor_process,
         })
+    }
+
+    /// Every Wayland global the compositor advertised, as `(interface,
+    /// version)`. The protocol-level compositor fingerprint.
+    pub fn advertised_globals(&self) -> &[(String, u32)] {
+        &self.advertised_globals
+    }
+
+    /// Compositor binary name from the Wayland socket's peer credentials
+    /// (`SO_PEERCRED` → `/proc/<pid>/comm`), e.g. `"niri"`. `None` when the
+    /// peer isn't a local process or the lookup failed.
+    pub fn compositor_process(&self) -> Option<&str> {
+        self.compositor_process.as_deref()
     }
 
     /// What the compositor advertised through `wp_color_manager_v1`'s
@@ -489,6 +521,45 @@ pub struct OutputDescription {
     pub make: String,
     pub model: String,
     pub size: Option<(i32, i32)>,
+}
+
+/// The compositor's binary name, via the Wayland socket's peer credentials.
+///
+/// `SO_PEERCRED` on the connection fd gives the server-side PID; its
+/// `/proc/<pid>/comm` is the compositor binary (e.g. `niri`, `kwin_wayland`,
+/// `gnome-shell`). `None` when the peer isn't a local process — a non-`AF_UNIX`
+/// transport, a proxy like waypipe, or any failure. Linux-only, as is the rest
+/// of this Wayland crate.
+fn compositor_process_name(conn: &Connection) -> Option<String> {
+    use std::os::fd::AsRawFd;
+
+    let backend = conn.backend();
+    let fd = backend.poll_fd().as_raw_fd();
+
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `fd` is the live Wayland socket for the duration of this call
+    // (`backend` is held above); `cred`/`len` are correctly sized and only
+    // read back on success.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || cred.pid <= 0 {
+        return None;
+    }
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", cred.pid)).ok()?;
+    let name = comm.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn pick_output(output_state: &OutputState, name: &str) -> Result<wl_output::WlOutput, Error> {

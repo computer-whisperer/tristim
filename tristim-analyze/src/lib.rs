@@ -365,6 +365,7 @@ mod tests {
                 mode: None,
             },
             capabilities: Default::default(),
+            compositor: Default::default(),
             trials: vec![trial],
         }
     }

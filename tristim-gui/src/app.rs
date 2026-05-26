@@ -252,6 +252,7 @@ fn live_capture(trials: Vec<cap::FormatTrial>) -> Capture {
             mode: None,
         },
         capabilities: cap::Capabilities::default(),
+        compositor: cap::CompositorInfo::default(),
         trials,
     }
 }
@@ -587,7 +588,7 @@ impl PresenterApp {
             .as_deref()
             .map(file_name)
             .unwrap_or("color validation presenter");
-        row([
+        let mut items = vec![
             brand(subtitle),
             spacer(),
             fact(
@@ -598,12 +599,15 @@ impl PresenterApp {
                 ),
             ),
             fact("output", out_label),
-            fact("captured", p.capture.timestamp.clone()),
-            button("Open…").key("open").secondary(),
-            button("New capture").key("new-capture").secondary(),
-        ])
-        .gap(tokens::SPACE_4)
-        .align(Align::Center)
+        ];
+        // The compositor that served the capture (v2+; absent for older files).
+        if let Some(comp) = compositor_label(&p.capture.compositor) {
+            items.push(fact("compositor", comp));
+        }
+        items.push(fact("captured", p.capture.timestamp.clone()));
+        items.push(button("Open…").key("open").secondary());
+        items.push(button("New capture").key("new-capture").secondary());
+        row(items).gap(tokens::SPACE_4).align(Align::Center)
     }
 
     fn sidebar(&self, p: &Presented, cx: &BuildCx) -> El {
@@ -1087,6 +1091,18 @@ fn brand(subtitle: &str) -> El {
 /// The final path component of `path` (for the header subtitle).
 fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// Human label for the capture's compositor: the socket-peer process if known,
+/// else the desktop hint, with the other in parens when it adds information.
+/// `None` when nothing was recorded (e.g. a pre-v2 capture).
+fn compositor_label(c: &cap::CompositorInfo) -> Option<String> {
+    match (c.process.as_deref(), c.desktop.as_deref()) {
+        (Some(p), Some(d)) if !p.eq_ignore_ascii_case(d) => Some(format!("{p} ({d})")),
+        (Some(p), _) => Some(p.to_string()),
+        (None, Some(d)) => Some(d.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// A full-width wrapping banner for a failed open (wraps, so a long serde

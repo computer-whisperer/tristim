@@ -21,3 +21,6 @@ wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 thiserror.workspace = true
 # fp16 encoding for HDR patches (f32 → IEEE 754 binary16).
 half = "2"
+# SO_PEERCRED on the Wayland socket fd → the compositor's PID (and thence
+# /proc/<pid>/comm) for the capture's compositor identity.
+libc = "0.2"

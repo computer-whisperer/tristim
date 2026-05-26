@@ -130,10 +130,27 @@ pub fn run_capture(
 
     // Probe surface: collect capabilities, then run the one-time puck-placement
     // countdown with a black patch on screen.
-    let capabilities = {
+    let (capabilities, compositor) = {
         let mut probe = PatchSurface::open_sdr(&config.output)?;
         probe.set_code_values([0.0, 0.0, 0.0])?;
         let caps = to_cap_capabilities(probe.color_capabilities());
+        // Compositor identity: the socket peer process + the advertised globals
+        // (both from the probe's Wayland connection) plus the session's
+        // XDG_CURRENT_DESKTOP hint. All best-effort facts (see CompositorInfo).
+        let compositor = cap::CompositorInfo {
+            process: probe.compositor_process().map(str::to_string),
+            desktop: std::env::var("XDG_CURRENT_DESKTOP")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            globals: probe
+                .advertised_globals()
+                .iter()
+                .map(|(interface, version)| cap::GlobalInfo {
+                    interface: interface.clone(),
+                    version: *version,
+                })
+                .collect(),
+        };
         for remaining in (1..=config.prep.as_secs()).rev() {
             on_event(GatherEvent::Countdown { remaining });
             if should_cancel() {
@@ -141,7 +158,7 @@ pub fn run_capture(
             }
             sleep(Duration::from_secs(1));
         }
-        caps
+        (caps, compositor)
     };
 
     let settle_ms = config.settle.as_millis() as u64;
@@ -256,6 +273,7 @@ pub fn run_capture(
                 }),
         },
         capabilities,
+        compositor,
         trials,
     })
 }
