@@ -26,9 +26,9 @@
 use aetna_core::prelude::*;
 use aetna_core::scene::glam::Vec3;
 use aetna_core::scene::{
-    GridPlanes, GridSettings, LabelPlacement, LineData, LineSegment, LineStyle, LinesHandle,
-    PointData, PointLabels, PointShape, PointStyle, PointsHandle, ScenePoint, SceneSpec,
-    SceneStyle, SizeMode,
+    AxisKind, GridPlanes, GridSettings, LabelPlacement, LineData, LineSegment, LineStyle,
+    LinesHandle, PointData, PointLabels, PointShape, PointStyle, PointsHandle, ScenePoint,
+    SceneSpec, SceneStyle, SizeMode,
 };
 
 use tristim_analyze::{AnalyzedSample, AnalyzedTrial, GroundTruth};
@@ -231,14 +231,13 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
             scene.point_labels.clone(),
         )
         .lines(scene.gamut.clone())
-        .add_lines(aetna_core::scene::LineDraw {
-            geometry: scene.vectors.clone(),
-            transform: aetna_core::scene::glam::Mat4::IDENTITY,
-            style: LineStyle {
+        .lines_styled(
+            scene.vectors.clone(),
+            LineStyle {
                 width: 2.0,
                 ..Default::default()
             },
-        })
+        )
         // A small square marker + persistent name at each cage's green primary,
         // so every outlined gamut is labelled where it's most distinctive.
         .points_labeled(
@@ -252,13 +251,15 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
         )
         .style(style)
         // X = a* (green→red), Y = L* (dark→light, up), Z = b* (blue→yellow).
-        .axis_titles("a*", "L*", "b*");
+        .axis_titles("a*", "L*", "b*")
+        // Lightness is one-sided: clip the L* axis to [0, 100] so it doesn't
+        // dive into meaningless negative space below the a*/b* floor. a*/b*
+        // stay bipolar (the symmetric default).
+        .axis_bounds(AxisKind::Y, 0.0, 100.0);
 
-    // No `.key(...)`: a keyed node is an interactive hit-test target, which
-    // makes the press land *on* the scene and skips aetna's camera-drag capture
-    // (orbit/pan never begins — only wheel-zoom, which routes separately). The
-    // scene sits at a stable spot in the tree, so its structural node id keys
-    // the camera state across frames and trial switches without an explicit key.
+    // No `.key(...)`: the scene sits at a stable spot in the tree, so its
+    // structural node id keys the camera state (and the hover pick) across
+    // frames and trial switches — an explicit key buys nothing here.
     chart3d(spec).width(Size::Fixed(px)).height(Size::Fixed(px))
 }
 

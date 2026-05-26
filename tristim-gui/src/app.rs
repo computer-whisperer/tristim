@@ -713,7 +713,17 @@ impl PresenterApp {
                         .width(Size::Fixed(plot_px))
                         .height(Size::Fixed(plot_px)),
                 };
-                (chart, space_legend())
+                // Hover a scene point → swap the legend for the per-sample
+                // inspector, mirroring the chromaticity view. The pick comes
+                // straight from aetna (a frame late); mark 0 is the sample
+                // cloud (mark 1 is the gamut labels), and for a scored trial
+                // the point index is the sample index (1:1, no filtering).
+                let hovered = hovered_scene_sample(cx, t);
+                let detail = match hovered {
+                    Some(_) => sample_inspector(t, hovered),
+                    None => space_legend(),
+                };
+                (chart, detail)
             }
         };
 
@@ -926,6 +936,16 @@ const PLOT_CARD_PAD: f32 = tokens::SPACE_4;
 /// a hand-drawn frame. Hugs the square plot rather than filling the row width.
 fn plot_card(plot: El) -> El {
     card([plot]).width(Size::Hug).padding(PLOT_CARD_PAD)
+}
+
+/// The trial-sample index hovered in the 3D scene, from aetna's hover pick
+/// (`cx.hovered_scene_point()`, a frame late). `None` unless the cursor is over
+/// a point in the sample cloud — mark 0; mark 1 is the gamut name labels, which
+/// we ignore. For a scored trial every sample is plotted in order, so the
+/// pick's point index *is* the `t.samples` index.
+fn hovered_scene_sample(cx: &BuildCx, t: &AnalyzedTrial) -> Option<usize> {
+    let pick = cx.hovered_scene_point()?;
+    (pick.mark == 0 && pick.point < t.samples.len()).then_some(pick.point)
 }
 
 /// Responsive square side (px) for the plot, derived from the window viewport.
