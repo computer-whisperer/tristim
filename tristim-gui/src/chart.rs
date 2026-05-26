@@ -80,7 +80,8 @@ pub fn chromaticity_chart(
 }
 
 /// Side (px) of the invisible per-sample hover targets layered over the plot.
-const HIT: f32 = 18.0;
+/// Shared with the luminance view so both 2D charts hover identically.
+pub(crate) const HIT: f32 = 18.0;
 
 /// One keyed, invisible hit target per measured sample, positioned (via
 /// `translate`, which moves the hit rect too) at the sample's screen point in
@@ -174,7 +175,8 @@ const LOCUS: Color = Color::srgb_u8(150, 150, 160);
 const TRIANGLE: Color = Color::srgb_u8(150, 190, 255);
 const WHITE: Color = Color::srgb_u8(245, 245, 245);
 const UNSCORED: Color = Color::srgb_u8(140, 140, 150);
-const HIGHLIGHT: Color = Color::srgb_u8(255, 255, 255);
+/// Ring drawn around the hovered sample. Shared with the luminance view.
+pub(crate) const HIGHLIGHT: Color = Color::srgb_u8(255, 255, 255);
 
 fn locus_path(proj: &Projector, space: Space) -> VectorPath {
     let pts = locus_in(space);

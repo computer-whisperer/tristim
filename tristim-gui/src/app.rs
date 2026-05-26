@@ -30,10 +30,10 @@ use crate::space3d::{N_REF_GAMUTS, REF_GAMUTS, RefSet, Space3dScene, space_chart
 /// Which plot the content panel shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
+    /// The 3D CIELAB sample space (see [`crate::space3d`]) — first and default.
+    Space3D,
     Chromaticity,
     Luminance,
-    /// The 3D CIELAB sample space (see [`crate::space3d`]).
-    Space3D,
 }
 
 /// Top-level app mode.
@@ -296,7 +296,7 @@ impl PresenterApp {
             source_path: None,
             open_rx: None,
             open_error: None,
-            view: Tab::Chromaticity,
+            view: Tab::Space3D,
             space: Space::UvPrime,
             show_field: false,
             hovered_sample: None,
@@ -316,7 +316,7 @@ impl PresenterApp {
             source_path: None,
             open_rx: None,
             open_error: None,
-            view: Tab::Chromaticity,
+            view: Tab::Space3D,
             space: Space::UvPrime,
             show_field: false,
             hovered_sample: None,
@@ -358,6 +358,11 @@ impl PresenterApp {
             source_path: None,
             open_rx: None,
             open_error: None,
+            // Unlike the live entry points (which default to Space3D), the
+            // dump-only running harness starts on a 2D view: the headless lint
+            // never calls `before_build`, so the 3D scene would render as the
+            // "Preparing…" placeholder. A 2D chart keeps the running-layout
+            // lint meaningful.
             view: Tab::Chromaticity,
             space: Space::UvPrime,
             show_field: false,
@@ -683,31 +688,24 @@ impl PresenterApp {
             view_selector(self.view),
         ];
 
-        // The main plot + its detail card, per view.
-        let (plot, detail) = match self.view {
-            Tab::Chromaticity => {
-                // Color fill is bounded to the presenter's negotiated gamut.
-                let gamut = presenter_gamut(cx);
-                heading.push(space_toggle(self.space));
-                if gamut.is_some() {
-                    heading.push(field_toggle(self.show_field));
-                }
-                let field = if self.show_field { gamut } else { None };
-                let detail = match self.hovered_sample {
-                    Some(_) => sample_inspector(t, self.hovered_sample),
-                    None => chart_legend(self.space),
-                };
-                (
-                    chromaticity_chart(t, self.space, field, plot_px, self.hovered_sample),
-                    detail,
-                )
-            }
-            Tab::Luminance => (luminance_chart(t, plot_px), luminance_legend(t)),
+        // Which sample (if any) is hovered, by the active view's mechanism: the
+        // 2D charts set `hovered_sample` from pointer events over per-sample hit
+        // targets; the 3D scene reports its pick through `cx` (mark 0 = the
+        // sample cloud; for a scored trial the point index is the sample index).
+        // Either way, a hovered sample swaps the legend for the shared
+        // per-sample inspector — common to all three views.
+        let hovered = match self.view {
+            Tab::Space3D => hovered_scene_sample(cx, t),
+            _ => self.hovered_sample,
+        };
+
+        // The main plot + its tab-specific legend (shown when nothing is hovered).
+        let (plot, legend) = match self.view {
             Tab::Space3D => {
                 // Reference-gamut overlay toggles (the trial's own gamut is
                 // always drawn as the target).
-                for (i, g) in REF_GAMUTS.iter().enumerate() {
-                    heading.push(ref_toggle(g.name, g.key, self.space3d_refs[i]));
+                for (gi, g) in REF_GAMUTS.iter().enumerate() {
+                    heading.push(ref_toggle(g.name, g.key, self.space3d_refs[gi]));
                 }
                 // The geometry handles are cached on `Presented` and refreshed
                 // in `before_build`; `None` only during a transient first frame.
@@ -717,18 +715,27 @@ impl PresenterApp {
                         .width(Size::Fixed(plot_px))
                         .height(Size::Fixed(plot_px)),
                 };
-                // Hover a scene point → swap the legend for the per-sample
-                // inspector, mirroring the chromaticity view. The pick comes
-                // straight from aetna (a frame late); mark 0 is the sample
-                // cloud (mark 1 is the gamut labels), and for a scored trial
-                // the point index is the sample index (1:1, no filtering).
-                let hovered = hovered_scene_sample(cx, t);
-                let detail = match hovered {
-                    Some(_) => sample_inspector(t, hovered),
-                    None => space_legend(),
-                };
-                (chart, detail)
+                (chart, space_legend())
             }
+            Tab::Chromaticity => {
+                // Color fill is bounded to the presenter's negotiated gamut.
+                let gamut = presenter_gamut(cx);
+                heading.push(space_toggle(self.space));
+                if gamut.is_some() {
+                    heading.push(field_toggle(self.show_field));
+                }
+                let field = if self.show_field { gamut } else { None };
+                (
+                    chromaticity_chart(t, self.space, field, plot_px, hovered),
+                    chart_legend(self.space),
+                )
+            }
+            Tab::Luminance => (luminance_chart(t, plot_px, hovered), luminance_legend(t)),
+        };
+
+        let detail = match hovered {
+            Some(i) => sample_inspector(t, Some(i)),
+            None => legend,
         };
 
         column([
@@ -879,14 +886,19 @@ impl PresenterApp {
             UiEventKind::Click | UiEventKind::Activate => match e.route() {
                 Some("field-toggle") => self.show_field = !self.show_field,
                 Some("space-toggle") => self.space = self.space.toggled(),
-                Some("view:chroma") => self.view = Tab::Chromaticity,
-                Some("view:lum") => {
-                    self.view = Tab::Luminance;
-                    self.hovered_sample = None; // hover is chromaticity-only
-                }
+                // Clear the hovered sample on any view switch — hit geometry is
+                // per-view, so a stale highlight shouldn't carry across tabs.
                 Some("view:space3d") => {
                     self.view = Tab::Space3D;
-                    self.hovered_sample = None; // 2D hover is N/A in the 3D view
+                    self.hovered_sample = None;
+                }
+                Some("view:chroma") => {
+                    self.view = Tab::Chromaticity;
+                    self.hovered_sample = None;
+                }
+                Some("view:lum") => {
+                    self.view = Tab::Luminance;
+                    self.hovered_sample = None;
                 }
                 Some(k) if k.starts_with("ref:") => {
                     if let Some(i) = REF_GAMUTS
@@ -1148,9 +1160,9 @@ fn view_selector(view: Tab) -> El {
         if active { b.primary() } else { b.secondary() }
     };
     row([
+        tab("3D Space", "view:space3d", view == Tab::Space3D),
         tab("Chromaticity", "view:chroma", view == Tab::Chromaticity),
         tab("Luminance", "view:lum", view == Tab::Luminance),
-        tab("3D Space", "view:space3d", view == Tab::Space3D),
     ])
     .gap(tokens::SPACE_2)
 }

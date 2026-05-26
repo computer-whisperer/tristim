@@ -11,7 +11,7 @@
 use aetna_core::prelude::*;
 use tristim_analyze::{AnalyzedTrial, GroundTruth};
 
-use crate::chart::{circle, heat};
+use crate::chart::{HIGHLIGHT, HIT, circle, heat};
 
 /// Design view_box; the renderer scales it to the responsive `plot_px` square.
 const SIZE: f32 = 440.0;
@@ -26,12 +26,17 @@ const IDEAL: Color = Color::srgb_u8(150, 190, 255);
 const UNSCORED: Color = Color::srgb_u8(140, 140, 150);
 
 /// Build the luminance chart El for `t`, rendered as a `plot_px`-square.
-pub fn luminance_chart(t: &AnalyzedTrial, plot_px: f32) -> El {
-    // (expected, measured, ΔE) for every sample that was scored for luminance.
-    let pts: Vec<(f64, f64, Option<f64>)> = t
+///
+/// `hover` is the `t.samples` index to highlight; invisible per-sample hit
+/// targets (keyed `sample:{i}`) are layered on top so hovering a dot drives the
+/// shared inspector, exactly as the chromaticity view does.
+pub fn luminance_chart(t: &AnalyzedTrial, plot_px: f32, hover: Option<usize>) -> El {
+    // (sample index, expected, measured, ΔE) for every luminance-scored sample.
+    let pts: Vec<(usize, f64, f64, Option<f64>)> = t
         .samples
         .iter()
-        .filter_map(|s| s.luminance.map(|l| (l.expected, l.measured, s.delta_e)))
+        .enumerate()
+        .filter_map(|(i, s)| s.luminance.map(|l| (i, l.expected, l.measured, s.delta_e)))
         .collect();
 
     if pts.is_empty() {
@@ -43,7 +48,7 @@ pub fn luminance_chart(t: &AnalyzedTrial, plot_px: f32) -> El {
     // Equal axes (ideal is y = x), scaled to the data with a little headroom.
     let max = pts
         .iter()
-        .map(|&(e, m, _)| e.max(m))
+        .map(|&(_, e, m, _)| e.max(m))
         .fold(0.0_f64, f64::max)
         .max(1e-6)
         * 1.05;
@@ -59,12 +64,39 @@ pub fn luminance_chart(t: &AnalyzedTrial, plot_px: f32) -> El {
     paths.push(line(px(0.0), py(0.0), px(max), py(max), IDEAL, 1.5));
 
     // One dot per sample at (expected, measured), colored by ΔE.
-    for (e, m, de) in pts {
+    for &(_, e, m, de) in &pts {
         let color = de.map_or(UNSCORED, heat);
         paths.push(circle([px(e), py(m)], 4.0).fill_solid(color).build());
     }
 
-    vector(VectorAsset::from_paths([0.0, 0.0, SIZE, SIZE], paths))
+    // Ring around the hovered sample.
+    if let Some(&(_, e, m, _)) = hover.and_then(|h| pts.iter().find(|p| p.0 == h)) {
+        paths.push(
+            circle([px(e), py(m)], 7.0)
+                .stroke_solid(HIGHLIGHT, 2.0)
+                .build(),
+        );
+    }
+
+    let chart = vector(VectorAsset::from_paths([0.0, 0.0, SIZE, SIZE], paths))
+        .width(Size::Fixed(plot_px))
+        .height(Size::Fixed(plot_px));
+
+    // Invisible per-sample hit targets in plot_px space (the SIZE view_box
+    // scales uniformly to plot_px), keyed `sample:{i}` so the existing pointer
+    // routing drives `hovered_sample`.
+    let scale = plot_px / SIZE;
+    let mut layers = vec![chart];
+    for &(i, e, m, _) in &pts {
+        layers.push(
+            El::default()
+                .key(format!("sample:{i}"))
+                .width(Size::Fixed(HIT))
+                .height(Size::Fixed(HIT))
+                .translate(px(e) * scale - HIT / 2.0, py(m) * scale - HIT / 2.0),
+        );
+    }
+    stack(layers)
         .width(Size::Fixed(plot_px))
         .height(Size::Fixed(plot_px))
 }
