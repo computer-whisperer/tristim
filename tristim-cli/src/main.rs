@@ -23,8 +23,9 @@ use std::time::Duration;
 
 use tristim_analyze::{GroundTruth, GroundTruthSource, analyze};
 use tristim_capture as cap;
-use tristim_display::list_outputs;
+use tristim_display::{PatchSurface, list_outputs};
 use tristim_driver::Colorimeter;
+use tristim_driver::measurement::{Calibration, RawMeasurement, Setup, raw_to_xyz};
 use tristim_gather as gather;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -35,6 +36,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "list-outputs" | "outputs" | "ls" => cmd_list_outputs(),
         "info" => cmd_info(),
         "measure" => cmd_measure(&argv[2..]),
+        "characterize" | "char" => cmd_characterize(&argv[2..]),
         "capture" => cmd_capture(&argv[2..]),
         "report" => cmd_report(&argv[2..]),
         "help" | "-h" | "--help" => {
@@ -55,6 +57,18 @@ fn print_usage() {
     eprintln!("  list-outputs              enumerate Wayland outputs");
     eprintln!("  info                      open the colorimeter, print HW info");
     eprintln!("  measure [--cal N]         take one XYZ measurement (aim puck manually)");
+    eprintln!("  characterize --output NAME [opts]");
+    eprintln!("        Sweep grey levels and repeat-measure each to characterize sensor");
+    eprintln!("        noise and the black-cal floor (how trustworthy low-light readings");
+    eprintln!("        are). Options:");
+    eprintln!("          --cal N            calibration index (default: 0)");
+    eprintln!("          --repeats N        measurements per level (default: 16)");
+    eprintln!("          --levels a,b,c     grey code values to sweep (default: low-light ramp)");
+    eprintln!("          --settle-ms N      ms to wait after each level (default: 400)");
+    eprintln!("          --prep-secs N      seconds to wait for puck placement (default: 6)");
+    eprintln!("          --burst            reset once then read back-to-back (isolates read");
+    eprintln!("                             noise); default auto-zeros before every reading");
+    eprintln!("          --raw              also print per-channel raw mean/sd/headroom");
     eprintln!("  capture --output NAME [opts]");
     eprintln!("        Run a capture session and write a tristim-capture JSON file.");
     eprintln!("        Options:");
@@ -152,6 +166,216 @@ fn cmd_measure(args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("xy   : ({x:.4}, {y:.4})");
     }
     Ok(())
+}
+
+// ── characterize ──────────────────────────────────────────────────────────
+
+/// Default grey-level sweep, weighted toward the low end where the black-cal
+/// floor bites. Powers of two over 8-bit code values (1/255 … 128/255) plus
+/// the endpoints — each maps cleanly onto the 8-bit SDR patch surface.
+const DEFAULT_LEVELS: &[f64] = &[
+    0.0,
+    1.0 / 255.0,
+    2.0 / 255.0,
+    4.0 / 255.0,
+    8.0 / 255.0,
+    16.0 / 255.0,
+    32.0 / 255.0,
+    64.0 / 255.0,
+    128.0 / 255.0,
+    1.0,
+];
+
+fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let output = arg_value(args, "--output")
+        .ok_or("--output NAME is required (try `tristim list-outputs`)")?;
+    let cal_index: u8 = parse_opt(args, "--cal", 0);
+    let repeats: usize = parse_opt(args, "--repeats", 16);
+    let settle_ms: u64 = parse_opt(args, "--settle-ms", 400);
+    let prep_secs: u64 = parse_opt(args, "--prep-secs", 6);
+    let burst = args.iter().any(|a| a == "--burst");
+    let verbose = args.iter().any(|a| a == "--raw" || a == "--verbose");
+    let levels: Vec<f64> = match arg_value(args, "--levels") {
+        Some(s) => s
+            .split(',')
+            .map(|p| p.trim().parse::<f64>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| format!("bad --levels list {s:?} (expected comma-separated numbers)"))?,
+        None => DEFAULT_LEVELS.to_vec(),
+    };
+
+    let mut device = Colorimeter::open_any()?;
+    let info = device.get_info()?;
+    let cal = device.get_calibration(cal_index)?;
+    let setup = device.get_setup(&cal)?;
+    let product = if device.is_spyder_2024() {
+        "Spyder 2024"
+    } else {
+        "SpyderX2"
+    };
+
+    eprintln!(
+        "{product} SN {} — characterize cal {cal_index}, {repeats} repeats/level, auto-zero {}",
+        info.serial,
+        if burst { "off (burst)" } else { "on" },
+    );
+    eprintln!(
+        "  black-cal s5 = {:?}   integration s2 = 0x{:04x}",
+        setup.s5, setup.s2,
+    );
+    eprintln!("Place the puck flat against '{output}'. Starting in {prep_secs}s.");
+
+    let mut surface = PatchSurface::open_sdr(&output)?;
+    surface.set_code_values([0.0, 0.0, 0.0])?;
+    for remaining in (1..=prep_secs).rev() {
+        eprintln!("  starting in {remaining}s...");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    // floor_σ = how many noise-sigmas the *dimmest* channel sits above its
+    // black-cal floor (s5). Small/negative ⇒ the max(0, raw−s5) clamp is
+    // biting and the reading is untrustworthy. flags mark that and high noise.
+    println!(
+        "{:>7}  {:>10}  {:>9}  {:>7}  {:>8}  flags",
+        "cv", "Y(cd/m²)", "sigmaY", "sY/Y", "floor_s",
+    );
+    let auto_zero = !burst;
+    for &cv in &levels {
+        let cv = cv.clamp(0.0, 1.0);
+        surface.set_code_values([cv, cv, cv])?;
+        std::thread::sleep(Duration::from_millis(settle_ms));
+        let raws = device.measure_raw_repeated(&setup, repeats, auto_zero)?;
+        let st = LevelStats::compute(cv, &raws, &setup, &cal);
+        println!(
+            "{:>7.4}  {:>10.3}  {:>9.4}  {:>6.1}%  {:>8.1}  {}",
+            st.cv,
+            st.y_mean,
+            st.y_std,
+            st.rel_noise_pct(),
+            st.min_floor_sigma,
+            st.flags(),
+        );
+        if verbose {
+            for ch in 0..6 {
+                println!(
+                    "          ch{ch}: mean {:>8.1}  sd {:>6.2}  s5 {:>4}  headroom {:>8.1} ({:>6.1}s)",
+                    st.raw_mean[ch],
+                    st.raw_std[ch],
+                    setup.s5[ch],
+                    st.raw_mean[ch] - setup.s5[ch] as f64,
+                    st.floor_sigma[ch],
+                );
+            }
+        }
+    }
+    let _ = surface.set_code_values([0.0, 0.0, 0.0]);
+    Ok(())
+}
+
+/// Per-level repeat statistics. Computed in the CLI (not the driver) while the
+/// trust metrics are still being worked out — the driver just hands back raw
+/// repeats.
+struct LevelStats {
+    cv: f64,
+    /// Per-channel mean / sample-std of the raw sensor counts.
+    raw_mean: [f64; 6],
+    raw_std: [f64; 6],
+    /// Per-channel headroom above the black-cal floor, in units of that
+    /// channel's own read noise: `(raw_mean − s5) / max(raw_std, ½ count)`.
+    floor_sigma: [f64; 6],
+    /// The worst (dimmest) channel's `floor_sigma` — what limits trust.
+    min_floor_sigma: f64,
+    /// Mean / sample-std of measured Y across the repeats (full pipeline).
+    y_mean: f64,
+    y_std: f64,
+    /// At least one channel's mean is at or below its black-cal floor.
+    clamp: bool,
+}
+
+impl LevelStats {
+    fn compute(cv: f64, raws: &[RawMeasurement], setup: &Setup, cal: &Calibration) -> Self {
+        let mut raw_mean = [0.0; 6];
+        let mut raw_std = [0.0; 6];
+        for ch in 0..6 {
+            let vals: Vec<f64> = raws.iter().map(|r| r.0[ch] as f64).collect();
+            raw_mean[ch] = mean(&vals);
+            raw_std[ch] = sample_std(&vals, raw_mean[ch]);
+        }
+
+        // Y through the full raw→XYZ pipeline per repeat, so the spread folds
+        // in the calibration matrix exactly as a real reading would.
+        let ys: Vec<f64> = raws.iter().map(|r| raw_to_xyz(r, setup, cal).y).collect();
+        let y_mean = mean(&ys);
+        let y_std = sample_std(&ys, y_mean);
+
+        let mut floor_sigma = [0.0; 6];
+        let mut min_floor_sigma = f64::INFINITY;
+        let mut clamp = false;
+        for ch in 0..6 {
+            let headroom = raw_mean[ch] - setup.s5[ch] as f64;
+            // ½-count floor on the noise so a perfectly stable channel reads as
+            // huge headroom rather than dividing by zero.
+            floor_sigma[ch] = headroom / raw_std[ch].max(0.5);
+            min_floor_sigma = min_floor_sigma.min(floor_sigma[ch]);
+            if headroom <= 0.0 {
+                clamp = true;
+            }
+        }
+
+        LevelStats {
+            cv,
+            raw_mean,
+            raw_std,
+            floor_sigma,
+            min_floor_sigma,
+            y_mean,
+            y_std,
+            clamp,
+        }
+    }
+
+    /// Relative luminance noise σY/Y as a percentage; `inf` at true black.
+    fn rel_noise_pct(&self) -> f64 {
+        if self.y_mean.abs() < 1e-9 {
+            f64::INFINITY
+        } else {
+            100.0 * self.y_std / self.y_mean
+        }
+    }
+
+    fn flags(&self) -> String {
+        let mut f = Vec::new();
+        if self.clamp {
+            f.push("CLAMP");
+        } else if self.min_floor_sigma < 1.0 {
+            f.push("FLOOR");
+        }
+        if self.rel_noise_pct() > 5.0 {
+            f.push("NOISY");
+        }
+        if f.is_empty() {
+            "ok".into()
+        } else {
+            f.join(",")
+        }
+    }
+}
+
+fn mean(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.iter().sum::<f64>() / v.len() as f64
+}
+
+/// Sample standard deviation (Bessel-corrected, `n−1`); `0` for fewer than two
+/// samples.
+fn sample_std(v: &[f64], mean: f64) -> f64 {
+    if v.len() < 2 {
+        return 0.0;
+    }
+    let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (v.len() - 1) as f64;
+    var.sqrt()
 }
 
 // ── report ──────────────────────────────────────────────────────────────────
@@ -432,4 +656,82 @@ fn parse_rgb(s: &str) -> Result<[f64; 3], String> {
         return Err(format!("expected R,G,B (three values), got {s:?}"));
     }
     Ok([parts[0], parts[1], parts[2]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mean_and_std_basic() {
+        let v = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+        let m = mean(&v);
+        assert!((m - 5.0).abs() < 1e-12);
+        // Sample (n−1) std of this classic set is 2.138...
+        assert!((sample_std(&v, m) - 2.1380899).abs() < 1e-6);
+    }
+
+    #[test]
+    fn std_degenerate_cases() {
+        assert_eq!(mean(&[]), 0.0);
+        assert_eq!(sample_std(&[], 0.0), 0.0);
+        assert_eq!(sample_std(&[3.0], 3.0), 0.0); // need ≥2 samples
+        assert_eq!(sample_std(&[5.0, 5.0, 5.0], 5.0), 0.0); // no spread
+    }
+
+    /// A bright, stable level reads as trustworthy; a level whose channels sit
+    /// at/under the black-cal floor flips the clamp flag and reports tiny
+    /// floor-σ.
+    #[test]
+    fn level_stats_flags_floor_and_clamp() {
+        let cal = unit_cal();
+        let setup = setup_with_floor([20; 6]);
+
+        // Well above the floor with a little noise: trustworthy.
+        let bright = vec![
+            RawMeasurement([200, 200, 200, 200, 200, 200]),
+            RawMeasurement([202, 198, 201, 199, 200, 200]),
+            RawMeasurement([198, 202, 199, 201, 200, 200]),
+        ];
+        let st = LevelStats::compute(0.5, &bright, &setup, &cal);
+        assert!(!st.clamp);
+        assert!(st.min_floor_sigma > 1.0);
+        assert_eq!(st.flags(), "ok");
+
+        // At/under the floor: clamp bites.
+        let dark = vec![
+            RawMeasurement([20, 18, 21, 19, 20, 22]),
+            RawMeasurement([19, 21, 20, 18, 21, 19]),
+            RawMeasurement([21, 19, 19, 20, 20, 20]),
+        ];
+        let st = LevelStats::compute(0.004, &dark, &setup, &cal);
+        assert!(st.clamp, "channels near/under s5 should set clamp");
+        assert!(st.flags().contains("CLAMP"));
+    }
+
+    fn unit_cal() -> Calibration {
+        // Y = sum of corrected counts (row 1 all ones); X/Z irrelevant here.
+        let mut matrix = [[0.0; 6]; 3];
+        matrix[1] = [1.0; 6];
+        Calibration {
+            index: 0,
+            v1: 0,
+            v2: 0,
+            v4: [0; 6],
+            matrix,
+            gain: [1.0; 3],
+            offset: [0.0; 3],
+            v3: 0,
+        }
+    }
+
+    fn setup_with_floor(s5: [u8; 6]) -> Setup {
+        Setup {
+            s1: 0,
+            s2: 0,
+            s3: [0; 6],
+            s4: [0; 6],
+            s5,
+        }
+    }
 }

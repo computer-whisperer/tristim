@@ -319,6 +319,46 @@ impl Colorimeter {
         Ok(parse_raw_measurement(&reply)?)
     }
 
+    /// Take `n` raw measurements with the given `setup`, returning every
+    /// reading. Summary statistics are intentionally *not* computed here — the
+    /// raw set is returned so callers can characterize noise, bias, and the
+    /// black-cal floor however they need while the sensor's low-light behavior
+    /// is still being worked out.
+    ///
+    /// `auto_zero` selects the dark-current discipline:
+    /// * `true` — reset (auto-zero) before *every* reading, exactly as
+    ///   [`measure_raw`](Self::measure_raw) does. Mirrors normal capture and
+    ///   folds re-zero variation into the spread.
+    /// * `false` — reset *once* up front, then read `n` times back-to-back via
+    ///   [`measure_raw_no_reset`](Self::measure_raw_no_reset). Isolates the
+    ///   sensor's read-to-read noise at a fixed dark baseline, and is far
+    ///   faster (skips the ~500 ms reset per reading).
+    ///
+    /// `n == 0` returns an empty vector without touching the device.
+    pub fn measure_raw_repeated(
+        &mut self,
+        setup: &Setup,
+        n: usize,
+        auto_zero: bool,
+    ) -> Result<Vec<RawMeasurement>> {
+        let mut out = Vec::with_capacity(n);
+        if n == 0 {
+            return Ok(out);
+        }
+        if !auto_zero {
+            self.send_reset()?;
+        }
+        for _ in 0..n {
+            let raw = if auto_zero {
+                self.measure_raw(setup)?
+            } else {
+                self.measure_raw_no_reset(setup)?
+            };
+            out.push(raw);
+        }
+        Ok(out)
+    }
+
     /// End-to-end XYZ measurement using calibration index `cal_index`.
     /// Convenience wrapper: downloads calibration if not cached, fetches
     /// setup, takes a measurement, converts raw counts to XYZ.
