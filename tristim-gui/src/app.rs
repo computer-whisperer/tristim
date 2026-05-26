@@ -18,7 +18,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use aetna_core::prelude::*;
 use tristim_analyze::{AnalyzedCapture, AnalyzedTrial, GroundTruth, GroundTruthSource, analyze};
 use tristim_capture::{self as cap, Capture};
-use tristim_color::metrics;
+use tristim_color::{ColorSpace, mat3_mul_vec, metrics, transfer};
 use tristim_gather::{self as gather, CaptureConfig, GatherEvent};
 
 use crate::chart::{PresenterGamut, chromaticity_chart};
@@ -1308,6 +1308,53 @@ fn fmt_opt(v: Option<f64>, prec: usize) -> String {
     }
 }
 
+/// Render an absolute-XYZ colour as an (encoded-sRGB `Color`, out-of-gamut?)
+/// pair, normalised to the reference white. The swatch is painted in sRGB —
+/// the viewer's working colour space — so `true` means the colour lay outside
+/// sRGB and the swatch is a clamped approximation, not the real colour.
+fn swatch_color(xyz: [f64; 3], white_y: f64) -> (Color, bool) {
+    let s = if white_y > 0.0 { 1.0 / white_y } else { 1.0 };
+    let lin = mat3_mul_vec(
+        &ColorSpace::SRGB.xyz_to_rgb(),
+        &[xyz[0] * s, xyz[1] * s, xyz[2] * s],
+    );
+    let approx = lin.iter().any(|&c| !(-1e-3..=1.001).contains(&c));
+    let enc = |c: f64| (transfer::srgb_oetf(c.clamp(0.0, 1.0)) * 255.0).round() as u8;
+    (
+        Color::srgb_u8(enc(lin[0]), enc(lin[1]), enc(lin[2])),
+        approx,
+    )
+}
+
+/// A labelled colour chip. When `approx`, a warning-tinted border and a small
+/// `≈` on the label flag it as a clamped (out-of-gamut) approximation.
+fn swatch(label: &str, color: Color, approx: bool) -> El {
+    let chip = El::default()
+        .width(Size::Fixed(64.0))
+        .height(Size::Fixed(28.0))
+        .fill(color)
+        .stroke(if approx {
+            tokens::WARNING
+        } else {
+            tokens::BORDER
+        })
+        .radius(tokens::RADIUS_SM)
+        // The fill is a measured/expected colour, not a theme token — that's
+        // the point of a swatch, so opt out of the raw-colour lint here.
+        .allow_lint(FindingKind::RawColor);
+    let caption = if approx {
+        row([
+            text(label).font_size(12.0),
+            text("≈").font_size(12.0).text_color(tokens::WARNING),
+        ])
+        .gap(4.0)
+        .align(Align::Center)
+    } else {
+        text(label).muted().font_size(12.0)
+    };
+    column([chip, caption]).gap(4.0).align(Align::Center)
+}
+
 /// Inspector for the hovered sample: what was sent, what was measured, and the
 /// error from the target. Shows a hint when nothing is hovered.
 fn sample_inspector(t: &AnalyzedTrial, hovered: Option<usize>) -> El {
@@ -1319,21 +1366,44 @@ fn sample_inspector(t: &AnalyzedTrial, hovered: Option<usize>) -> El {
         .gap(tokens::SPACE_2);
     };
     let [r, g, b] = s.requested;
-    let mut rows = vec![
-        stat_row("requested", format!("{r:.3}  {g:.3}  {b:.3}")),
-        stat_row("measured xy", fmt_xy(s.measured_xy)),
-        stat_row("target xy", fmt_xy(s.expected_xy)),
-        stat_row("Δu'v'", fmt_opt(s.delta_uv, 4)),
-        stat_row("ΔE*ab", fmt_opt(s.delta_e, 2)),
-    ];
+    let mut body: Vec<El> = Vec::new();
+
+    // Asked-vs-got colour swatches, when there's a luminance reference to
+    // normalise against (a scored trial). Each is painted in the viewer's sRGB
+    // space; a warning border marks any that had to be clamped into gamut.
+    let white_y = t.reference_white_xyz.map_or(0.0, |w| w[1]);
+    if white_y > 0.0 {
+        let expected = s.expected_xyz.map(|xyz| swatch_color(xyz, white_y));
+        let (measured, m_approx) = swatch_color(s.measured_xyz, white_y);
+        let mut chips = Vec::new();
+        if let Some((color, approx)) = expected {
+            chips.push(swatch("expected", color, approx));
+        }
+        chips.push(swatch("measured", measured, m_approx));
+        body.push(row(chips).gap(tokens::SPACE_4).align(Align::Start));
+        if m_approx || expected.is_some_and(|(_, a)| a) {
+            body.push(
+                text("≈ approximated — outside the viewer's sRGB gamut")
+                    .muted()
+                    .font_size(11.0)
+                    .wrap_text(),
+            );
+        }
+    }
+
+    body.push(stat_row("requested", format!("{r:.3}  {g:.3}  {b:.3}")));
+    body.push(stat_row("measured xy", fmt_xy(s.measured_xy)));
+    body.push(stat_row("target xy", fmt_xy(s.expected_xy)));
+    body.push(stat_row("Δu'v'", fmt_opt(s.delta_uv, 4)));
+    body.push(stat_row("ΔE*ab", fmt_opt(s.delta_e, 2)));
     if let Some(l) = s.luminance {
         let unit = if l.absolute { "cd/m²" } else { "× white" };
-        rows.push(stat_row(
+        body.push(stat_row(
             "luminance",
             format!("{:.3} vs {:.3} {unit}", l.measured, l.expected),
         ));
     }
-    titled_card("Sample", rows).gap(tokens::SPACE_2)
+    titled_card("Sample", body).gap(tokens::SPACE_2)
 }
 
 fn chart_legend(space: Space) -> El {
@@ -1400,6 +1470,38 @@ fn duv_color(v: f64) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In-sRGB-gamut colours render faithfully (no warning); colours outside
+    /// sRGB are flagged as clamped approximations.
+    #[test]
+    fn swatch_color_flags_out_of_gamut() {
+        // sRGB white is in gamut → not an approximation.
+        let white = ColorSpace::SRGB.white_xyz();
+        assert!(!swatch_color(white, 1.0).1);
+        // The BT.2020 green primary is far outside sRGB → approximated.
+        let bt2020_green = tristim_color::chromaticity_to_xyz([0.170, 0.797]);
+        assert!(swatch_color(bt2020_green, 1.0).1);
+    }
+
+    /// Compositor label: peer process wins, falls back to the desktop hint,
+    /// shows both when they differ, and is absent when nothing is recorded.
+    #[test]
+    fn compositor_label_prefers_process() {
+        let with = |p: Option<&str>, d: Option<&str>| {
+            compositor_label(&cap::CompositorInfo {
+                process: p.map(str::to_string),
+                desktop: d.map(str::to_string),
+                globals: vec![],
+            })
+        };
+        assert_eq!(with(Some("niri"), Some("niri")).as_deref(), Some("niri"));
+        assert_eq!(
+            with(Some("kwin_wayland"), Some("KDE")).as_deref(),
+            Some("kwin_wayland (KDE)")
+        );
+        assert_eq!(with(None, Some("GNOME")).as_deref(), Some("GNOME"));
+        assert_eq!(with(None, None), None);
+    }
 
     fn sample(y: f64) -> cap::Sample {
         cap::Sample {

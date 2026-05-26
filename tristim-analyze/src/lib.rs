@@ -78,6 +78,11 @@ pub struct AnalyzedSample {
     pub measured_xy: Option<[f64; 2]>,
     /// Expected chromaticity (`None` for an unscored trial or pure black).
     pub expected_xy: Option<[f64; 2]>,
+    /// Expected colour in absolute CIE XYZ — the same value that feeds the ΔE
+    /// Lab conversion (PQ: cd/m²; relative encodings: scaled to the measured
+    /// white). `None` for an unscored trial. Pairs with [`Self::measured_xyz`]
+    /// for rendering asked-vs-got colour swatches.
+    pub expected_xyz: Option<[f64; 3]>,
     /// Measured colour in CIE L\*a\*b\* (against the trial's reference white).
     /// `None` when the trial is unscored. The same value that feeds `delta_e`.
     pub measured_lab: Option<[f64; 3]>,
@@ -186,6 +191,7 @@ fn analyze_trial(trial: &FormatTrial) -> AnalyzedTrial {
                     measured_xyz: s.measured.xyz,
                     measured_xy: s.measured.xy,
                     expected_xy: None,
+                    expected_xyz: None,
                     measured_lab: None,
                     expected_lab: None,
                     delta_uv: None,
@@ -290,6 +296,7 @@ fn analyze_trial(trial: &FormatTrial) -> AnalyzedTrial {
                 measured_xyz: s.measured.xyz,
                 measured_xy: s.measured.xy,
                 expected_xy,
+                expected_xyz: Some(expected_abs),
                 measured_lab,
                 expected_lab,
                 delta_uv,
