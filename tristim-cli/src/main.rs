@@ -232,9 +232,10 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
         std::thread::sleep(Duration::from_secs(1));
     }
 
-    // floor_σ = how many noise-sigmas the *dimmest* channel sits above its
-    // black-cal floor (s5). Small/negative ⇒ the max(0, raw−s5) clamp is
-    // biting and the reading is untrustworthy. flags mark that and high noise.
+    // floor_s = how many noise-σ the dimmest *signal* channel sits above its
+    // black-cal floor (s5). Small ⇒ the max(0, raw−s5) clamp is biting and the
+    // reading is untrustworthy. sY/Y folds in the ±½-count quantization floor
+    // that bare repeat-variance hides at low light. flags mark both regimes.
     println!(
         "{:>7}  {:>10}  {:>9}  {:>7}  {:>8}  flags",
         "cv", "Y(cd/m²)", "sigmaY", "sY/Y", "floor_s",
@@ -250,7 +251,7 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
             "{:>7.4}  {:>10.3}  {:>9.4}  {:>6.1}%  {:>8.1}  {}",
             st.cv,
             st.y_mean,
-            st.y_std,
+            st.y_std(),
             st.rel_noise_pct(),
             st.min_floor_sigma,
             st.flags(),
@@ -258,12 +259,13 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
         if verbose {
             for ch in 0..6 {
                 println!(
-                    "          ch{ch}: mean {:>8.1}  sd {:>6.2}  s5 {:>4}  headroom {:>8.1} ({:>6.1}s)",
+                    "          ch{ch}: mean {:>8.1}  sd {:>6.2}  s5 {:>4}  corrected {:>8.1}  floor {:>7.1}s  {}",
                     st.raw_mean[ch],
                     st.raw_std[ch],
                     setup.s5[ch],
-                    st.raw_mean[ch] - setup.s5[ch] as f64,
+                    st.corrected[ch],
                     st.floor_sigma[ch],
+                    if st.is_signal[ch] { "signal" } else { "dark" },
                 );
             }
         }
@@ -271,6 +273,12 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
     let _ = surface.set_code_values([0.0, 0.0, 0.0]);
     Ok(())
 }
+
+/// 1σ-equivalent uncertainty of a single integer count (uniform quantization
+/// noise, `q/√12`). Used as a noise floor that repeat-variance can't reveal:
+/// when the integer counts happen to agree across repeats, the spread reads as
+/// zero even though the reading is only good to ±½ count.
+const QUANT_SIGMA: f64 = 0.288_675_13; // 1.0 / 12_f64.sqrt()
 
 /// Per-level repeat statistics. Computed in the CLI (not the driver) while the
 /// trust metrics are still being worked out — the driver just hands back raw
@@ -280,16 +288,29 @@ struct LevelStats {
     /// Per-channel mean / sample-std of the raw sensor counts.
     raw_mean: [f64; 6],
     raw_std: [f64; 6],
-    /// Per-channel headroom above the black-cal floor, in units of that
-    /// channel's own read noise: `(raw_mean − s5) / max(raw_std, ½ count)`.
+    /// Per-channel black-cal-corrected counts, `max(0, raw_mean − s5)`.
+    corrected: [f64; 6],
+    /// Which channels carry signal at this level: corrected count above ~1% of
+    /// the brightest channel and at least one count. The Spyder's dark/unused
+    /// channels (cal 0: ch3/ch4) fall out here and are kept out of every trust
+    /// metric, so a permanently-floored channel can't poison the verdict.
+    is_signal: [bool; 6],
+    /// Per-channel headroom above the black-cal floor in noise-σ units:
+    /// `corrected / hypot(raw_std, QUANT_SIGMA)`.
     floor_sigma: [f64; 6],
-    /// The worst (dimmest) channel's `floor_sigma` — what limits trust.
+    /// The worst *signal* channel's `floor_sigma` — what limits trust. Small ⇒
+    /// a contributing channel is near its floor and the `max(0, raw−s5)` clamp
+    /// is starting to rectify (bias) the reading. `0` when nothing carries signal.
     min_floor_sigma: f64,
-    /// Mean / sample-std of measured Y across the repeats (full pipeline).
+    /// Brightest channel's corrected count: the overall signal level in counts.
+    max_corrected: f64,
+    /// Mean measured Y across the repeats (full raw→XYZ pipeline).
     y_mean: f64,
-    y_std: f64,
-    /// At least one channel's mean is at or below its black-cal floor.
-    clamp: bool,
+    /// Temporal (repeat) σ of Y, and the quantization-floor σ that repeats
+    /// can't see (±½-count discretization propagated through the Y row). The
+    /// reported uncertainty [`y_std`](Self::y_std) combines them in quadrature.
+    y_repeat_std: f64,
+    y_quant_std: f64,
 }
 
 impl LevelStats {
@@ -302,52 +323,87 @@ impl LevelStats {
             raw_std[ch] = sample_std(&vals, raw_mean[ch]);
         }
 
-        // Y through the full raw→XYZ pipeline per repeat, so the spread folds
-        // in the calibration matrix exactly as a real reading would.
-        let ys: Vec<f64> = raws.iter().map(|r| raw_to_xyz(r, setup, cal).y).collect();
-        let y_mean = mean(&ys);
-        let y_std = sample_std(&ys, y_mean);
+        // Black-cal-corrected counts and the signal-channel mask. A channel
+        // counts as signal only if it rises meaningfully above its own floor
+        // (>1% of the brightest channel, and ≥1 count); this drops the dark
+        // channels that otherwise pin every floor metric at zero.
+        let mut corrected = [0.0; 6];
+        for ch in 0..6 {
+            corrected[ch] = (raw_mean[ch] - setup.s5[ch] as f64).max(0.0);
+        }
+        let max_corrected = corrected.iter().copied().fold(0.0, f64::max);
+        let signal_threshold = (max_corrected * 0.01).max(1.0);
+        let mut is_signal = [false; 6];
+        for ch in 0..6 {
+            is_signal[ch] = corrected[ch] >= signal_threshold;
+        }
 
+        // Headroom above the floor in σ-units (repeat noise ⊕ quantization),
+        // limited by the worst signal channel.
         let mut floor_sigma = [0.0; 6];
         let mut min_floor_sigma = f64::INFINITY;
-        let mut clamp = false;
         for ch in 0..6 {
-            let headroom = raw_mean[ch] - setup.s5[ch] as f64;
-            // ½-count floor on the noise so a perfectly stable channel reads as
-            // huge headroom rather than dividing by zero.
-            floor_sigma[ch] = headroom / raw_std[ch].max(0.5);
-            min_floor_sigma = min_floor_sigma.min(floor_sigma[ch]);
-            if headroom <= 0.0 {
-                clamp = true;
+            floor_sigma[ch] = corrected[ch] / raw_std[ch].hypot(QUANT_SIGMA);
+            if is_signal[ch] {
+                min_floor_sigma = min_floor_sigma.min(floor_sigma[ch]);
             }
         }
+        if !min_floor_sigma.is_finite() {
+            min_floor_sigma = 0.0; // nothing above the floor — we're measuring it
+        }
+
+        // Y from the full pipeline per repeat → temporal σ.
+        let ys: Vec<f64> = raws.iter().map(|r| raw_to_xyz(r, setup, cal).y).collect();
+        let y_mean = mean(&ys);
+        let y_repeat_std = sample_std(&ys, y_mean);
+
+        // Quantization floor on Y: ±½-count on each signal channel, propagated
+        // through the Y row of the calibration matrix (with its gain). Repeats
+        // can't reveal this when the integer counts happen to agree.
+        let mut quant_var = 0.0;
+        for (ch, &signal) in is_signal.iter().enumerate() {
+            if signal {
+                let w = cal.matrix[1][ch] * cal.gain[1];
+                quant_var += (w * QUANT_SIGMA).powi(2);
+            }
+        }
+        let y_quant_std = quant_var.sqrt();
 
         LevelStats {
             cv,
             raw_mean,
             raw_std,
+            corrected,
+            is_signal,
             floor_sigma,
             min_floor_sigma,
+            max_corrected,
             y_mean,
-            y_std,
-            clamp,
+            y_repeat_std,
+            y_quant_std,
         }
     }
 
-    /// Relative luminance noise σY/Y as a percentage; `inf` at true black.
+    /// Combined Y uncertainty: temporal repeat noise ⊕ quantization floor.
+    fn y_std(&self) -> f64 {
+        self.y_repeat_std.hypot(self.y_quant_std)
+    }
+
+    /// Relative luminance uncertainty σY/Y as a percentage; `inf` at true black.
     fn rel_noise_pct(&self) -> f64 {
         if self.y_mean.abs() < 1e-9 {
             f64::INFINITY
         } else {
-            100.0 * self.y_std / self.y_mean
+            100.0 * self.y_std() / self.y_mean
         }
     }
 
     fn flags(&self) -> String {
         let mut f = Vec::new();
-        if self.clamp {
-            f.push("CLAMP");
-        } else if self.min_floor_sigma < 1.0 {
+        // Near the black-cal floor: either nothing carries usable signal, or the
+        // limiting signal channel is within a few σ of its floor (the
+        // max(0, raw−s5) clamp begins to rectify/bias the reading).
+        if self.max_corrected < 1.0 || self.min_floor_sigma < 3.0 {
             f.push("FLOOR");
         }
         if self.rel_noise_pct() > 5.0 {
@@ -679,34 +735,39 @@ mod tests {
         assert_eq!(sample_std(&[5.0, 5.0, 5.0], 5.0), 0.0); // no spread
     }
 
-    /// A bright, stable level reads as trustworthy; a level whose channels sit
-    /// at/under the black-cal floor flips the clamp flag and reports tiny
-    /// floor-σ.
+    /// Dark/unused channels must not poison the verdict: a level whose live
+    /// channels are well above the floor reads "ok" even with some channels
+    /// pinned at their floor. A level where *everything* sits at the floor
+    /// carries no signal and flags FLOOR.
     #[test]
-    fn level_stats_flags_floor_and_clamp() {
+    fn level_stats_excludes_dark_channels_and_flags_floor() {
         let cal = unit_cal();
         let setup = setup_with_floor([20; 6]);
 
-        // Well above the floor with a little noise: trustworthy.
+        // ch0–2 well above the floor; ch3–5 pinned at it (dark). The dark
+        // channels must drop out of the signal set, not drag floor_σ to zero.
         let bright = vec![
-            RawMeasurement([200, 200, 200, 200, 200, 200]),
-            RawMeasurement([202, 198, 201, 199, 200, 200]),
-            RawMeasurement([198, 202, 199, 201, 200, 200]),
+            RawMeasurement([200, 200, 200, 20, 20, 20]),
+            RawMeasurement([202, 198, 201, 20, 20, 20]),
+            RawMeasurement([198, 202, 199, 20, 20, 20]),
         ];
         let st = LevelStats::compute(0.5, &bright, &setup, &cal);
-        assert!(!st.clamp);
-        assert!(st.min_floor_sigma > 1.0);
+        assert_eq!(st.is_signal, [true, true, true, false, false, false]);
+        assert!(st.min_floor_sigma > 3.0);
         assert_eq!(st.flags(), "ok");
 
-        // At/under the floor: clamp bites.
+        // Every channel at/below its floor: nothing carries signal → FLOOR.
         let dark = vec![
             RawMeasurement([20, 18, 21, 19, 20, 22]),
             RawMeasurement([19, 21, 20, 18, 21, 19]),
             RawMeasurement([21, 19, 19, 20, 20, 20]),
         ];
         let st = LevelStats::compute(0.004, &dark, &setup, &cal);
-        assert!(st.clamp, "channels near/under s5 should set clamp");
-        assert!(st.flags().contains("CLAMP"));
+        assert!(
+            st.is_signal.iter().all(|&s| !s),
+            "no channel should count as signal at the floor"
+        );
+        assert!(st.flags().contains("FLOOR"));
     }
 
     fn unit_cal() -> Calibration {
