@@ -35,12 +35,9 @@ pub fn luminance_chart(t: &AnalyzedTrial, plot_px: f32) -> El {
         .collect();
 
     if pts.is_empty() {
-        return vector(VectorAsset::from_paths(
-            [0.0, 0.0, SIZE, SIZE],
-            vec![frame_path()],
-        ))
-        .width(Size::Fixed(plot_px))
-        .height(Size::Fixed(plot_px));
+        return vector(VectorAsset::from_paths([0.0, 0.0, SIZE, SIZE], vec![]))
+            .width(Size::Fixed(plot_px))
+            .height(Size::Fixed(plot_px));
     }
 
     // Equal axes (ideal is y = x), scaled to the data with a little headroom.
@@ -54,7 +51,7 @@ pub fn luminance_chart(t: &AnalyzedTrial, plot_px: f32) -> El {
     let px = |e: f64| L + (e / max) as f32 * (SIZE - L - R);
     let py = |m: f64| (SIZE - B) - (m / max) as f32 * (SIZE - T - B);
 
-    let mut paths = vec![frame_path()];
+    let mut paths: Vec<VectorPath> = Vec::new();
 
     // Axes (left + bottom) and the ideal diagonal.
     paths.push(line(px(0.0), py(0.0), px(0.0), py(max), AXIS, 1.0));
@@ -78,18 +75,6 @@ pub fn luminance_units(t: &AnalyzedTrial) -> &'static str {
         GroundTruth::Known { absolute: true, .. } => "cd/m²",
         _ => "fraction of white",
     }
-}
-
-fn frame_path() -> VectorPath {
-    let m = 0.5;
-    PathBuilder::new()
-        .move_to(m, m)
-        .line_to(SIZE - m, m)
-        .line_to(SIZE - m, SIZE - m)
-        .line_to(m, SIZE - m)
-        .close()
-        .stroke_solid(tokens::BORDER, 1.0)
-        .build()
 }
 
 fn line(x0: f32, y0: f32, x1: f32, y1: f32, color: Color, width: f32) -> VectorPath {

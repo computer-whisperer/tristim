@@ -10,46 +10,105 @@
 //! - **error vectors** (lines) — `expected_lab → measured_lab` per sample. Lab
 //!   is perceptually near-uniform, so each vector's *length* is the reported
 //!   ΔE\*ab and its *direction* shows the kind of error (hue / chroma / lightness).
-//! - **gamut wireframe** (lines) — the ideal RGB cube of the trial's colour
-//!   space, mapped corner-by-corner into the same Lab frame and subdivided
-//!   (cube edges curve in Lab). It is the surface the measured points *would*
-//!   sit on if the display were perfect, so drift off it is visible at a glance.
+//! - **gamut cages** (lines) — the ideal RGB cube of a colour space, mapped
+//!   corner-by-corner into the same Lab frame and subdivided (cube edges curve
+//!   in Lab). It is the surface the measured points *would* sit on if the
+//!   display reproduced that space perfectly, so drift off it is visible at a
+//!   glance. The trial's negotiated space is always drawn (the *target*); the
+//!   standard reference gamuts in [`REF_GAMUTS`] can be overlaid for comparison,
+//!   each in its own colour with an in-plot name label.
 //!
-//! Geometry handles are built once per trial and cached on the presenter (see
-//! [`Space3dScene`]); `build` clones them into a fresh [`SceneSpec`] each frame,
-//! so the backend re-uploads nothing while the camera moves.
+//! Geometry handles are built once per trial + reference set and cached on the
+//! presenter (see [`Space3dScene`]); `build` clones them into a fresh
+//! [`SceneSpec`] each frame, so the backend re-uploads nothing while the camera
+//! moves.
 
 use aetna_core::prelude::*;
 use aetna_core::scene::glam::Vec3;
 use aetna_core::scene::{
-    GridPlanes, GridSettings, LineData, LineSegment, LineStyle, LinesHandle, PointData,
-    PointLabels, PointShape, PointStyle, PointsHandle, ScenePoint, SceneSpec, SceneStyle, SizeMode,
+    GridPlanes, GridSettings, LabelPlacement, LineData, LineSegment, LineStyle, LinesHandle,
+    PointData, PointLabels, PointShape, PointStyle, PointsHandle, ScenePoint, SceneSpec,
+    SceneStyle, SizeMode,
 };
 
 use tristim_analyze::{AnalyzedSample, AnalyzedTrial, GroundTruth};
 use tristim_color::{ColorSpace, mat3_mul_vec, metrics, transfer};
 
+/// A standard colour space the 3D view can outline as a reference overlay,
+/// alongside the trial's own (always-drawn) gamut.
+#[derive(Clone, Copy)]
+pub struct RefGamut {
+    /// Toggle route suffix (`ref:<key>`) and stable identity.
+    pub key: &'static str,
+    /// Button / in-plot label text.
+    pub name: &'static str,
+    pub space: ColorSpace,
+    /// Cage + label colour (authoring sRGBA).
+    pub color: [f32; 4],
+}
+
+/// Number of reference-gamut overlays offered.
+pub const N_REF_GAMUTS: usize = 3;
+
+/// The reference gamuts, in nesting order (sRGB ⊂ Display P3 ⊂ Rec.2020) — the
+/// same trio the chromaticity colour-field supports.
+pub const REF_GAMUTS: [RefGamut; N_REF_GAMUTS] = [
+    RefGamut {
+        key: "srgb",
+        name: "sRGB",
+        space: ColorSpace::SRGB,
+        color: [0.42, 0.60, 1.0, 0.5],
+    },
+    RefGamut {
+        key: "p3",
+        name: "Display P3",
+        space: ColorSpace::DISPLAY_P3,
+        color: [0.36, 0.85, 0.52, 0.5],
+    },
+    RefGamut {
+        key: "bt2020",
+        name: "Rec.2020",
+        space: ColorSpace::BT2020,
+        color: [1.0, 0.70, 0.30, 0.5],
+    },
+];
+
+/// Which reference overlays are enabled, parallel to [`REF_GAMUTS`].
+pub type RefSet = [bool; N_REF_GAMUTS];
+
 /// Cached scene geometry for one analyzed trial. Cheap to clone into a
 /// [`SceneSpec`] each frame (the handles are `Arc`s); rebuilt only when the
 /// selected trial changes.
 pub struct Space3dScene {
-    /// Trial index these handles were built for — the cache key.
+    /// Trial index these handles were built for — half of the cache key.
     pub trial: usize,
+    /// Reference overlays these handles were built for — the other half.
+    refs: RefSet,
     /// Measured samples, each at its `measured_lab`, coloured by measured colour.
     points: PointsHandle,
     /// Per-point hover labels (ΔE / L\*), aligned with `points`.
     point_labels: PointLabels,
     /// `expected → measured` displacement per scorable sample.
     vectors: LinesHandle,
-    /// The trial colour space's RGB cube, mapped into the Lab frame.
+    /// All gamut cages (target + enabled references), per-segment coloured.
     gamut: LinesHandle,
+    /// One label-anchor point per cage, at its green primary.
+    gamut_label_geo: PointsHandle,
+    /// Persistent cage name labels, aligned with `gamut_label_geo`.
+    gamut_labels: PointLabels,
     /// Whether any sample could be embedded (false ⇒ show a placeholder note).
     has_data: bool,
 }
 
 impl Space3dScene {
-    /// Build the cached geometry for `trial` (index `idx`).
-    pub fn build(trial: &AnalyzedTrial, idx: usize) -> Self {
+    /// Whether these cached handles still match the requested view.
+    pub fn matches(&self, trial: usize, refs: RefSet) -> bool {
+        self.trial == trial && self.refs == refs
+    }
+
+    /// Build the cached geometry for `trial` (index `idx`) with the given
+    /// reference-gamut overlays enabled.
+    pub fn build(trial: &AnalyzedTrial, idx: usize, refs: RefSet) -> Self {
         // Reference white the analyzer placed samples against; 0 ⇒ unscored.
         let white = trial.reference_white_xyz;
         let white_y = white.map_or(0.0, |w| w[1]);
@@ -73,20 +132,57 @@ impl Space3dScene {
             }
         }
 
-        let gamut = match (&trial.ground_truth, white) {
-            (GroundTruth::Known { space, .. }, Some(white_xyz)) => {
-                gamut_wireframe(space, white_xyz)
+        // Cages: the trial's negotiated space (always, as the target) plus each
+        // enabled reference overlay — all in the shared measured-white Lab
+        // frame, so they're directly comparable to the sample cloud.
+        let mut cage = Vec::new();
+        let mut anchor_pts = Vec::new();
+        let mut anchor_txt = Vec::new();
+        if let Some(white_xyz) = white {
+            let target = match &trial.ground_truth {
+                GroundTruth::Known { space, .. } => Some(*space),
+                _ => None,
+            };
+            if let Some(space) = &target {
+                add_cage(
+                    &mut cage,
+                    &mut anchor_pts,
+                    &mut anchor_txt,
+                    space,
+                    white_xyz,
+                    TARGET_CAGE_COLOR,
+                    format!("{} · target", space_name(space)),
+                );
             }
-            _ => Vec::new(),
-        };
+            for (on, g) in refs.iter().zip(REF_GAMUTS.iter()) {
+                // Skip a reference that coincides with the target (already drawn).
+                let dup = target.is_some_and(|t| t == g.space);
+                if *on && !dup {
+                    add_cage(
+                        &mut cage,
+                        &mut anchor_pts,
+                        &mut anchor_txt,
+                        &g.space,
+                        white_xyz,
+                        g.color,
+                        g.name.to_string(),
+                    );
+                }
+            }
+        }
 
         let has_data = !points.is_empty();
         Self {
             trial: idx,
+            refs,
             points: PointsHandle::new(PointData { points }),
             point_labels: PointLabels::new(labels).on_hover(),
             vectors: LinesHandle::new(LineData { segments: vectors }),
-            gamut: LinesHandle::new(LineData { segments: gamut }),
+            gamut: LinesHandle::new(LineData { segments: cage }),
+            gamut_label_geo: PointsHandle::new(PointData { points: anchor_pts }),
+            gamut_labels: PointLabels::new(anchor_txt)
+                .always()
+                .placement(LabelPlacement::Above),
             has_data,
         }
     }
@@ -109,8 +205,10 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
     }
 
     // Size the reference grid to the Lab scale: lightness runs 0..100, a*/b*
-    // span roughly ±100 for wide content. A dark viewport makes the colour
-    // swatches read like a colour picker rather than washing out over the UI.
+    // span roughly ±100 for wide content. No scene background — the scene
+    // composites over the enclosing card's panel surface (a dark surface in
+    // the default theme), so the swatches read against the same surface as
+    // the rest of the UI.
     let style = SceneStyle {
         grid: GridSettings {
             planes: GridPlanes::XZ,
@@ -119,7 +217,6 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
             subdivisions: 1,
             ..Default::default()
         },
-        background: Some(Color::srgb_u8(26, 28, 34)),
         ..Default::default()
     };
 
@@ -142,6 +239,17 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
                 ..Default::default()
             },
         })
+        // A small square marker + persistent name at each cage's green primary,
+        // so every outlined gamut is labelled where it's most distinctive.
+        .points_labeled(
+            scene.gamut_label_geo.clone(),
+            PointStyle {
+                size: 5.0,
+                shape: PointShape::Square,
+                size_mode: SizeMode::ScreenSpace,
+            },
+            scene.gamut_labels.clone(),
+        )
         .style(style)
         // X = a* (green→red), Y = L* (dark→light, up), Z = b* (blue→yellow).
         .axis_titles("a*", "L*", "b*");
@@ -151,9 +259,7 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
     // (orbit/pan never begins — only wheel-zoom, which routes separately). The
     // scene sits at a stable spot in the tree, so its structural node id keys
     // the camera state across frames and trial switches without an explicit key.
-    chart3d(spec)
-        .width(Size::Fixed(px))
-        .height(Size::Fixed(px))
+    chart3d(spec).width(Size::Fixed(px)).height(Size::Fixed(px))
 }
 
 /// The legend/detail card for the 3D view.
@@ -163,7 +269,10 @@ pub fn space_legend() -> El {
         [
             legend_row("dots", "measured samples, in their own colour"),
             legend_row("lines", "expected → measured (length = ΔE*ab)"),
-            legend_row("cage", "ideal gamut of the trial's colour space"),
+            legend_row(
+                "cages",
+                "gamut bounds — the trial's space (· target) plus any reference gamuts enabled above",
+            ),
             text("Drag to orbit · shift-drag to pan · wheel to zoom · hover a dot for ΔE.")
                 .muted()
                 .font_size(12.0)
@@ -175,18 +284,26 @@ pub fn space_legend() -> El {
 fn legend_row(head: &str, body: &str) -> El {
     row([
         text(head).font_size(12.0).width(Size::Fixed(44.0)),
-        text(body).muted().font_size(12.0).wrap_text(),
+        // Fill the remaining row width so a long description wraps within the
+        // card instead of overflowing it.
+        text(body)
+            .muted()
+            .font_size(12.0)
+            .wrap_text()
+            .width(Size::Fill(1.0)),
     ])
     .gap(tokens::SPACE_2)
     .align(Align::Start)
+    .width(Size::Fill(1.0))
 }
 
 // ── geometry helpers ─────────────────────────────────────────────────────────
 
 /// Faint, semi-transparent neutral for the error vectors.
 const VECTOR_COLOR: [f32; 4] = [0.92, 0.93, 0.97, 0.55];
-/// Even fainter for the gamut cage so it reads as a reference, not data.
-const GAMUT_COLOR: [f32; 4] = [0.70, 0.74, 0.84, 0.32];
+/// The trial's own (target) gamut cage: a bright neutral, brighter than the
+/// coloured reference overlays so the target reads as primary.
+const TARGET_CAGE_COLOR: [f32; 4] = [0.86, 0.89, 0.96, 0.55];
 /// Subdivisions per gamut-cube edge (edges curve in Lab).
 const GAMUT_SEGMENTS: usize = 16;
 
@@ -228,9 +345,47 @@ fn lab_corner(m: &[[f64; 3]; 3], white_xyz: [f64; 3], rgb: [f64; 3]) -> Vec3 {
     lab_to_world(metrics::xyz_to_lab(xyz_abs, white_xyz))
 }
 
+/// Short display name for a colour space (for the in-plot cage label).
+fn space_name(s: &ColorSpace) -> &'static str {
+    if *s == ColorSpace::SRGB {
+        "sRGB"
+    } else if *s == ColorSpace::DISPLAY_P3 {
+        "Display P3"
+    } else if *s == ColorSpace::DCI_P3 {
+        "DCI-P3"
+    } else if *s == ColorSpace::BT2020 {
+        "Rec.2020"
+    } else if *s == ColorSpace::ADOBE_RGB {
+        "Adobe RGB"
+    } else {
+        "trial gamut"
+    }
+}
+
+/// Append one gamut cage (subdivided RGB-cube wireframe) plus a labelled anchor
+/// point at its green primary — the vertex that differs most between gamuts, so
+/// labels don't pile up at the shared white.
+fn add_cage(
+    segs: &mut Vec<LineSegment>,
+    anchor_pts: &mut Vec<ScenePoint>,
+    anchor_txt: &mut Vec<String>,
+    space: &ColorSpace,
+    white_xyz: [f64; 3],
+    color: [f32; 4],
+    name: String,
+) {
+    segs.extend(gamut_wireframe(space, white_xyz, color));
+    let m = space.rgb_to_xyz();
+    anchor_pts.push(ScenePoint {
+        position: lab_corner(&m, white_xyz, [0.0, 1.0, 0.0]),
+        color,
+    });
+    anchor_txt.push(name);
+}
+
 /// The 12 edges of the colour space's RGB cube, each subdivided and mapped into
-/// the Lab frame (so curved edges read as curves, not chords).
-fn gamut_wireframe(space: &ColorSpace, white_xyz: [f64; 3]) -> Vec<LineSegment> {
+/// the Lab frame (so curved edges read as curves, not chords), in `color`.
+fn gamut_wireframe(space: &ColorSpace, white_xyz: [f64; 3], color: [f32; 4]) -> Vec<LineSegment> {
     let m = space.rgb_to_xyz();
     // The 8 cube corners. Two corners share an edge iff they differ in exactly
     // one channel — the nested loop below picks out the 12 such pairs.
@@ -263,7 +418,7 @@ fn gamut_wireframe(space: &ColorSpace, white_xyz: [f64; 3]) -> Vec<LineSegment> 
                 out.push(LineSegment {
                     start: prev,
                     end: cur,
-                    color: GAMUT_COLOR,
+                    color,
                 });
                 prev = cur;
             }
@@ -312,14 +467,21 @@ mod tests {
             },
             samples: vec![
                 sample([0.95, 1.0, 1.09], [100.0, 0.0, 0.0], [100.0, 0.0, 0.0], 0.0),
-                sample([0.4, 0.2, 0.02], [51.0, 60.0, 40.0], [54.0, 80.0, 67.0], 25.0),
+                sample(
+                    [0.4, 0.2, 0.02],
+                    [51.0, 60.0, 40.0],
+                    [54.0, 80.0, 67.0],
+                    25.0,
+                ),
             ],
             summary: None,
             reference_white_xyz: Some(white_xyz),
         };
 
-        let scene = Space3dScene::build(&trial, 3);
+        let scene = Space3dScene::build(&trial, 3, [false; N_REF_GAMUTS]);
         assert_eq!(scene.trial, 3);
+        assert!(scene.matches(3, [false; N_REF_GAMUTS]));
+        assert!(!scene.matches(3, [true, false, false]));
         assert!(scene.has_data);
 
         let (pts, _) = scene.points.snapshot();
@@ -327,7 +489,9 @@ mod tests {
         for p in &pts.points {
             assert!(p.position.is_finite(), "point position must be finite");
             assert!(
-                p.color.iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)),
+                p.color
+                    .iter()
+                    .all(|c| c.is_finite() && (0.0..=1.0).contains(c)),
                 "swatch must be in-gamut sRGB: {:?}",
                 p.color
             );
@@ -340,11 +504,51 @@ mod tests {
         let (vecs, _) = scene.vectors.snapshot();
         assert_eq!(vecs.segments.len(), 2);
 
+        // One cage (the trial's sRGB target), with a single labelled anchor.
         let (gamut, _) = scene.gamut.snapshot();
         assert_eq!(gamut.segments.len(), 12 * GAMUT_SEGMENTS);
         for s in &gamut.segments {
             assert!(s.start.is_finite() && s.end.is_finite());
         }
+        assert_eq!(scene.gamut_label_geo.snapshot().0.points.len(), 1);
+        assert_eq!(scene.gamut_labels.get(0), Some("sRGB · target"));
+    }
+
+    /// Enabling a non-target reference adds a second cage + label; enabling the
+    /// reference that *is* the target is deduplicated (no second cage).
+    #[test]
+    fn reference_overlays_add_and_dedup_cages() {
+        let white_xyz = ColorSpace::SRGB.white_xyz();
+        let trial = AnalyzedTrial {
+            pixel_format: "xrgb8888".into(),
+            ground_truth: GroundTruth::Known {
+                space: ColorSpace::SRGB, // target = sRGB (REF_GAMUTS[0])
+                transfer: "srgb".into(),
+                absolute: false,
+                source: GroundTruthSource::Negotiated,
+            },
+            samples: vec![sample(
+                [0.4, 0.2, 0.02],
+                [51.0, 60.0, 40.0],
+                [54.0, 80.0, 67.0],
+                25.0,
+            )],
+            summary: None,
+            reference_white_xyz: Some(white_xyz),
+        };
+
+        // Display P3 overlay on (index 1): target + P3 = two cages, two labels.
+        let p3 = Space3dScene::build(&trial, 0, [false, true, false]);
+        assert_eq!(
+            p3.gamut.snapshot().0.segments.len(),
+            2 * 12 * GAMUT_SEGMENTS
+        );
+        assert_eq!(p3.gamut_label_geo.snapshot().0.points.len(), 2);
+
+        // sRGB overlay on (index 0) == target: deduped to one cage.
+        let srgb = Space3dScene::build(&trial, 0, [true, false, false]);
+        assert_eq!(srgb.gamut.snapshot().0.segments.len(), 12 * GAMUT_SEGMENTS);
+        assert_eq!(srgb.gamut_label_geo.snapshot().0.points.len(), 1);
     }
 
     /// An unscored trial (no reference white / no Lab) yields an empty scene
@@ -370,9 +574,11 @@ mod tests {
             summary: None,
             reference_white_xyz: None,
         };
-        let scene = Space3dScene::build(&trial, 0);
+        let scene = Space3dScene::build(&trial, 0, [true, true, true]);
         assert!(!scene.has_data);
         assert_eq!(scene.points.snapshot().0.points.len(), 0);
+        // No reference white ⇒ no Lab frame ⇒ no cages even with overlays on.
         assert_eq!(scene.gamut.snapshot().0.segments.len(), 0);
+        assert_eq!(scene.gamut_label_geo.snapshot().0.points.len(), 0);
     }
 }

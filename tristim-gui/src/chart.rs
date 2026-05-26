@@ -140,7 +140,7 @@ fn field_el(gamut: PresenterGamut, space: Space, plot_px: f32) -> El {
 /// highlight ring around the hovered sample.
 fn vector_chart(t: &AnalyzedTrial, space: Space, hover: Option<usize>) -> El {
     let proj = Projector::new([0.0, 0.0, SIZE, SIZE], space.view());
-    let mut paths: Vec<VectorPath> = vec![frame_path(), locus_path(&proj, space)];
+    let mut paths: Vec<VectorPath> = vec![locus_path(&proj, space)];
 
     if let GroundTruth::Known { space: target, .. } = &t.ground_truth {
         paths.push(triangle_path(&proj, &gamut_in(space, target)));
@@ -175,19 +175,6 @@ const TRIANGLE: Color = Color::srgb_u8(150, 190, 255);
 const WHITE: Color = Color::srgb_u8(245, 245, 245);
 const UNSCORED: Color = Color::srgb_u8(140, 140, 150);
 const HIGHLIGHT: Color = Color::srgb_u8(255, 255, 255);
-
-/// Faint border just inside the view_box so the stroke isn't clipped.
-fn frame_path() -> VectorPath {
-    let m = 0.5;
-    PathBuilder::new()
-        .move_to(m, m)
-        .line_to(SIZE - m, m)
-        .line_to(SIZE - m, SIZE - m)
-        .line_to(m, SIZE - m)
-        .close()
-        .stroke_solid(tokens::BORDER, 1.0)
-        .build()
-}
 
 fn locus_path(proj: &Projector, space: Space) -> VectorPath {
     let pts = locus_in(space);

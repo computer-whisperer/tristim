@@ -25,7 +25,7 @@ use crate::chart::{PresenterGamut, chromaticity_chart};
 use crate::luminance::{luminance_chart, luminance_units};
 use crate::plot::Space;
 use crate::setup::{CaptureForm, FormAction};
-use crate::space3d::{Space3dScene, space_chart, space_legend};
+use crate::space3d::{N_REF_GAMUTS, REF_GAMUTS, RefSet, Space3dScene, space_chart, space_legend};
 
 /// Which plot the content panel shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,19 +68,20 @@ impl Presented {
 
     /// Index of the trial in focus, clamped to the available trials.
     fn focused(&self) -> usize {
-        self.selected.min(self.analyzed.trials.len().saturating_sub(1))
+        self.selected
+            .min(self.analyzed.trials.len().saturating_sub(1))
     }
 
-    /// Ensure the cached 3D scene matches the focused trial, rebuilding its
-    /// geometry handles only when the focus moved.
-    fn ensure_space3d(&mut self) {
+    /// Ensure the cached 3D scene matches the focused trial and enabled
+    /// reference gamuts, rebuilding its geometry handles only when either moved.
+    fn ensure_space3d(&mut self, refs: RefSet) {
         if self.analyzed.trials.is_empty() {
             self.space3d = None;
             return;
         }
         let i = self.focused();
-        if self.space3d.as_ref().map(|s| s.trial) != Some(i) {
-            self.space3d = Some(Space3dScene::build(&self.analyzed.trials[i], i));
+        if !self.space3d.as_ref().is_some_and(|s| s.matches(i, refs)) {
+            self.space3d = Some(Space3dScene::build(&self.analyzed.trials[i], i, refs));
         }
     }
 }
@@ -279,6 +280,8 @@ pub struct PresenterApp {
     show_field: bool,
     /// Index of the sample currently hovered in the plot, if any.
     hovered_sample: Option<usize>,
+    /// Which reference-gamut overlays are enabled in the 3D view.
+    space3d_refs: RefSet,
 }
 
 impl PresenterApp {
@@ -296,6 +299,7 @@ impl PresenterApp {
             space: Space::UvPrime,
             show_field: false,
             hovered_sample: None,
+            space3d_refs: [false; N_REF_GAMUTS],
         }
     }
 
@@ -315,6 +319,7 @@ impl PresenterApp {
             space: Space::UvPrime,
             show_field: false,
             hovered_sample: None,
+            space3d_refs: [false; N_REF_GAMUTS],
         }
     }
 
@@ -356,6 +361,7 @@ impl PresenterApp {
             space: Space::UvPrime,
             show_field: false,
             hovered_sample: None,
+            space3d_refs: [false; N_REF_GAMUTS],
         }
     }
 
@@ -376,8 +382,9 @@ impl PresenterApp {
         // The 3D view reads cached geometry handles; build them up front so a
         // headless render (which never calls `before_build`) still has a scene.
         if view == Tab::Space3D {
+            let refs = self.space3d_refs;
             if let Some(p) = self.presented.as_mut() {
-                p.ensure_space3d();
+                p.ensure_space3d(refs);
             }
         }
     }
@@ -657,7 +664,9 @@ impl PresenterApp {
         let i = p.selected.min(p.analyzed.trials.len() - 1);
         let t = &p.analyzed.trials[i];
 
-        let plot_px = plot_size(cx, extra_chrome);
+        // Inner plot size: the budgeted square minus the card's padding on both
+        // sides, so the enclosing `plot_card` ends up at the budgeted footprint.
+        let plot_px = plot_size(cx, extra_chrome) - 2.0 * PLOT_CARD_PAD;
 
         // Heading: title + view selector, plus chromaticity-only controls.
         let mut heading: Vec<El> = vec![
@@ -691,6 +700,11 @@ impl PresenterApp {
             }
             Tab::Luminance => (luminance_chart(t, plot_px), luminance_legend(t)),
             Tab::Space3D => {
+                // Reference-gamut overlay toggles (the trial's own gamut is
+                // always drawn as the target).
+                for (i, g) in REF_GAMUTS.iter().enumerate() {
+                    heading.push(ref_toggle(g.name, g.key, self.space3d_refs[i]));
+                }
                 // The geometry handles are cached on `Presented` and refreshed
                 // in `before_build`; `None` only during a transient first frame.
                 let chart = match &p.space3d {
@@ -709,7 +723,7 @@ impl PresenterApp {
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
             row([
-                plot,
+                plot_card(plot),
                 column([
                     summary_card(t).width(Size::Fill(1.0)),
                     detail.width(Size::Fill(1.0)),
@@ -860,6 +874,14 @@ impl PresenterApp {
                     self.view = Tab::Space3D;
                     self.hovered_sample = None; // 2D hover is N/A in the 3D view
                 }
+                Some(k) if k.starts_with("ref:") => {
+                    if let Some(i) = REF_GAMUTS
+                        .iter()
+                        .position(|g| k == format!("ref:{}", g.key))
+                    {
+                        self.space3d_refs[i] = !self.space3d_refs[i];
+                    }
+                }
                 Some("new-capture") => {
                     self.form.refresh_outputs();
                     self.mode = Mode::Setup;
@@ -892,6 +914,18 @@ impl PresenterApp {
             _ => {}
         }
     }
+}
+
+/// Inset between the plot card's border and the plot inside it. `content_panel`
+/// subtracts it (twice) from the budgeted square so the card's *outer* footprint
+/// matches the old bare-plot footprint and the stat column keeps its width.
+const PLOT_CARD_PAD: f32 = tokens::SPACE_4;
+
+/// Wrap a fixed-size plot in aetna's panel card, so all three views share one
+/// content-separation surface (CARD fill + border + radius + shadow) instead of
+/// a hand-drawn frame. Hugs the square plot rather than filling the row width.
+fn plot_card(plot: El) -> El {
+    card([plot]).width(Size::Hug).padding(PLOT_CARD_PAD)
 }
 
 /// Responsive square side (px) for the plot, derived from the window viewport.
@@ -946,11 +980,12 @@ impl App for PresenterApp {
         // trial. Done here (not in `build`, which is `&self`) so the handles
         // persist across frames and the backend re-uploads nothing on orbit.
         if self.view == Tab::Space3D {
+            let refs = self.space3d_refs;
             if let Some(p) = self.presented.as_mut() {
-                p.ensure_space3d();
+                p.ensure_space3d(refs);
             }
             if let Some(live) = self.running.as_mut().and_then(|r| r.live.as_mut()) {
-                live.ensure_space3d();
+                live.ensure_space3d(refs);
             }
         }
     }
@@ -1062,6 +1097,12 @@ fn field_toggle(on: bool) -> El {
 /// Toggle between the two chromaticity projections, labeled with the current.
 fn space_toggle(space: Space) -> El {
     button(space.label()).key("space-toggle").secondary()
+}
+
+/// A reference-gamut overlay toggle for the 3D view; primary when enabled.
+fn ref_toggle(name: &str, key: &str, on: bool) -> El {
+    let b = button(name).key(format!("ref:{key}"));
+    if on { b.primary() } else { b.secondary() }
 }
 
 /// Segmented selector for the active view; the current view's button is primary.
