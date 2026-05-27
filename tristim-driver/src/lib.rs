@@ -7,10 +7,12 @@
 //! this is a clean-room Rust re-implementation working from the documented
 //! wire format, not a code translation.
 
+pub mod confidence;
 pub mod device;
 pub mod measurement;
 pub mod protocol;
 
+pub use confidence::{MeasurementConfidence, TrustFlag};
 pub use device::{Colorimeter, DeviceInfo};
 pub use measurement::{Calibration, RawMeasurement, Setup, Xyz};
 pub use protocol::{DATACOLOR_VID, Opcode};

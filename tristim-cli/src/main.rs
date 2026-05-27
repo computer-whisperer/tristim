@@ -24,8 +24,7 @@ use std::time::Duration;
 use tristim_analyze::{GroundTruth, GroundTruthSource, analyze};
 use tristim_capture as cap;
 use tristim_display::{PatchSurface, list_outputs};
-use tristim_driver::Colorimeter;
-use tristim_driver::measurement::{Calibration, RawMeasurement, Setup, Xyz, raw_to_xyz};
+use tristim_driver::{Colorimeter, MeasurementConfidence, TrustFlag};
 use tristim_gather as gather;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -248,26 +247,26 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
         surface.set_code_values([cv, cv, cv])?;
         std::thread::sleep(Duration::from_millis(settle_ms));
         let raws = device.measure_raw_repeated(&setup, repeats, auto_zero)?;
-        let st = LevelStats::compute(cv, &raws, &setup, &cal);
+        let conf = MeasurementConfidence::from_repeats(&raws, &setup, &cal);
         println!(
             "{:>7.4}  {:>10.3}  {:>6.1}%  {:>8}  {:>8.1}  {}",
-            st.cv,
-            st.y_mean,
-            st.rel_noise_pct(),
-            fmt_duv(st.uv_std()),
-            st.min_floor_sigma,
-            st.flags(),
+            cv,
+            conf.mean.y,
+            100.0 * conf.y_rel_uncertainty(),
+            fmt_duv(conf.uv_std()),
+            conf.min_floor_sigma,
+            fmt_flags(&conf.flags()),
         );
         if verbose {
             for ch in 0..6 {
                 println!(
                     "          ch{ch}: mean {:>8.1}  sd {:>6.2}  s5 {:>4}  corrected {:>8.1}  floor {:>7.1}s  {}",
-                    st.raw_mean[ch],
-                    st.raw_std[ch],
+                    conf.raw_mean[ch],
+                    conf.raw_std[ch],
                     setup.s5[ch],
-                    st.corrected[ch],
-                    st.floor_sigma[ch],
-                    if st.is_signal[ch] { "signal" } else { "dark" },
+                    conf.corrected[ch],
+                    conf.floor_sigma[ch],
+                    if conf.is_signal[ch] { "signal" } else { "dark" },
                 );
             }
         }
@@ -276,257 +275,28 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// 1σ-equivalent uncertainty of a single integer count (uniform quantization
-/// noise, `q/√12`). Used as a noise floor that repeat-variance can't reveal:
-/// when the integer counts happen to agree across repeats, the spread reads as
-/// zero even though the reading is only good to ±½ count.
-const QUANT_SIGMA: f64 = 0.288_675_13; // 1.0 / 12_f64.sqrt()
-
-/// Per-level repeat statistics. Computed in the CLI (not the driver) while the
-/// trust metrics are still being worked out — the driver just hands back raw
-/// repeats.
-struct LevelStats {
-    cv: f64,
-    /// Per-channel mean / sample-std of the raw sensor counts.
-    raw_mean: [f64; 6],
-    raw_std: [f64; 6],
-    /// Per-channel black-cal-corrected counts, `max(0, raw_mean − s5)`.
-    corrected: [f64; 6],
-    /// Which channels carry signal at this level: corrected count above ~1% of
-    /// the brightest channel and at least one count. The Spyder's dark/unused
-    /// channels (cal 0: ch3/ch4) fall out here and are kept out of every trust
-    /// metric, so a permanently-floored channel can't poison the verdict.
-    is_signal: [bool; 6],
-    /// Per-channel headroom above the black-cal floor in noise-σ units:
-    /// `corrected / hypot(raw_std, QUANT_SIGMA)`.
-    floor_sigma: [f64; 6],
-    /// The worst *signal* channel's `floor_sigma` — what limits trust. Small ⇒
-    /// a contributing channel is near its floor and the `max(0, raw−s5)` clamp
-    /// is starting to rectify (bias) the reading. `0` when nothing carries signal.
-    min_floor_sigma: f64,
-    /// Brightest channel's corrected count: the overall signal level in counts.
-    max_corrected: f64,
-    /// Mean measured Y across the repeats (full raw→XYZ pipeline).
-    y_mean: f64,
-    /// Temporal (repeat) σ of Y, and the quantization-floor σ that repeats
-    /// can't see (±½-count discretization propagated through the Y row). The
-    /// reported uncertainty [`y_std`](Self::y_std) combines them in quadrature.
-    y_repeat_std: f64,
-    y_quant_std: f64,
-    /// Chromaticity (u'v') uncertainty split: temporal repeat scatter and the
-    /// quantization floor (½-count per signal channel propagated through the
-    /// nonlinear u'v' map). `chroma_defined` is false at true black, where
-    /// chromaticity has no meaning.
-    uv_temporal: f64,
-    uv_quant: f64,
-    chroma_defined: bool,
-}
-
-impl LevelStats {
-    fn compute(cv: f64, raws: &[RawMeasurement], setup: &Setup, cal: &Calibration) -> Self {
-        let mut raw_mean = [0.0; 6];
-        let mut raw_std = [0.0; 6];
-        for ch in 0..6 {
-            let vals: Vec<f64> = raws.iter().map(|r| r.0[ch] as f64).collect();
-            raw_mean[ch] = mean(&vals);
-            raw_std[ch] = sample_std(&vals, raw_mean[ch]);
-        }
-
-        // Black-cal-corrected counts and the signal-channel mask. A channel
-        // counts as signal only if it rises meaningfully above its own floor
-        // (>1% of the brightest channel, and ≥1 count); this drops the dark
-        // channels that otherwise pin every floor metric at zero.
-        let mut corrected = [0.0; 6];
-        for ch in 0..6 {
-            corrected[ch] = (raw_mean[ch] - setup.s5[ch] as f64).max(0.0);
-        }
-        let max_corrected = corrected.iter().copied().fold(0.0, f64::max);
-        let signal_threshold = (max_corrected * 0.01).max(1.0);
-        let mut is_signal = [false; 6];
-        for ch in 0..6 {
-            is_signal[ch] = corrected[ch] >= signal_threshold;
-        }
-
-        // Headroom above the floor in σ-units (repeat noise ⊕ quantization),
-        // limited by the worst signal channel.
-        let mut floor_sigma = [0.0; 6];
-        let mut min_floor_sigma = f64::INFINITY;
-        for ch in 0..6 {
-            floor_sigma[ch] = corrected[ch] / raw_std[ch].hypot(QUANT_SIGMA);
-            if is_signal[ch] {
-                min_floor_sigma = min_floor_sigma.min(floor_sigma[ch]);
-            }
-        }
-        if !min_floor_sigma.is_finite() {
-            min_floor_sigma = 0.0; // nothing above the floor — we're measuring it
-        }
-
-        // Full raw→XYZ pipeline per repeat, reused for luminance and chromaticity.
-        let xyzs: Vec<Xyz> = raws.iter().map(|r| raw_to_xyz(r, setup, cal)).collect();
-        let ys: Vec<f64> = xyzs.iter().map(|p| p.y).collect();
-        let y_mean = mean(&ys);
-        let y_repeat_std = sample_std(&ys, y_mean);
-        let x_mean = mean(&xyzs.iter().map(|p| p.x).collect::<Vec<_>>());
-        let z_mean = mean(&xyzs.iter().map(|p| p.z).collect::<Vec<_>>());
-
-        // A ½-count quantum on channel `ch` displaces XYZ along that channel's
-        // matrix column (× gain) — the gradient ∂XYZ/∂count_ch. Used for both
-        // the Y floor and (through the nonlinear u'v' map) the chromaticity floor.
-        let xyz_grad = |ch: usize| {
-            (
-                cal.matrix[0][ch] * cal.gain[0],
-                cal.matrix[1][ch] * cal.gain[1],
-                cal.matrix[2][ch] * cal.gain[2],
-            )
-        };
-
-        // Quantization floor on Y: the quantum on each signal channel through
-        // the Y gradient. Repeats can't reveal this when the counts agree.
-        let mut quant_var = 0.0;
-        for (ch, &signal) in is_signal.iter().enumerate() {
-            if signal {
-                let (_, gy, _) = xyz_grad(ch);
-                quant_var += (gy * QUANT_SIGMA).powi(2);
-            }
-        }
-        let y_quant_std = quant_var.sqrt();
-
-        // Chromaticity (u'v') uncertainty — the low-light color-precision story.
-        // Temporal: RMS scatter of the per-repeat u'v' points about their mean.
-        // Quantization: each signal channel's quantum nudges XYZ, and the u'v'
-        // displacement is summed in quadrature. This is what blows up near black
-        // — a fixed XYZ wobble swings the ratios that define chromaticity far
-        // more when X+Y+Z is small. Combined the same way as Y.
-        let (uv_temporal, uv_quant, chroma_defined) = match uv_prime(x_mean, y_mean, z_mean) {
-            None => (0.0, 0.0, false),
-            Some((u0, v0)) => {
-                let uvs: Vec<(f64, f64)> = xyzs
-                    .iter()
-                    .filter_map(|p| uv_prime(p.x, p.y, p.z))
-                    .collect();
-                let uv_temporal = if uvs.len() >= 2 {
-                    let n = uvs.len();
-                    let um = uvs.iter().map(|p| p.0).sum::<f64>() / n as f64;
-                    let vm = uvs.iter().map(|p| p.1).sum::<f64>() / n as f64;
-                    let ss: f64 = uvs
-                        .iter()
-                        .map(|&(u, v)| (u - um).powi(2) + (v - vm).powi(2))
-                        .sum();
-                    (ss / (n - 1) as f64).sqrt()
-                } else {
-                    0.0
-                };
-                let mut quant_uv_var = 0.0;
-                for (ch, &signal) in is_signal.iter().enumerate() {
-                    if signal {
-                        let (gx, gy, gz) = xyz_grad(ch);
-                        if let Some((u1, v1)) = uv_prime(
-                            x_mean + gx * QUANT_SIGMA,
-                            y_mean + gy * QUANT_SIGMA,
-                            z_mean + gz * QUANT_SIGMA,
-                        ) {
-                            quant_uv_var += (u1 - u0).powi(2) + (v1 - v0).powi(2);
-                        }
-                    }
-                }
-                (uv_temporal, quant_uv_var.sqrt(), true)
-            }
-        };
-
-        LevelStats {
-            cv,
-            raw_mean,
-            raw_std,
-            corrected,
-            is_signal,
-            floor_sigma,
-            min_floor_sigma,
-            max_corrected,
-            y_mean,
-            y_repeat_std,
-            y_quant_std,
-            uv_temporal,
-            uv_quant,
-            chroma_defined,
-        }
-    }
-
-    /// Combined Y uncertainty: temporal repeat noise ⊕ quantization floor.
-    fn y_std(&self) -> f64 {
-        self.y_repeat_std.hypot(self.y_quant_std)
-    }
-
-    /// Combined chromaticity uncertainty Δu'v': temporal ⊕ quantization. `None`
-    /// when chromaticity is undefined (true black).
-    fn uv_std(&self) -> Option<f64> {
-        self.chroma_defined
-            .then(|| self.uv_temporal.hypot(self.uv_quant))
-    }
-
-    /// Relative luminance uncertainty σY/Y as a percentage; `inf` at true black.
-    fn rel_noise_pct(&self) -> f64 {
-        if self.y_mean.abs() < 1e-9 {
-            f64::INFINITY
-        } else {
-            100.0 * self.y_std() / self.y_mean
-        }
-    }
-
-    fn flags(&self) -> String {
-        let mut f = Vec::new();
-        // Near the black-cal floor: either nothing carries usable signal, or the
-        // limiting signal channel is within a few σ of its floor (the
-        // max(0, raw−s5) clamp begins to rectify/bias the reading).
-        if self.max_corrected < 1.0 || self.min_floor_sigma < 3.0 {
-            f.push("FLOOR");
-        }
-        if self.rel_noise_pct() > 5.0 {
-            f.push("NOISY");
-        }
-        // Chromaticity uncertainty past a roughly-perceptible Δu'v' (~0.003).
-        if self.uv_std().is_some_and(|d| d > 0.003) {
-            f.push("DUV");
-        }
-        if f.is_empty() {
-            "ok".into()
-        } else {
-            f.join(",")
-        }
-    }
-}
-
-/// CIE 1976 u'v' chromaticity from XYZ; `None` when `X + 15Y + 3Z ≤ 0` (black).
-fn uv_prime(x: f64, y: f64, z: f64) -> Option<(f64, f64)> {
-    let d = x + 15.0 * y + 3.0 * z;
-    if d <= 0.0 {
-        return None;
-    }
-    Some((4.0 * x / d, 9.0 * y / d))
-}
-
-fn mean(v: &[f64]) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    v.iter().sum::<f64>() / v.len() as f64
-}
-
-/// Sample standard deviation (Bessel-corrected, `n−1`); `0` for fewer than two
-/// samples.
-fn sample_std(v: &[f64], mean: f64) -> f64 {
-    if v.len() < 2 {
-        return 0.0;
-    }
-    let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (v.len() - 1) as f64;
-    var.sqrt()
-}
-
 /// Format a Δu'v' uncertainty for the table; `—` when undefined (true black).
 fn fmt_duv(d: Option<f64>) -> String {
     match d {
         Some(d) if d.is_finite() => format!("{d:.5}"),
         _ => "—".into(),
     }
+}
+
+/// Render trust flags for the table; `ok` when none are raised.
+fn fmt_flags(flags: &[TrustFlag]) -> String {
+    if flags.is_empty() {
+        return "ok".into();
+    }
+    flags
+        .iter()
+        .map(|f| match f {
+            TrustFlag::Floor => "FLOOR",
+            TrustFlag::Noisy => "NOISY",
+            TrustFlag::Chroma => "DUV",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 // ── report ──────────────────────────────────────────────────────────────────
@@ -807,138 +577,4 @@ fn parse_rgb(s: &str) -> Result<[f64; 3], String> {
         return Err(format!("expected R,G,B (three values), got {s:?}"));
     }
     Ok([parts[0], parts[1], parts[2]])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mean_and_std_basic() {
-        let v = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
-        let m = mean(&v);
-        assert!((m - 5.0).abs() < 1e-12);
-        // Sample (n−1) std of this classic set is 2.138...
-        assert!((sample_std(&v, m) - 2.1380899).abs() < 1e-6);
-    }
-
-    #[test]
-    fn std_degenerate_cases() {
-        assert_eq!(mean(&[]), 0.0);
-        assert_eq!(sample_std(&[], 0.0), 0.0);
-        assert_eq!(sample_std(&[3.0], 3.0), 0.0); // need ≥2 samples
-        assert_eq!(sample_std(&[5.0, 5.0, 5.0], 5.0), 0.0); // no spread
-    }
-
-    /// Dark/unused channels must not poison the verdict: a level whose live
-    /// channels are well above the floor reads "ok" even with some channels
-    /// pinned at their floor. A level where *everything* sits at the floor
-    /// carries no signal and flags FLOOR.
-    #[test]
-    fn level_stats_excludes_dark_channels_and_flags_floor() {
-        let cal = unit_cal();
-        let setup = setup_with_floor([20; 6]);
-
-        // ch0–2 well above the floor; ch3–5 pinned at it (dark). The dark
-        // channels must drop out of the signal set, not drag floor_σ to zero.
-        let bright = vec![
-            RawMeasurement([200, 200, 200, 20, 20, 20]),
-            RawMeasurement([202, 198, 201, 20, 20, 20]),
-            RawMeasurement([198, 202, 199, 20, 20, 20]),
-        ];
-        let st = LevelStats::compute(0.5, &bright, &setup, &cal);
-        assert_eq!(st.is_signal, [true, true, true, false, false, false]);
-        assert!(st.min_floor_sigma > 3.0);
-        assert_eq!(st.flags(), "ok");
-
-        // Every channel at/below its floor: nothing carries signal → FLOOR.
-        let dark = vec![
-            RawMeasurement([20, 18, 21, 19, 20, 22]),
-            RawMeasurement([19, 21, 20, 18, 21, 19]),
-            RawMeasurement([21, 19, 19, 20, 20, 20]),
-        ];
-        let st = LevelStats::compute(0.004, &dark, &setup, &cal);
-        assert!(
-            st.is_signal.iter().all(|&s| !s),
-            "no channel should count as signal at the floor"
-        );
-        assert!(st.flags().contains("FLOOR"));
-    }
-
-    #[test]
-    fn uv_prime_known_point() {
-        // Equal-energy white (X=Y=Z) → u'=4/19, v'=9/19.
-        let (u, v) = uv_prime(1.0, 1.0, 1.0).unwrap();
-        assert!((u - 4.0 / 19.0).abs() < 1e-12);
-        assert!((v - 9.0 / 19.0).abs() < 1e-12);
-        assert!(uv_prime(0.0, 0.0, 0.0).is_none());
-    }
-
-    /// The chromaticity quantization floor must rise as the signal drops: the
-    /// same ½-count quantum swings u'v' far more when X+Y+Z is small. Same
-    /// chromaticity, 10× dimmer ⇒ markedly larger Δu'v'.
-    #[test]
-    fn chromaticity_uncertainty_grows_toward_black() {
-        let cal = xyz_passthrough_cal();
-        let setup = setup_with_floor([0; 6]);
-        // Stable repeats (no temporal spread) so we isolate the quant floor.
-        let bright = vec![RawMeasurement([100, 90, 80, 0, 0, 0]); 4];
-        let dark = vec![RawMeasurement([10, 9, 8, 0, 0, 0]); 4];
-        let b = LevelStats::compute(1.0, &bright, &setup, &cal)
-            .uv_std()
-            .unwrap();
-        let d = LevelStats::compute(0.01, &dark, &setup, &cal)
-            .uv_std()
-            .unwrap();
-        assert!(b > 0.0 && d > 0.0);
-        assert!(
-            d > 2.0 * b,
-            "chromaticity floor should climb toward black (bright {b}, dark {d})"
-        );
-    }
-
-    /// Channels map straight to X/Y/Z (ch0→X, ch1→Y, ch2→Z) so chromaticity
-    /// is well-defined and exercised in tests.
-    fn xyz_passthrough_cal() -> Calibration {
-        let mut matrix = [[0.0; 6]; 3];
-        matrix[0][0] = 1.0;
-        matrix[1][1] = 1.0;
-        matrix[2][2] = 1.0;
-        Calibration {
-            index: 0,
-            v1: 0,
-            v2: 0,
-            v4: [0; 6],
-            matrix,
-            gain: [1.0; 3],
-            offset: [0.0; 3],
-            v3: 0,
-        }
-    }
-
-    fn unit_cal() -> Calibration {
-        // Y = sum of corrected counts (row 1 all ones); X/Z irrelevant here.
-        let mut matrix = [[0.0; 6]; 3];
-        matrix[1] = [1.0; 6];
-        Calibration {
-            index: 0,
-            v1: 0,
-            v2: 0,
-            v4: [0; 6],
-            matrix,
-            gain: [1.0; 3],
-            offset: [0.0; 3],
-            v3: 0,
-        }
-    }
-
-    fn setup_with_floor(s5: [u8; 6]) -> Setup {
-        Setup {
-            s1: 0,
-            s2: 0,
-            s3: [0; 6],
-            s4: [0; 6],
-            s5,
-        }
-    }
 }

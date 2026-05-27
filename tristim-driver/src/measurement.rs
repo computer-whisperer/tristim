@@ -94,6 +94,17 @@ impl Xyz {
         }
         Some((self.x / sum, self.y / sum))
     }
+
+    /// CIE 1976 u'v' chromaticity coordinates from this XYZ. These are the
+    /// (more perceptually uniform) coordinates Δu'v' is measured in.
+    /// Returns `None` if `X + 15Y + 3Z <= 0` (pure black).
+    pub fn uv_prime(&self) -> Option<(f64, f64)> {
+        let d = self.x + 15.0 * self.y + 3.0 * self.z;
+        if d <= 0.0 {
+            return None;
+        }
+        Some((4.0 * self.x / d, 9.0 * self.y / d))
+    }
 }
 
 // ---------------------------------------------------------------------------
