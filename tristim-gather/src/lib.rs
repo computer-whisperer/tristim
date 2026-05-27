@@ -233,6 +233,7 @@ pub fn run_capture(
             requested: fs.color_description(),
             pixel_format: fs.pixel_format_str().to_string(),
             outcome,
+            gamut: None,
             samples,
         });
         on_event(GatherEvent::FormatDone {

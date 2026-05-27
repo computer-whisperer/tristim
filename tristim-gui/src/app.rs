@@ -122,6 +122,7 @@ impl LiveTrial {
             pixel_format: self.pixel_format.clone(),
             // Negotiation always precedes samples; default until it arrives.
             outcome: self.outcome.clone().unwrap_or(cap::Negotiation::Unmanaged),
+            gamut: None,
             samples: self.samples.clone(),
         }
     }

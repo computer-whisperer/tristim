@@ -423,6 +423,7 @@ mod tests {
             requested: None,
             pixel_format: "xrgb8888".into(),
             outcome: Negotiation::Unmanaged, // assumes sRGB
+            gamut: None,
             samples,
         };
         let analyzed = analyze(&capture_with(trial));
@@ -459,6 +460,7 @@ mod tests {
             }),
             pixel_format: "xrgb8888".into(),
             outcome: Negotiation::Accepted { identity: 1 },
+            gamut: None,
             samples,
         };
         let analyzed = analyze(&capture_with(trial));
@@ -483,6 +485,7 @@ mod tests {
                 cause: "unsupported".into(),
                 message: "no PQ".into(),
             },
+            gamut: None,
             samples: vec![sample([1.0, 1.0, 1.0], [0.0, 0.0, 0.0])],
         };
         let analyzed = analyze(&capture_with(trial));
@@ -509,6 +512,7 @@ mod tests {
             }),
             pixel_format: "xbgr16161616f".into(),
             outcome: Negotiation::Accepted { identity: 1 },
+            gamut: None,
             samples,
         };
         let analyzed = analyze(&capture_with(trial));

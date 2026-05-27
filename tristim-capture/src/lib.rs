@@ -26,10 +26,11 @@ use thiserror::Error;
 /// Current schema version. Bump on any breaking change to the types below;
 /// readers should reject captures whose `schema_version` they don't understand.
 ///
-/// v2 added the optional [`Capture::compositor`] section. It is
-/// `#[serde(default)]`, so v1 captures still load (with an empty
-/// `CompositorInfo`) and `load` does no version gate.
-pub const SCHEMA_VERSION: u32 = 2;
+/// v2 added the optional [`Capture::compositor`] section. v3 added the optional
+/// per-trial [`FormatTrial::gamut`] section. Both are `#[serde(default)]`, so
+/// older captures still load (with the section absent) and `load` does no
+/// version gate.
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -168,8 +169,54 @@ pub struct FormatTrial {
     /// Whether the compositor accepted the description. A rejection is itself
     /// a result worth recording.
     pub outcome: Negotiation,
+    /// The display's reproduced gamut for this encoding, if a gamut probe was
+    /// run as a prerequisite to the sweep (added in schema v3). `None` when not
+    /// probed. When present, this trial's samples were constrained to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamut: Option<MeasuredGamut>,
     /// Measurements taken while this trial's format was active.
     pub samples: Vec<Sample>,
+}
+
+/// The adaptively-probed reproduced gamut for one encoding: the measured image
+/// of the code-cube surface (8 corners + 6 face centers, recursively refined),
+/// in the measured-white Lab frame. Recorded as a prerequisite to a capture so
+/// the sweep can stay inside what the display can actually reproduce.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeasuredGamut {
+    /// Measured white (code value 1,1,1) XYZ — the Lab reference for vertices.
+    pub white_xyz: [f64; 3],
+    /// Probed boundary vertices (deduped; patches index into this).
+    pub vertices: Vec<GamutVertex>,
+    /// Quadtree leaf patches over the 6 cube faces.
+    pub patches: Vec<GamutPatch>,
+}
+
+/// One measured boundary vertex: the requested code value and what came back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GamutVertex {
+    /// Requested code value in the trial's encoding.
+    pub code_value: [f64; 3],
+    /// Measured CIE XYZ (`Y` in cd/m²).
+    pub xyz: [f64; 3],
+    /// CIELAB relative to [`MeasuredGamut::white_xyz`].
+    pub lab: [f64; 3],
+    /// Whether the reading passed the confidence gate (false near black / on
+    /// saturated corners read near the sensor floor).
+    pub trustworthy: bool,
+}
+
+/// One refined leaf patch of a cube face: its 4 corner vertices and why
+/// subdivision stopped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GamutPatch {
+    /// Face the patch lies on, e.g. `"R=1"`.
+    pub face: String,
+    /// Indices into [`MeasuredGamut::vertices`] — the quad's corners, CCW.
+    pub corners: [usize; 4],
+    /// Why subdivision stopped: `"flat"`, `"folded"` (clamped), `"max_depth"`,
+    /// or `"low_trust"`.
+    pub status: String,
 }
 
 /// A parametric color description, in semantic units (nits, not protocol
@@ -341,6 +388,7 @@ mod tests {
                 }),
                 pixel_format: "xbgr16161616f".to_string(),
                 outcome: Negotiation::Accepted { identity: 42 },
+                gamut: None,
                 samples: vec![Sample {
                     requested: [0.5081, 0.0, 0.0],
                     measured: Measured {
@@ -382,6 +430,7 @@ mod tests {
                 cause: "unsupported_primaries".to_string(),
                 message: "no DCI-P3".to_string(),
             },
+            gamut: None,
             samples: vec![],
         });
         let json = capture.to_json_pretty().expect("serialize");
@@ -403,6 +452,47 @@ mod tests {
         assert!(!json.contains("\"mode\""));
         assert!(!json.contains("reference_white_nits"));
         assert!(!json.contains("\"mastering\""));
+    }
+
+    #[test]
+    fn gamut_section_round_trips() {
+        let mut capture = sample_capture();
+        capture.trials[0].gamut = Some(MeasuredGamut {
+            white_xyz: [95.0, 100.0, 108.0],
+            vertices: vec![
+                GamutVertex {
+                    code_value: [1.0, 1.0, 1.0],
+                    xyz: [95.0, 100.0, 108.0],
+                    lab: [100.0, 0.0, 0.0],
+                    trustworthy: true,
+                },
+                GamutVertex {
+                    code_value: [0.0, 0.0, 0.0],
+                    xyz: [0.2, 0.2, 0.2],
+                    lab: [1.8, 0.0, 0.0],
+                    trustworthy: false,
+                },
+            ],
+            patches: vec![GamutPatch {
+                face: "R=1".to_string(),
+                corners: [0, 1, 0, 1],
+                status: "folded".to_string(),
+            }],
+        });
+        let json = capture.to_json_pretty().expect("serialize");
+        let back = Capture::from_json(&json).expect("deserialize");
+        assert_eq!(capture, back);
+    }
+
+    /// A capture without a probed gamut omits the section, and it still loads
+    /// (the field is `#[serde(default)]`).
+    #[test]
+    fn missing_gamut_omitted_and_loads() {
+        let capture = sample_capture(); // no gamut set
+        let json = capture.to_json_pretty().expect("serialize");
+        assert!(!json.contains("\"gamut\""));
+        let back = Capture::from_json(&json).expect("deserialize");
+        assert!(back.trials[0].gamut.is_none());
     }
 
     /// A v1 capture (no `compositor` section) still loads — the field is
