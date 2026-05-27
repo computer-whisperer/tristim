@@ -20,7 +20,10 @@ mod sequence;
 mod time;
 
 pub use format::{FormatSpec, KNOWN_FORMATS, parse_format};
-pub use gamut::{GamutConfig, GamutEvent, GamutProbe, GamutVertex, probe_gamut};
+pub use gamut::{
+    GamutConfig, GamutEvent, GamutMesh, GamutProbe, GamutVertex, MeshVertex, Patch, PatchStatus,
+    RefineParams, probe_gamut, probe_gamut_refined, refine_gamut,
+};
 pub use sequence::{grey_ramp, parse_sequence, primary_ramps, scatter};
 pub use time::rfc3339_utc_now;
 

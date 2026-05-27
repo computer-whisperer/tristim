@@ -80,6 +80,8 @@ fn print_usage() {
     eprintln!("          --prep-secs N      seconds to wait for puck placement (default: 6)");
     eprintln!("          --window F         centered-window area fraction (default: 1.0)");
     eprintln!("          --border R,G,B     surround code values for windowed/anti-ABL use");
+    eprintln!("          --refine           adaptively subdivide the faces + detect clamping");
+    eprintln!("          --max-depth N      max subdivision depth with --refine (default: 3)");
     eprintln!("  capture --output NAME [opts]");
     eprintln!("        Run a capture session and write a tristim-capture JSON file.");
     eprintln!("        Options:");
@@ -343,11 +345,24 @@ fn cmd_gamut(args: &[String]) -> Result<(), Box<dyn Error>> {
         border,
     };
 
-    eprintln!("gamut: output={output}, format={format_spec}, {repeats} repeats/point");
+    let refine = args.iter().any(|a| a == "--refine");
+    eprintln!(
+        "gamut: output={output}, format={format_spec}, {repeats} repeats/point{}",
+        if refine { ", adaptive" } else { "" }
+    );
     eprintln!("Place the puck flat against '{output}'. Probe starts in {prep_secs}s.");
 
-    let probe = gather::probe_gamut(&config, log_gamut_event, || false)?;
-    print_gamut_summary(&probe);
+    if refine {
+        let params = gather::RefineParams {
+            max_depth: parse_opt(args, "--max-depth", 3),
+            ..Default::default()
+        };
+        let mesh = gather::probe_gamut_refined(&config, &params, log_gamut_event, || false)?;
+        print_gamut_mesh(&mesh);
+    } else {
+        let probe = gather::probe_gamut(&config, log_gamut_event, || false)?;
+        print_gamut_summary(&probe);
+    }
     Ok(())
 }
 
@@ -389,6 +404,73 @@ fn log_gamut_event(ev: gather::GamutEvent) {
             fmt_xy(measured.chromaticity().map(|(x, y)| [x, y])),
             fmt_flags(&flags),
         ),
+        Measured {
+            index,
+            code_value,
+            measured,
+            flags,
+        } => eprintln!(
+            "  [{:>3}] ({:.3},{:.3},{:.3})  Y={:>8.3}  xy={}  {}",
+            index + 1,
+            code_value[0],
+            code_value[1],
+            code_value[2],
+            measured.y,
+            fmt_xy(measured.chromaticity().map(|(x, y)| [x, y])),
+            fmt_flags(&flags),
+        ),
+    }
+}
+
+/// Print a refined-mesh summary: vertex/patch counts, the leaf-status
+/// breakdown (notably any clamped folds), the white point, and the measured
+/// RGB primary triangle vs sRGB.
+fn print_gamut_mesh(mesh: &gather::GamutMesh) {
+    use gather::PatchStatus::*;
+    println!();
+    println!(
+        "refined gamut: {} measured vertices, {} leaf patches",
+        mesh.vertices.len(),
+        mesh.patches.len()
+    );
+    println!(
+        "  {} flat, {} folded (clamped), {} max-depth, {} low-trust",
+        mesh.count(Flat),
+        mesh.count(Folded),
+        mesh.count(MaxDepth),
+        mesh.count(LowTrust),
+    );
+    for p in mesh.patches.iter().filter(|p| p.status == Folded) {
+        let v = &mesh.vertices[p.corners[0]];
+        println!(
+            "    fold on face {} near cv ({:.2},{:.2},{:.2})",
+            p.face_label(),
+            v.code_value[0],
+            v.code_value[1],
+            v.code_value[2],
+        );
+    }
+
+    if let Some((wx, wy)) = mesh.white.chromaticity() {
+        println!();
+        println!("white: xy=({wx:.4}, {wy:.4})  Y={:.2} cd/m²", mesh.white.y);
+    }
+
+    let prim = |cv: [f64; 3]| {
+        mesh.vertex_at(cv)
+            .and_then(|v| v.measured.chromaticity())
+            .map(|(x, y)| [x, y])
+    };
+    if let (Some(r), Some(g), Some(b)) = (
+        prim([1.0, 0.0, 0.0]),
+        prim([0.0, 1.0, 0.0]),
+        prim([0.0, 0.0, 1.0]),
+    ) {
+        let area = triangle_area_xy(r, g, b);
+        println!(
+            "measured RGB primary triangle (xy): area {area:.4}  ({:.0}% of sRGB)",
+            100.0 * area / SRGB_TRIANGLE_AREA,
+        );
     }
 }
 

@@ -11,4 +11,5 @@ description = "Capture orchestration for tristim: drive a colorimeter + Wayland 
 tristim-driver = { path = "../tristim-driver" }
 tristim-display = { path = "../tristim-display" }
 tristim-capture = { path = "../tristim-capture" }
+tristim-color = { path = "../tristim-color" }
 thiserror.workspace = true
