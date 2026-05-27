@@ -72,16 +72,28 @@ impl Presented {
             .min(self.analyzed.trials.len().saturating_sub(1))
     }
 
-    /// Ensure the cached 3D scene matches the focused trial and enabled
-    /// reference gamuts, rebuilding its geometry handles only when either moved.
-    fn ensure_space3d(&mut self, refs: RefSet) {
+    /// Ensure the cached 3D scene matches the focused trial, enabled reference
+    /// gamuts, and measured-shell toggle, rebuilding its handles only when any
+    /// moved.
+    fn ensure_space3d(&mut self, refs: RefSet, show_measured: bool) {
         if self.analyzed.trials.is_empty() {
             self.space3d = None;
             return;
         }
         let i = self.focused();
-        if !self.space3d.as_ref().is_some_and(|s| s.matches(i, refs)) {
-            self.space3d = Some(Space3dScene::build(&self.analyzed.trials[i], i, refs));
+        if !self
+            .space3d
+            .as_ref()
+            .is_some_and(|s| s.matches(i, refs, show_measured))
+        {
+            let gamut = self.capture.trials.get(i).and_then(|t| t.gamut.as_ref());
+            self.space3d = Some(Space3dScene::build(
+                &self.analyzed.trials[i],
+                i,
+                refs,
+                gamut,
+                show_measured,
+            ));
         }
     }
 }
@@ -287,6 +299,8 @@ pub struct PresenterApp {
     hovered_sample: Option<usize>,
     /// Which reference-gamut overlays are enabled in the 3D view.
     space3d_refs: RefSet,
+    /// Whether the measured-gamut shell overlay is enabled in the 3D view.
+    space3d_show_measured: bool,
 }
 
 impl PresenterApp {
@@ -305,6 +319,7 @@ impl PresenterApp {
             show_field: false,
             hovered_sample: None,
             space3d_refs: [false; N_REF_GAMUTS],
+            space3d_show_measured: false,
         }
     }
 
@@ -325,6 +340,7 @@ impl PresenterApp {
             show_field: false,
             hovered_sample: None,
             space3d_refs: [false; N_REF_GAMUTS],
+            space3d_show_measured: false,
         }
     }
 
@@ -372,6 +388,7 @@ impl PresenterApp {
             show_field: false,
             hovered_sample: None,
             space3d_refs: [false; N_REF_GAMUTS],
+            space3d_show_measured: false,
         }
     }
 
@@ -393,8 +410,9 @@ impl PresenterApp {
         // headless render (which never calls `before_build`) still has a scene.
         if view == Tab::Space3D {
             let refs = self.space3d_refs;
+            let show = self.space3d_show_measured;
             if let Some(p) = self.presented.as_mut() {
-                p.ensure_space3d(refs);
+                p.ensure_space3d(refs, show);
             }
         }
     }
@@ -711,6 +729,10 @@ impl PresenterApp {
                 for (gi, g) in REF_GAMUTS.iter().enumerate() {
                     heading.push(ref_toggle(g.name, g.key, self.space3d_refs[gi]));
                 }
+                // The measured-gamut shell, only when this trial was probed.
+                if p.capture.trials.get(i).is_some_and(|t| t.gamut.is_some()) {
+                    heading.push(measured_toggle(self.space3d_show_measured));
+                }
                 // The geometry handles are cached on `Presented` and refreshed
                 // in `before_build`; `None` only during a transient first frame.
                 let chart = match &p.space3d {
@@ -904,6 +926,9 @@ impl PresenterApp {
                     self.view = Tab::Luminance;
                     self.hovered_sample = None;
                 }
+                Some("measured-toggle") => {
+                    self.space3d_show_measured = !self.space3d_show_measured;
+                }
                 Some(k) if k.starts_with("ref:") => {
                     if let Some(i) = REF_GAMUTS
                         .iter()
@@ -1021,11 +1046,12 @@ impl App for PresenterApp {
         // persist across frames and the backend re-uploads nothing on orbit.
         if self.view == Tab::Space3D {
             let refs = self.space3d_refs;
+            let show = self.space3d_show_measured;
             if let Some(p) = self.presented.as_mut() {
-                p.ensure_space3d(refs);
+                p.ensure_space3d(refs, show);
             }
             if let Some(live) = self.running.as_mut().and_then(|r| r.live.as_mut()) {
-                live.ensure_space3d(refs);
+                live.ensure_space3d(refs, show);
             }
         }
     }
@@ -1064,7 +1090,7 @@ impl App for PresenterApp {
                     && let Some(route) = e.route()
                     && let FormAction::Start(cfg) = self.form.handle(route)
                 {
-                    self.launch(cfg);
+                    self.launch(*cfg);
                 }
             }
             Mode::Running => {
@@ -1154,6 +1180,12 @@ fn space_toggle(space: Space) -> El {
 /// A reference-gamut overlay toggle for the 3D view; primary when enabled.
 fn ref_toggle(name: &str, key: &str, on: bool) -> El {
     let b = button(name).key(format!("ref:{key}"));
+    if on { b.primary() } else { b.secondary() }
+}
+
+/// Toggle for the measured-gamut shell overlay in the 3D view; primary when on.
+fn measured_toggle(on: bool) -> El {
+    let b = button("measured").key("measured-toggle");
     if on { b.primary() } else { b.secondary() }
 }
 

@@ -17,8 +17,9 @@ use tristim_gather::{self as gather, CaptureConfig, KNOWN_FORMATS};
 pub enum FormAction {
     /// Nothing beyond the in-form state change already applied.
     None,
-    /// Launch a capture with this validated config.
-    Start(CaptureConfig),
+    /// Launch a capture with this validated config. Boxed — `CaptureConfig`
+    /// dwarfs the `None` variant (clippy::large_enum_variant).
+    Start(Box<CaptureConfig>),
 }
 
 struct OutputItem {
@@ -173,7 +174,7 @@ impl CaptureForm {
                 "start" => match self.build_config() {
                     Ok(cfg) => {
                         self.error = None;
-                        return FormAction::Start(cfg);
+                        return FormAction::Start(Box::new(cfg));
                     }
                     Err(e) => self.error = Some(e),
                 },

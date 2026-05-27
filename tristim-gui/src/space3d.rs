@@ -32,6 +32,7 @@ use aetna_core::scene::{
 };
 
 use tristim_analyze::{AnalyzedSample, AnalyzedTrial, GroundTruth};
+use tristim_capture::MeasuredGamut;
 use tristim_color::{ColorSpace, mat3_mul_vec, metrics, transfer};
 
 /// A standard colour space the 3D view can outline as a reference overlay,
@@ -90,8 +91,11 @@ pub struct Space3dScene {
     point_labels: PointLabels,
     /// `expected → measured` displacement per scorable sample.
     vectors: LinesHandle,
-    /// All gamut cages (target + enabled references), per-segment coloured.
+    /// All gamut cages (target + enabled references + the measured shell when
+    /// enabled), per-segment coloured.
     gamut: LinesHandle,
+    /// Whether the measured-gamut shell overlay is included — half the cache key.
+    show_measured: bool,
     /// One label-anchor point per cage, at its green primary.
     gamut_label_geo: PointsHandle,
     /// Persistent cage name labels, aligned with `gamut_label_geo`.
@@ -102,13 +106,20 @@ pub struct Space3dScene {
 
 impl Space3dScene {
     /// Whether these cached handles still match the requested view.
-    pub fn matches(&self, trial: usize, refs: RefSet) -> bool {
-        self.trial == trial && self.refs == refs
+    pub fn matches(&self, trial: usize, refs: RefSet, show_measured: bool) -> bool {
+        self.trial == trial && self.refs == refs && self.show_measured == show_measured
     }
 
     /// Build the cached geometry for `trial` (index `idx`) with the given
-    /// reference-gamut overlays enabled.
-    pub fn build(trial: &AnalyzedTrial, idx: usize, refs: RefSet) -> Self {
+    /// reference-gamut overlays enabled. When `show_measured` and `measured` is
+    /// present, the probed gamut shell is overlaid in the same Lab frame.
+    pub fn build(
+        trial: &AnalyzedTrial,
+        idx: usize,
+        refs: RefSet,
+        measured: Option<&MeasuredGamut>,
+        show_measured: bool,
+    ) -> Self {
         // Reference white the analyzer placed samples against; 0 ⇒ unscored.
         let white = trial.reference_white_xyz;
         let white_y = white.map_or(0.0, |w| w[1]);
@@ -169,6 +180,19 @@ impl Space3dScene {
                     );
                 }
             }
+
+            // The measured gamut shell: the *actual* probed boundary, drawn in
+            // the same Lab frame so drift from the ideal cages reads directly.
+            if let Some(g) = measured.filter(|_| show_measured) {
+                cage.extend(measured_cage(g, white_xyz));
+                if let Some(green) = g.vertices.iter().find(|v| v.code_value == [0.0, 1.0, 0.0]) {
+                    anchor_pts.push(ScenePoint {
+                        position: lab_to_world(metrics::xyz_to_lab(green.xyz, white_xyz)),
+                        color: MEASURED_CAGE_COLOR,
+                    });
+                    anchor_txt.push("measured".to_string());
+                }
+            }
         }
 
         let has_data = !points.is_empty();
@@ -179,6 +203,7 @@ impl Space3dScene {
             point_labels: PointLabels::new(labels).on_hover(),
             vectors: LinesHandle::new(LineData { segments: vectors }),
             gamut: LinesHandle::new(LineData { segments: cage }),
+            show_measured,
             gamut_label_geo: PointsHandle::new(PointData { points: anchor_pts }),
             gamut_labels: PointLabels::new(anchor_txt)
                 .always()
@@ -274,6 +299,10 @@ pub fn space_legend() -> El {
                 "cages",
                 "gamut bounds — the trial's space (· target) plus any reference gamuts enabled above",
             ),
+            legend_row(
+                "measured",
+                "the probed gamut shell, when enabled (hot edges = clamped/folded regions)",
+            ),
             text("Drag to orbit · shift-drag to pan · wheel to zoom · hover a dot for ΔE.")
                 .muted()
                 .font_size(12.0)
@@ -284,7 +313,8 @@ pub fn space_legend() -> El {
 
 fn legend_row(head: &str, body: &str) -> El {
     row([
-        text(head).font_size(12.0).width(Size::Fixed(44.0)),
+        // Wide enough for the longest head ("measured").
+        text(head).font_size(12.0).width(Size::Fixed(68.0)),
         // Fill the remaining row width so a long description wraps within the
         // card instead of overflowing it.
         text(body)
@@ -305,6 +335,12 @@ const VECTOR_COLOR: [f32; 4] = [0.92, 0.93, 0.97, 0.55];
 /// The trial's own (target) gamut cage: a bright neutral, brighter than the
 /// coloured reference overlays so the target reads as primary.
 const TARGET_CAGE_COLOR: [f32; 4] = [0.86, 0.89, 0.96, 0.55];
+/// The measured gamut shell (probed cube-surface wireframe): a distinct magenta
+/// so it reads against both the neutral target cage and the coloured references.
+const MEASURED_CAGE_COLOR: [f32; 4] = [0.93, 0.45, 0.85, 0.7];
+/// Clamped (folded) patches of the measured shell — where pushing the code value
+/// stopped moving the measurement; drawn hotter to flag the boundary it hit.
+const MEASURED_FOLD_COLOR: [f32; 4] = [1.0, 0.4, 0.25, 0.9];
 /// Subdivisions per gamut-cube edge (edges curve in Lab).
 const GAMUT_SEGMENTS: usize = 16;
 
@@ -382,6 +418,35 @@ fn add_cage(
         color,
     });
     anchor_txt.push(name);
+}
+
+/// The measured gamut shell: each refined leaf patch drawn as a quad outline in
+/// the trial's Lab frame, with folded (clamped) patches flagged hotter. This is
+/// the *actual* probed boundary surface, to read against the ideal cages.
+fn measured_cage(gamut: &MeasuredGamut, white_xyz: [f64; 3]) -> Vec<LineSegment> {
+    let world: Vec<Vec3> = gamut
+        .vertices
+        .iter()
+        .map(|v| lab_to_world(metrics::xyz_to_lab(v.xyz, white_xyz)))
+        .collect();
+    let mut out = Vec::new();
+    for p in &gamut.patches {
+        let color = if p.status == "folded" {
+            MEASURED_FOLD_COLOR
+        } else {
+            MEASURED_CAGE_COLOR
+        };
+        // The quad's 4 edges (corners are stored CCW).
+        for k in 0..4 {
+            let (Some(&start), Some(&end)) =
+                (world.get(p.corners[k]), world.get(p.corners[(k + 1) % 4]))
+            else {
+                continue;
+            };
+            out.push(LineSegment { start, end, color });
+        }
+    }
+    out
 }
 
 /// The 12 edges of the colour space's RGB cube, each subdivided and mapped into
@@ -480,10 +545,11 @@ mod tests {
             reference_white_xyz: Some(white_xyz),
         };
 
-        let scene = Space3dScene::build(&trial, 3, [false; N_REF_GAMUTS]);
+        let scene = Space3dScene::build(&trial, 3, [false; N_REF_GAMUTS], None, false);
         assert_eq!(scene.trial, 3);
-        assert!(scene.matches(3, [false; N_REF_GAMUTS]));
-        assert!(!scene.matches(3, [true, false, false]));
+        assert!(scene.matches(3, [false; N_REF_GAMUTS], false));
+        assert!(!scene.matches(3, [true, false, false], false));
+        assert!(!scene.matches(3, [false; N_REF_GAMUTS], true));
         assert!(scene.has_data);
 
         let (pts, _) = scene.points.snapshot();
@@ -540,7 +606,7 @@ mod tests {
         };
 
         // Display P3 overlay on (index 1): target + P3 = two cages, two labels.
-        let p3 = Space3dScene::build(&trial, 0, [false, true, false]);
+        let p3 = Space3dScene::build(&trial, 0, [false, true, false], None, false);
         assert_eq!(
             p3.gamut.snapshot().0.segments.len(),
             2 * 12 * GAMUT_SEGMENTS
@@ -548,9 +614,68 @@ mod tests {
         assert_eq!(p3.gamut_label_geo.snapshot().0.points.len(), 2);
 
         // sRGB overlay on (index 0) == target: deduped to one cage.
-        let srgb = Space3dScene::build(&trial, 0, [true, false, false]);
+        let srgb = Space3dScene::build(&trial, 0, [true, false, false], None, false);
         assert_eq!(srgb.gamut.snapshot().0.segments.len(), 12 * GAMUT_SEGMENTS);
         assert_eq!(srgb.gamut_label_geo.snapshot().0.points.len(), 1);
+    }
+
+    /// The measured-shell overlay adds patch-outline segments + a "measured"
+    /// label only when enabled, and flags folded patches in the hot colour.
+    #[test]
+    fn measured_shell_overlay_adds_when_enabled() {
+        use tristim_capture::{GamutPatch, GamutVertex, MeasuredGamut};
+        let white_xyz = ColorSpace::SRGB.white_xyz();
+        let trial = AnalyzedTrial {
+            pixel_format: "xrgb8888".into(),
+            ground_truth: GroundTruth::Known {
+                space: ColorSpace::SRGB,
+                transfer: "srgb".into(),
+                absolute: false,
+                source: GroundTruthSource::Negotiated,
+            },
+            samples: vec![sample(
+                [0.95, 1.0, 1.09],
+                [100.0, 0.0, 0.0],
+                [100.0, 0.0, 0.0],
+                0.0,
+            )],
+            summary: None,
+            reference_white_xyz: Some(white_xyz),
+        };
+        let v = |cv: [f64; 3], xyz: [f64; 3]| GamutVertex {
+            code_value: cv,
+            xyz,
+            lab: [0.0; 3],
+            trustworthy: true,
+        };
+        let gamut = MeasuredGamut {
+            white_xyz,
+            vertices: vec![
+                v([0.0, 0.0, 0.0], [0.1, 0.1, 0.1]),
+                v([1.0, 0.0, 0.0], [40.0, 20.0, 2.0]),
+                v([0.0, 1.0, 0.0], [35.0, 70.0, 12.0]),
+                v([0.0, 0.0, 1.0], [18.0, 7.0, 95.0]),
+            ],
+            patches: vec![GamutPatch {
+                face: "R=1".into(),
+                corners: [0, 1, 2, 3],
+                status: "folded".into(),
+            }],
+        };
+
+        // Off: the gamut is present but not drawn — target cage + its one label.
+        let off = Space3dScene::build(&trial, 0, [false; N_REF_GAMUTS], Some(&gamut), false);
+        let off_segs = off.gamut.snapshot().0.segments.len();
+        assert_eq!(off.gamut_label_geo.snapshot().0.points.len(), 1);
+
+        // On: +4 patch-edge segments and a "measured" label anchor.
+        let on = Space3dScene::build(&trial, 0, [false; N_REF_GAMUTS], Some(&gamut), true);
+        let (segs, _) = on.gamut.snapshot();
+        assert_eq!(segs.segments.len(), off_segs + 4);
+        assert_eq!(on.gamut_label_geo.snapshot().0.points.len(), 2);
+        assert_eq!(on.gamut_labels.get(1), Some("measured"));
+        // The folded patch is drawn in the hot fold colour.
+        assert!(segs.segments.iter().any(|s| s.color == MEASURED_FOLD_COLOR));
     }
 
     /// An unscored trial (no reference white / no Lab) yields an empty scene
@@ -577,7 +702,7 @@ mod tests {
             summary: None,
             reference_white_xyz: None,
         };
-        let scene = Space3dScene::build(&trial, 0, [true, true, true]);
+        let scene = Space3dScene::build(&trial, 0, [true, true, true], None, false);
         assert!(!scene.has_data);
         assert_eq!(scene.points.snapshot().0.points.len(), 0);
         // No reference white ⇒ no Lab frame ⇒ no cages even with overlays on.
