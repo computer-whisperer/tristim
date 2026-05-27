@@ -48,6 +48,13 @@ pub struct CaptureForm {
     settle_ms: u64,
     prep_secs: u64,
     window_pct: u32,
+    /// Probe each format's reproduced gamut before its sweep, recording it and
+    /// constraining scatter to it.
+    probe_gamut: bool,
+    /// Repeated measurements per gamut-probe point.
+    gamut_repeats: usize,
+    /// Adaptive-refinement depth cap for the gamut probe.
+    gamut_max_depth: u32,
     /// Last validation / enumeration error, shown beneath the form.
     error: Option<String>,
 }
@@ -94,6 +101,9 @@ impl CaptureForm {
             settle_ms: 250,
             prep_secs: 6,
             window_pct: 100,
+            probe_gamut: false,
+            gamut_repeats: 8,
+            gamut_max_depth: 3,
             error: None,
         }
     }
@@ -101,6 +111,12 @@ impl CaptureForm {
     /// Record a validation/run error to show beneath the form.
     pub fn set_error(&mut self, msg: String) {
         self.error = Some(msg);
+    }
+
+    /// Enable/disable the gamut-probe controls. Used by the headless dump to
+    /// lint the expanded setup layout (the repeats/depth steppers row).
+    pub fn set_probe_gamut(&mut self, on: bool) {
+        self.probe_gamut = on;
     }
 
     /// Re-enumerate the compositor's outputs (a quick Wayland roundtrip).
@@ -171,6 +187,11 @@ impl CaptureForm {
                 "window:dec" => self.window_pct = self.window_pct.saturating_sub(5).max(5),
                 "cal:inc" => self.cal_index = (self.cal_index + 1).min(15),
                 "cal:dec" => self.cal_index = self.cal_index.saturating_sub(1),
+                "gamut:toggle" => self.probe_gamut = !self.probe_gamut,
+                "gamut-rep:inc" => self.gamut_repeats = (self.gamut_repeats + 1).min(64),
+                "gamut-rep:dec" => self.gamut_repeats = self.gamut_repeats.saturating_sub(1).max(1),
+                "gamut-depth:inc" => self.gamut_max_depth = (self.gamut_max_depth + 1).min(5),
+                "gamut-depth:dec" => self.gamut_max_depth = self.gamut_max_depth.saturating_sub(1),
                 "start" => match self.build_config() {
                     Ok(cfg) => {
                         self.error = None;
@@ -202,15 +223,36 @@ impl CaptureForm {
             return Err("enable at least one format".into());
         }
 
+        // Grey/primaries are the fixed sequence; scatter is split into a request
+        // so it's generated per-format — and, when probing, constrained to the
+        // measured gamut (matching the CLI).
         let mut sequence = Vec::new();
+        let mut scatter_count = 0;
         for s in &self.seqs {
-            if s.on {
+            if !s.on {
+                continue;
+            }
+            if s.name == "scatter" {
+                scatter_count += s.count;
+            } else {
                 sequence.extend(gather::parse_sequence(&format!("{}:{}", s.name, s.count))?);
             }
         }
-        if sequence.is_empty() {
+        if sequence.is_empty() && scatter_count == 0 {
             return Err("enable at least one sequence".into());
         }
+        let scatter = (scatter_count > 0).then_some(gather::ScatterRequest {
+            count: scatter_count,
+            seed: gather::SCATTER_SEED,
+        });
+
+        let gamut = self.probe_gamut.then(|| gather::GamutProbeOpts {
+            repeats: self.gamut_repeats,
+            refine: gather::RefineParams {
+                max_depth: self.gamut_max_depth,
+                ..Default::default()
+            },
+        });
 
         Ok(CaptureConfig {
             output,
@@ -221,27 +263,41 @@ impl CaptureForm {
             border: None,
             formats,
             sequence,
-            // Scatter stays in `sequence` here, and the gamut-probe prerequisite
-            // isn't wired into the GUI form yet, so neither is set.
-            scatter: None,
-            gamut: None,
+            scatter,
+            gamut,
         })
     }
 
-    /// (total measurements, rough estimated seconds) for the current selection.
+    /// (total sweep measurements, rough estimated seconds) for the current
+    /// selection. The gamut probe's points aren't sweep samples, but their time
+    /// is folded into the estimate.
     fn preview(&self) -> (usize, u64) {
         let fmts = self.formats.iter().filter(|f| f.on).count();
         let seq_len: usize = self
             .seqs
             .iter()
             .filter(|s| s.on)
-            .filter_map(|s| gather::parse_sequence(&format!("{}:{}", s.name, s.count)).ok())
-            .map(|v| v.len())
+            .map(|s| {
+                if s.name == "scatter" {
+                    s.count
+                } else {
+                    gather::parse_sequence(&format!("{}:{}", s.name, s.count))
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                }
+            })
             .sum();
         let count = fmts * seq_len;
         // Per-patch cost ≈ settle + a fixed measurement overhead.
         let per = self.settle_ms as f64 / 1000.0 + 0.4;
-        let est = self.prep_secs + (count as f64 * per) as u64;
+        // Gamut probe: roughly ~25 adaptive points per format, each a burst of
+        // `repeats` reads (~0.7 s) after the settle.
+        let gamut_secs = if self.probe_gamut {
+            (fmts * 25) as f64 * (self.settle_ms as f64 / 1000.0 + self.gamut_repeats as f64 * 0.7)
+        } else {
+            0.0
+        };
+        let est = self.prep_secs + (count as f64 * per) as u64 + gamut_secs as u64;
         (count, est)
     }
 
@@ -251,7 +307,12 @@ impl CaptureForm {
         let plan = if count == 0 {
             "nothing selected".to_string()
         } else {
-            format!("{count} measurements · ~{}", fmt_dur(est))
+            let probe = if self.probe_gamut {
+                " + gamut probe"
+            } else {
+                ""
+            };
+            format!("{count} measurements{probe} · ~{}", fmt_dur(est))
         };
 
         let mut rows = vec![
@@ -282,6 +343,7 @@ impl CaptureForm {
                 "Cal index",
                 stepper(format!("{}", self.cal_index), "cal:dec", "cal:inc"),
             ),
+            field("Gamut probe", self.gamut_view()),
             divider(),
             row([
                 text(plan).muted().font_size(12.0),
@@ -369,6 +431,59 @@ impl CaptureForm {
             })
             .collect();
         column(rows).gap(tokens::SPACE_2)
+    }
+
+    /// The gamut-probe controls: an on/off toggle, and — when on — the repeats
+    /// and refinement-depth steppers.
+    fn gamut_view(&self) -> El {
+        let toggle = {
+            let b = button(if self.probe_gamut { "on" } else { "off" }).key("gamut:toggle");
+            if self.probe_gamut {
+                b.primary()
+            } else {
+                b.secondary()
+            }
+        };
+        let mut items = vec![
+            row([
+                toggle,
+                text("probe each format's reproduced gamut first; constrains scatter to it")
+                    .muted()
+                    .font_size(12.0)
+                    .wrap_text()
+                    .width(Size::Fill(1.0)),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fill(1.0)),
+        ];
+        if self.probe_gamut {
+            items.push(
+                row([
+                    text("repeats")
+                        .muted()
+                        .font_size(12.0)
+                        .width(Size::Fixed(56.0)),
+                    stepper(
+                        format!("{}", self.gamut_repeats),
+                        "gamut-rep:dec",
+                        "gamut-rep:inc",
+                    ),
+                    text("depth")
+                        .muted()
+                        .font_size(12.0)
+                        .width(Size::Fixed(48.0)),
+                    stepper(
+                        format!("{}", self.gamut_max_depth),
+                        "gamut-depth:dec",
+                        "gamut-depth:inc",
+                    ),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+            );
+        }
+        column(items).gap(tokens::SPACE_2).width(Size::Fill(1.0))
     }
 }
 

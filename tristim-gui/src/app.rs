@@ -444,6 +444,12 @@ impl PresenterApp {
         self.show_field = on;
     }
 
+    /// Enable the setup form's gamut-probe controls. Used by the headless dump
+    /// to lint the expanded setup layout.
+    pub fn set_setup_probe_gamut(&mut self, on: bool) {
+        self.form.set_probe_gamut(on);
+    }
+
     /// Spawn the capture on a background thread and switch to Running. Progress
     /// flows back over a channel drained in [`Self::before_build`].
     fn launch(&mut self, cfg: CaptureConfig) {

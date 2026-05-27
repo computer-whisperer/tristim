@@ -84,6 +84,10 @@ fn main() -> ExitCode {
     // roundtrip); without a compositor the list is just empty, which still
     // exercises the form layout.
     let setup_app = PresenterApp::setup();
+    // And the same form with the gamut-probe controls expanded (the
+    // repeats/depth steppers row only renders when probing is on).
+    let mut setup_gamut_app = PresenterApp::setup();
+    setup_gamut_app.set_setup_probe_gamut(true);
     // And the live running view (progress strip + live plots), reusing the
     // capture as if it were mid-run.
     let running_app = PresenterApp::debug_running(capture.clone());
@@ -99,7 +103,11 @@ fn main() -> ExitCode {
             emit(&bundle, &out_dir, name)
         };
 
-        for (probe, tag) in [(&setup_app, "setup"), (&running_app, "running")] {
+        for (probe, tag) in [
+            (&setup_app, "setup"),
+            (&setup_gamut_app, "setup-gamut"),
+            (&running_app, "running"),
+        ] {
             match render(probe, &format!("{tag}-{}w", vw as u32)) {
                 Ok(n) => total_findings += n,
                 Err(e) => {
