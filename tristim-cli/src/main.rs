@@ -25,7 +25,7 @@ use tristim_analyze::{GroundTruth, GroundTruthSource, analyze};
 use tristim_capture as cap;
 use tristim_display::{PatchSurface, list_outputs};
 use tristim_driver::Colorimeter;
-use tristim_driver::measurement::{Calibration, RawMeasurement, Setup, raw_to_xyz};
+use tristim_driver::measurement::{Calibration, RawMeasurement, Setup, Xyz, raw_to_xyz};
 use tristim_gather as gather;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -235,10 +235,12 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
     // floor_s = how many noise-σ the dimmest *signal* channel sits above its
     // black-cal floor (s5). Small ⇒ the max(0, raw−s5) clamp is biting and the
     // reading is untrustworthy. sY/Y folds in the ±½-count quantization floor
-    // that bare repeat-variance hides at low light. flags mark both regimes.
+    // that bare repeat-variance hides at low light; d_uv is the same idea for
+    // chromaticity (Δu'v'), which degrades far faster toward black. flags mark
+    // the floor regime, high luminance noise (NOISY), and coarse color (DUV).
     println!(
-        "{:>7}  {:>10}  {:>9}  {:>7}  {:>8}  flags",
-        "cv", "Y(cd/m²)", "sigmaY", "sY/Y", "floor_s",
+        "{:>7}  {:>10}  {:>7}  {:>8}  {:>8}  flags",
+        "cv", "Y(cd/m²)", "sY/Y", "d_uv", "floor_s",
     );
     let auto_zero = !burst;
     for &cv in &levels {
@@ -248,11 +250,11 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
         let raws = device.measure_raw_repeated(&setup, repeats, auto_zero)?;
         let st = LevelStats::compute(cv, &raws, &setup, &cal);
         println!(
-            "{:>7.4}  {:>10.3}  {:>9.4}  {:>6.1}%  {:>8.1}  {}",
+            "{:>7.4}  {:>10.3}  {:>6.1}%  {:>8}  {:>8.1}  {}",
             st.cv,
             st.y_mean,
-            st.y_std(),
             st.rel_noise_pct(),
+            fmt_duv(st.uv_std()),
             st.min_floor_sigma,
             st.flags(),
         );
@@ -311,6 +313,13 @@ struct LevelStats {
     /// reported uncertainty [`y_std`](Self::y_std) combines them in quadrature.
     y_repeat_std: f64,
     y_quant_std: f64,
+    /// Chromaticity (u'v') uncertainty split: temporal repeat scatter and the
+    /// quantization floor (½-count per signal channel propagated through the
+    /// nonlinear u'v' map). `chroma_defined` is false at true black, where
+    /// chromaticity has no meaning.
+    uv_temporal: f64,
+    uv_quant: f64,
+    chroma_defined: bool,
 }
 
 impl LevelStats {
@@ -352,22 +361,77 @@ impl LevelStats {
             min_floor_sigma = 0.0; // nothing above the floor — we're measuring it
         }
 
-        // Y from the full pipeline per repeat → temporal σ.
-        let ys: Vec<f64> = raws.iter().map(|r| raw_to_xyz(r, setup, cal).y).collect();
+        // Full raw→XYZ pipeline per repeat, reused for luminance and chromaticity.
+        let xyzs: Vec<Xyz> = raws.iter().map(|r| raw_to_xyz(r, setup, cal)).collect();
+        let ys: Vec<f64> = xyzs.iter().map(|p| p.y).collect();
         let y_mean = mean(&ys);
         let y_repeat_std = sample_std(&ys, y_mean);
+        let x_mean = mean(&xyzs.iter().map(|p| p.x).collect::<Vec<_>>());
+        let z_mean = mean(&xyzs.iter().map(|p| p.z).collect::<Vec<_>>());
 
-        // Quantization floor on Y: ±½-count on each signal channel, propagated
-        // through the Y row of the calibration matrix (with its gain). Repeats
-        // can't reveal this when the integer counts happen to agree.
+        // A ½-count quantum on channel `ch` displaces XYZ along that channel's
+        // matrix column (× gain) — the gradient ∂XYZ/∂count_ch. Used for both
+        // the Y floor and (through the nonlinear u'v' map) the chromaticity floor.
+        let xyz_grad = |ch: usize| {
+            (
+                cal.matrix[0][ch] * cal.gain[0],
+                cal.matrix[1][ch] * cal.gain[1],
+                cal.matrix[2][ch] * cal.gain[2],
+            )
+        };
+
+        // Quantization floor on Y: the quantum on each signal channel through
+        // the Y gradient. Repeats can't reveal this when the counts agree.
         let mut quant_var = 0.0;
         for (ch, &signal) in is_signal.iter().enumerate() {
             if signal {
-                let w = cal.matrix[1][ch] * cal.gain[1];
-                quant_var += (w * QUANT_SIGMA).powi(2);
+                let (_, gy, _) = xyz_grad(ch);
+                quant_var += (gy * QUANT_SIGMA).powi(2);
             }
         }
         let y_quant_std = quant_var.sqrt();
+
+        // Chromaticity (u'v') uncertainty — the low-light color-precision story.
+        // Temporal: RMS scatter of the per-repeat u'v' points about their mean.
+        // Quantization: each signal channel's quantum nudges XYZ, and the u'v'
+        // displacement is summed in quadrature. This is what blows up near black
+        // — a fixed XYZ wobble swings the ratios that define chromaticity far
+        // more when X+Y+Z is small. Combined the same way as Y.
+        let (uv_temporal, uv_quant, chroma_defined) = match uv_prime(x_mean, y_mean, z_mean) {
+            None => (0.0, 0.0, false),
+            Some((u0, v0)) => {
+                let uvs: Vec<(f64, f64)> = xyzs
+                    .iter()
+                    .filter_map(|p| uv_prime(p.x, p.y, p.z))
+                    .collect();
+                let uv_temporal = if uvs.len() >= 2 {
+                    let n = uvs.len();
+                    let um = uvs.iter().map(|p| p.0).sum::<f64>() / n as f64;
+                    let vm = uvs.iter().map(|p| p.1).sum::<f64>() / n as f64;
+                    let ss: f64 = uvs
+                        .iter()
+                        .map(|&(u, v)| (u - um).powi(2) + (v - vm).powi(2))
+                        .sum();
+                    (ss / (n - 1) as f64).sqrt()
+                } else {
+                    0.0
+                };
+                let mut quant_uv_var = 0.0;
+                for (ch, &signal) in is_signal.iter().enumerate() {
+                    if signal {
+                        let (gx, gy, gz) = xyz_grad(ch);
+                        if let Some((u1, v1)) = uv_prime(
+                            x_mean + gx * QUANT_SIGMA,
+                            y_mean + gy * QUANT_SIGMA,
+                            z_mean + gz * QUANT_SIGMA,
+                        ) {
+                            quant_uv_var += (u1 - u0).powi(2) + (v1 - v0).powi(2);
+                        }
+                    }
+                }
+                (uv_temporal, quant_uv_var.sqrt(), true)
+            }
+        };
 
         LevelStats {
             cv,
@@ -381,12 +445,22 @@ impl LevelStats {
             y_mean,
             y_repeat_std,
             y_quant_std,
+            uv_temporal,
+            uv_quant,
+            chroma_defined,
         }
     }
 
     /// Combined Y uncertainty: temporal repeat noise ⊕ quantization floor.
     fn y_std(&self) -> f64 {
         self.y_repeat_std.hypot(self.y_quant_std)
+    }
+
+    /// Combined chromaticity uncertainty Δu'v': temporal ⊕ quantization. `None`
+    /// when chromaticity is undefined (true black).
+    fn uv_std(&self) -> Option<f64> {
+        self.chroma_defined
+            .then(|| self.uv_temporal.hypot(self.uv_quant))
     }
 
     /// Relative luminance uncertainty σY/Y as a percentage; `inf` at true black.
@@ -409,12 +483,25 @@ impl LevelStats {
         if self.rel_noise_pct() > 5.0 {
             f.push("NOISY");
         }
+        // Chromaticity uncertainty past a roughly-perceptible Δu'v' (~0.003).
+        if self.uv_std().is_some_and(|d| d > 0.003) {
+            f.push("DUV");
+        }
         if f.is_empty() {
             "ok".into()
         } else {
             f.join(",")
         }
     }
+}
+
+/// CIE 1976 u'v' chromaticity from XYZ; `None` when `X + 15Y + 3Z ≤ 0` (black).
+fn uv_prime(x: f64, y: f64, z: f64) -> Option<(f64, f64)> {
+    let d = x + 15.0 * y + 3.0 * z;
+    if d <= 0.0 {
+        return None;
+    }
+    Some((4.0 * x / d, 9.0 * y / d))
 }
 
 fn mean(v: &[f64]) -> f64 {
@@ -432,6 +519,14 @@ fn sample_std(v: &[f64], mean: f64) -> f64 {
     }
     let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (v.len() - 1) as f64;
     var.sqrt()
+}
+
+/// Format a Δu'v' uncertainty for the table; `—` when undefined (true black).
+fn fmt_duv(d: Option<f64>) -> String {
+    match d {
+        Some(d) if d.is_finite() => format!("{d:.5}"),
+        _ => "—".into(),
+    }
 }
 
 // ── report ──────────────────────────────────────────────────────────────────
@@ -768,6 +863,57 @@ mod tests {
             "no channel should count as signal at the floor"
         );
         assert!(st.flags().contains("FLOOR"));
+    }
+
+    #[test]
+    fn uv_prime_known_point() {
+        // Equal-energy white (X=Y=Z) → u'=4/19, v'=9/19.
+        let (u, v) = uv_prime(1.0, 1.0, 1.0).unwrap();
+        assert!((u - 4.0 / 19.0).abs() < 1e-12);
+        assert!((v - 9.0 / 19.0).abs() < 1e-12);
+        assert!(uv_prime(0.0, 0.0, 0.0).is_none());
+    }
+
+    /// The chromaticity quantization floor must rise as the signal drops: the
+    /// same ½-count quantum swings u'v' far more when X+Y+Z is small. Same
+    /// chromaticity, 10× dimmer ⇒ markedly larger Δu'v'.
+    #[test]
+    fn chromaticity_uncertainty_grows_toward_black() {
+        let cal = xyz_passthrough_cal();
+        let setup = setup_with_floor([0; 6]);
+        // Stable repeats (no temporal spread) so we isolate the quant floor.
+        let bright = vec![RawMeasurement([100, 90, 80, 0, 0, 0]); 4];
+        let dark = vec![RawMeasurement([10, 9, 8, 0, 0, 0]); 4];
+        let b = LevelStats::compute(1.0, &bright, &setup, &cal)
+            .uv_std()
+            .unwrap();
+        let d = LevelStats::compute(0.01, &dark, &setup, &cal)
+            .uv_std()
+            .unwrap();
+        assert!(b > 0.0 && d > 0.0);
+        assert!(
+            d > 2.0 * b,
+            "chromaticity floor should climb toward black (bright {b}, dark {d})"
+        );
+    }
+
+    /// Channels map straight to X/Y/Z (ch0→X, ch1→Y, ch2→Z) so chromaticity
+    /// is well-defined and exercised in tests.
+    fn xyz_passthrough_cal() -> Calibration {
+        let mut matrix = [[0.0; 6]; 3];
+        matrix[0][0] = 1.0;
+        matrix[1][1] = 1.0;
+        matrix[2][2] = 1.0;
+        Calibration {
+            index: 0,
+            v1: 0,
+            v2: 0,
+            v4: [0; 6],
+            matrix,
+            gain: [1.0; 3],
+            offset: [0.0; 3],
+            v3: 0,
+        }
     }
 
     fn unit_cal() -> Calibration {
