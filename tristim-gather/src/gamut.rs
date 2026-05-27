@@ -308,6 +308,18 @@ pub enum PatchStatus {
     LowTrust,
 }
 
+impl PatchStatus {
+    /// Stable string for the capture schema.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PatchStatus::Flat => "flat",
+            PatchStatus::Folded => "folded",
+            PatchStatus::MaxDepth => "max_depth",
+            PatchStatus::LowTrust => "low_trust",
+        }
+    }
+}
+
 /// A measured boundary vertex: the code value we asked for and what came back.
 #[derive(Debug, Clone, Copy)]
 pub struct MeshVertex {
@@ -351,6 +363,32 @@ impl GamutMesh {
     /// The measured vertex for an exact code value, if it was probed.
     pub fn vertex_at(&self, cv: [f64; 3]) -> Option<&MeshVertex> {
         self.vertices.iter().find(|v| v.code_value == cv)
+    }
+
+    /// Convert to the serializable capture-schema form.
+    pub fn to_capture(&self) -> cap::MeasuredGamut {
+        cap::MeasuredGamut {
+            white_xyz: [self.white.x, self.white.y, self.white.z],
+            vertices: self
+                .vertices
+                .iter()
+                .map(|v| cap::GamutVertex {
+                    code_value: v.code_value,
+                    xyz: [v.measured.x, v.measured.y, v.measured.z],
+                    lab: v.lab,
+                    trustworthy: v.trustworthy,
+                })
+                .collect(),
+            patches: self
+                .patches
+                .iter()
+                .map(|p| cap::GamutPatch {
+                    face: p.face_label(),
+                    corners: p.corners,
+                    status: p.status.as_str().to_string(),
+                })
+                .collect(),
+        }
     }
 }
 

@@ -93,6 +93,11 @@ fn print_usage() {
     eprintln!("          --border R,G,B     surround code values for windowed/anti-CABL use");
     eprintln!("          --format SPEC      color format to negotiate (repeatable, >=1 required)");
     eprintln!("          --seq SPEC         color sequence to run (repeatable, >=1 required)");
+    eprintln!(
+        "          --probe-gamut      probe each format's gamut first, record it on the trial"
+    );
+    eprintln!("          --gamut-repeats N  repeats per gamut probe point (default: 8)");
+    eprintln!("          --gamut-max-depth N  gamut refinement depth (default: 3)");
     eprintln!();
     eprintln!("        --format SPEC (name[:k=v,...]):");
     eprintln!("          unmanaged                      plain 8-bit buffer, no description");
@@ -684,6 +689,19 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
         sequence.extend(gather::parse_sequence(s)?);
     }
 
+    // Optional per-format gamut-probe prerequisite.
+    let gamut = if args.iter().any(|a| a == "--probe-gamut") {
+        Some(gather::GamutProbeOpts {
+            repeats: parse_opt(args, "--gamut-repeats", 8),
+            refine: gather::RefineParams {
+                max_depth: parse_opt(args, "--gamut-max-depth", 3),
+                ..Default::default()
+            },
+        })
+    } else {
+        None
+    };
+
     let config = gather::CaptureConfig {
         output: output.clone(),
         cal_index,
@@ -693,12 +711,18 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
         border,
         formats,
         sequence,
+        gamut,
     };
 
     eprintln!(
-        "capture: output={output}, {} formats, {} samples/format, window={window_fraction}, -> {out_path}",
+        "capture: output={output}, {} formats, {} samples/format, window={window_fraction}{}, -> {out_path}",
         config.formats.len(),
         config.sequence.len(),
+        if config.gamut.is_some() {
+            ", gamut probe"
+        } else {
+            ""
+        },
     );
     eprintln!("Place the puck flat against '{output}'. Capture starts in {prep_secs}s.");
 
@@ -739,6 +763,9 @@ fn log_event(ev: &gather::GatherEvent, seq_len: usize) {
             }
             cap::Negotiation::Unmanaged => eprintln!("  unmanaged buffer (assumed sRGB)"),
         },
+        GamutProbed {
+            vertices, folds, ..
+        } => eprintln!("  gamut probed: {vertices} vertices, {folds} folds (clamped)"),
         Sample { index, sample, .. } => {
             let cv = sample.requested;
             let xyz = sample.measured.xyz;

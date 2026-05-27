@@ -220,6 +220,8 @@ impl CaptureForm {
             border: None,
             formats,
             sequence,
+            // Gamut-probe prerequisite isn't wired into the GUI form yet.
+            gamut: None,
         })
     }
 

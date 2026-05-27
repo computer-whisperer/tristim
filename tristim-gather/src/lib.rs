@@ -33,8 +33,10 @@ use std::time::Duration;
 use thiserror::Error;
 use tristim_capture as cap;
 use tristim_display::{self as display, DescriptionState, PatchSurface, list_outputs};
-use tristim_driver::Colorimeter;
 use tristim_driver::measurement::raw_to_xyz;
+use tristim_driver::{Colorimeter, MeasurementConfidence};
+
+use crate::gamut::ProbeSample;
 
 /// Everything a capture run needs. Built by a frontend (CLI args or the GUI
 /// form) from the shared [`parse_format`] / [`parse_sequence`] helpers.
@@ -56,6 +58,20 @@ pub struct CaptureConfig {
     pub formats: Vec<FormatSpec>,
     /// Code-value triples every format steps through (flattened sequences).
     pub sequence: Vec<[f64; 3]>,
+    /// If set, probe each format's reproduced gamut (on the same surface,
+    /// before its sweep) and record it on the trial.
+    pub gamut: Option<GamutProbeOpts>,
+}
+
+/// Options for the optional per-format gamut-probe prerequisite of a capture.
+/// The output, format, settle, and window come from the [`CaptureConfig`]; this
+/// adds only the measurement depth.
+#[derive(Debug, Clone)]
+pub struct GamutProbeOpts {
+    /// Repeated measurements per probe point (burst within a point).
+    pub repeats: usize,
+    /// Adaptive-refinement thresholds.
+    pub refine: RefineParams,
 }
 
 /// Progress reported by [`run_capture`] as it proceeds. Owned data, so it can
@@ -89,6 +105,13 @@ pub enum GatherEvent {
         index: usize,
         total: usize,
         sample: cap::Sample,
+    },
+    /// A format's gamut probe finished, before its sweep. `folds` is the number
+    /// of clamped (`Folded`) leaf patches detected.
+    GamutProbed {
+        index: usize,
+        vertices: usize,
+        folds: usize,
     },
     /// A format trial finished with `samples` measurements recorded.
     FormatDone { index: usize, samples: usize },
@@ -189,10 +212,36 @@ pub fn run_capture(
         on_event(GatherEvent::Negotiation(outcome.clone()));
 
         let mut samples = Vec::new();
+        let mut gamut = None;
         if let Some(mut surface) = surface {
             surface.set_window_fraction(config.window_fraction)?;
             if let Some(b) = config.border {
                 surface.set_border(b)?;
+            }
+            // Optional prerequisite: probe this encoding's reproduced gamut on
+            // the same surface (one puck placement) before the sweep, and record
+            // it on the trial. The measure closure drives the surface + device;
+            // its borrows release when `refine_gamut` returns, before the sweep.
+            if let Some(opts) = &config.gamut {
+                if !should_cancel() {
+                    let measure = |cv: [f64; 3]| -> Result<ProbeSample, GatherError> {
+                        surface.set_code_values(cv)?;
+                        sleep(config.settle);
+                        let raws = device.measure_raw_repeated(&setup, opts.repeats, false)?;
+                        let conf = MeasurementConfidence::from_repeats(&raws, &setup, &cal);
+                        Ok(ProbeSample {
+                            measured: conf.mean,
+                            trustworthy: conf.is_trustworthy(),
+                        })
+                    };
+                    let mesh = refine_gamut(&opts.refine, measure)?;
+                    on_event(GatherEvent::GamutProbed {
+                        index: fi,
+                        vertices: mesh.vertices.len(),
+                        folds: mesh.count(crate::gamut::PatchStatus::Folded),
+                    });
+                    gamut = Some(mesh.to_capture());
+                }
             }
             for (i, cv) in config.sequence.iter().enumerate() {
                 if should_cancel() {
@@ -233,7 +282,7 @@ pub fn run_capture(
             requested: fs.color_description(),
             pixel_format: fs.pixel_format_str().to_string(),
             outcome,
-            gamut: None,
+            gamut,
             samples,
         });
         on_event(GatherEvent::FormatDone {

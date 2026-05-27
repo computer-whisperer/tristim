@@ -197,6 +197,9 @@ impl Running {
                 }
                 self.rebuild_live();
             }
+            // The GUI capture form doesn't request a gamut probe yet, so this
+            // never fires here; ignore it to stay exhaustive.
+            GatherEvent::GamutProbed { .. } => {}
         }
     }
 
