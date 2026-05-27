@@ -22,9 +22,11 @@ mod time;
 pub use format::{FormatSpec, KNOWN_FORMATS, parse_format};
 pub use gamut::{
     GamutConfig, GamutEvent, GamutMesh, GamutProbe, GamutVertex, MeshVertex, Patch, PatchStatus,
-    RefineParams, probe_gamut, probe_gamut_refined, refine_gamut,
+    RefineParams, ReproChecker, probe_gamut, probe_gamut_refined, refine_gamut,
 };
-pub use sequence::{grey_ramp, parse_sequence, primary_ramps, scatter};
+pub use sequence::{
+    SCATTER_SEED, grey_ramp, parse_scatter, parse_sequence, primary_ramps, scatter,
+};
 pub use time::rfc3339_utc_now;
 
 use std::thread::sleep;
@@ -56,11 +58,25 @@ pub struct CaptureConfig {
     pub border: Option<[f64; 3]>,
     /// Color formats to put under test, in order. Each runs the full sequence.
     pub formats: Vec<FormatSpec>,
-    /// Code-value triples every format steps through (flattened sequences).
+    /// Deterministic code-value triples (grey/primaries) every format steps
+    /// through. Scatter is generated separately (see `scatter`).
     pub sequence: Vec<[f64; 3]>,
+    /// If set, scatter samples generated per format and appended to the sweep.
+    /// When a gamut is probed, they're constrained to the measured gamut
+    /// (generate-to-fill); otherwise it's plain deterministic scatter.
+    pub scatter: Option<ScatterRequest>,
     /// If set, probe each format's reproduced gamut (on the same surface,
     /// before its sweep) and record it on the trial.
     pub gamut: Option<GamutProbeOpts>,
+}
+
+/// A per-format scatter request: how many points, and the seed to draw them
+/// from. Generated at capture time so it can be constrained to that format's
+/// measured gamut.
+#[derive(Debug, Clone)]
+pub struct ScatterRequest {
+    pub count: usize,
+    pub seed: u64,
 }
 
 /// Options for the optional per-format gamut-probe prerequisite of a capture.
@@ -193,7 +209,6 @@ pub fn run_capture(
 
     let settle_ms = config.settle.as_millis() as u64;
     let format_count = config.formats.len();
-    let seq_len = config.sequence.len();
     let mut trials = Vec::new();
 
     for (fi, fs) in config.formats.iter().enumerate() {
@@ -213,6 +228,7 @@ pub fn run_capture(
 
         let mut samples = Vec::new();
         let mut gamut = None;
+        let mut mesh_opt = None;
         if let Some(mut surface) = surface {
             surface.set_window_fraction(config.window_fraction)?;
             if let Some(b) = config.border {
@@ -241,9 +257,29 @@ pub fn run_capture(
                         folds: mesh.count(crate::gamut::PatchStatus::Folded),
                     });
                     gamut = Some(mesh.to_capture());
+                    mesh_opt = Some(mesh);
                 }
             }
-            for (i, cv) in config.sequence.iter().enumerate() {
+
+            // This format's sweep: the deterministic sequence + scatter. When a
+            // gamut was probed, scatter is constrained to it (generate-to-fill);
+            // otherwise it's plain deterministic scatter.
+            let mut sweep = config.sequence.clone();
+            if let Some(req) = &config.scatter {
+                let checker = mesh_opt
+                    .as_ref()
+                    .and_then(|m| ReproChecker::new(m, fs.color_description().as_ref()));
+                let pts = match &checker {
+                    Some(c) => {
+                        sequence::scatter_accepted(req.count, req.seed, |cv| c.reproducible(cv))
+                    }
+                    None => sequence::scatter_accepted(req.count, req.seed, |_| true),
+                };
+                sweep.extend(pts);
+            }
+            let total = sweep.len();
+
+            for (i, cv) in sweep.iter().enumerate() {
                 if should_cancel() {
                     break;
                 }
@@ -268,7 +304,7 @@ pub fn run_capture(
                 on_event(GatherEvent::Sample {
                     format_index: fi,
                     index: i,
-                    total: seq_len,
+                    total,
                     sample: sample.clone(),
                 });
                 samples.push(sample);

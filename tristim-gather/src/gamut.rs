@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use tristim_capture as cap;
 use tristim_color::metrics::{delta_e76, xyz_to_lab};
+use tristim_color::{ColorSpace, mat3_inverse, mat3_mul_vec, transfer};
 use tristim_display::PatchSurface;
 use tristim_driver::{Calibration, Colorimeter, MeasurementConfidence, Setup, TrustFlag, Xyz};
 
@@ -591,6 +592,95 @@ pub fn probe_gamut_refined(
     Ok(mesh)
 }
 
+// ── gamut membership (sample constraint) ────────────────────────────────────
+
+/// Slack on the display-RGB membership test (in display-RGB units), so a color
+/// a hair outside the measured parallelepiped — e.g. an intended near-black
+/// below the panel's black floor — still counts as reproducible.
+const REPRO_EPS: f64 = 0.02;
+
+/// Tests whether a code value's intended color (under some encoding) is
+/// reproducible within a measured gamut.
+///
+/// The measured primaries (R/G/B corners relative to measured black) define the
+/// display's own linear-RGB basis; a color is reproducible iff its coordinates
+/// in that basis land within `[0, 1]` (plus [`REPRO_EPS`] slack). The intended
+/// color is decoded from the code value via the encoding's transfer function +
+/// primaries; relative encodings (sRGB) are anchored to the measured white
+/// luminance, matching how `analyze` scores them. For a clipping pipeline the
+/// *measured* primaries already describe the real (smaller) gamut, so
+/// over-saturated requests like BT.2020 blue fall outside.
+pub struct ReproChecker {
+    black: [f64; 3],
+    xyz_to_disp: [[f64; 3]; 3],
+    transfer: String,
+    rgb_to_xyz: [[f64; 3]; 3],
+    absolute: bool,
+    white_y: f64,
+}
+
+impl ReproChecker {
+    /// Build from a measured `mesh` and the trial's `requested` encoding
+    /// (`None` ⇒ unmanaged, assumed sRGB). Returns `None` if the mesh is missing
+    /// a primary/black corner or the encoding is unmapped.
+    pub fn new(mesh: &GamutMesh, requested: Option<&cap::ColorDescription>) -> Option<Self> {
+        let corner = |cv| {
+            mesh.vertex_at(cv)
+                .map(|v| [v.measured.x, v.measured.y, v.measured.z])
+        };
+        let black = corner([0.0, 0.0, 0.0])?;
+        let r = corner([1.0, 0.0, 0.0])?;
+        let g = corner([0.0, 1.0, 0.0])?;
+        let b = corner([0.0, 0.0, 1.0])?;
+        // Columns = measured primaries relative to black.
+        let m = [
+            [r[0] - black[0], g[0] - black[0], b[0] - black[0]],
+            [r[1] - black[1], g[1] - black[1], b[1] - black[1]],
+            [r[2] - black[2], g[2] - black[2], b[2] - black[2]],
+        ];
+
+        let (transfer, primaries) = match requested {
+            Some(d) => (d.transfer_function.clone(), d.primaries.clone()),
+            None => ("srgb".to_string(), "srgb".to_string()),
+        };
+        let space = ColorSpace::from_name(&primaries)?;
+        transfer::decode_named(&transfer, 0.5)?; // validate the transfer is mapped
+
+        Some(ReproChecker {
+            black,
+            xyz_to_disp: mat3_inverse(&m),
+            absolute: transfer == "st2084_pq",
+            transfer,
+            rgb_to_xyz: space.rgb_to_xyz(),
+            white_y: mesh.white.y,
+        })
+    }
+
+    /// Whether the intended color for `cv` is reproducible by the measured gamut.
+    pub fn reproducible(&self, cv: [f64; 3]) -> bool {
+        let lin = [
+            transfer::decode_named(&self.transfer, cv[0]).unwrap_or(0.0),
+            transfer::decode_named(&self.transfer, cv[1]).unwrap_or(0.0),
+            transfer::decode_named(&self.transfer, cv[2]).unwrap_or(0.0),
+        ];
+        let mut xyz = mat3_mul_vec(&self.rgb_to_xyz, &lin);
+        // Anchor a relative encoding to the measured white's absolute level.
+        if !self.absolute {
+            for c in &mut xyz {
+                *c *= self.white_y;
+            }
+        }
+        let rel = [
+            xyz[0] - self.black[0],
+            xyz[1] - self.black[1],
+            xyz[2] - self.black[2],
+        ];
+        let disp = mat3_mul_vec(&self.xyz_to_disp, &rel);
+        disp.iter()
+            .all(|&c| (-REPRO_EPS..=1.0 + REPRO_EPS).contains(&c))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,5 +754,38 @@ mod tests {
         // White clamps to half scale, so the gamut is genuinely smaller — not
         // collapsed to nothing.
         assert!(mesh.white.y > 0.0 && mesh.white.y < SRGB_TO_XYZ[1].iter().sum::<f64>());
+    }
+
+    fn desc(transfer: &str, primaries: &str) -> cap::ColorDescription {
+        cap::ColorDescription {
+            transfer_function: transfer.into(),
+            primaries: primaries.into(),
+            reference_white_nits: None,
+            mastering: None,
+        }
+    }
+
+    #[test]
+    fn repro_checker_gates_on_measured_gamut() {
+        // Smooth sRGB display (measured primaries = sRGB).
+        let mesh = refine_gamut(&RefineParams::default(), smooth).unwrap();
+
+        // sRGB content on the sRGB display: the whole code cube is reproducible.
+        let c = ReproChecker::new(&mesh, Some(&desc("srgb", "srgb"))).unwrap();
+        assert!(c.reproducible([0.5, 0.5, 0.5]));
+        assert!(c.reproducible([1.0, 0.0, 0.0]));
+
+        // BT.2020 content on the sRGB display: saturated primaries fall outside,
+        // a near-neutral grey stays in.
+        let c = ReproChecker::new(&mesh, Some(&desc("srgb", "bt2020"))).unwrap();
+        assert!(
+            !c.reproducible([0.0, 0.0, 1.0]),
+            "BT.2020 blue exceeds sRGB"
+        );
+        assert!(
+            !c.reproducible([0.0, 1.0, 0.0]),
+            "BT.2020 green exceeds sRGB"
+        );
+        assert!(c.reproducible([0.3, 0.3, 0.3]), "near-grey reproducible");
     }
 }

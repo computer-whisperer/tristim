@@ -684,10 +684,21 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
     if seq_specs.is_empty() {
         return Err("at least one --seq is required (see `tristim help`)".into());
     }
+    // Grey/primaries are deterministic and shared across formats; scatter is
+    // split out so it can be generated per-format (and gamut-constrained).
     let mut sequence = Vec::new();
+    let mut scatter_count = 0;
     for s in &seq_specs {
-        sequence.extend(gather::parse_sequence(s)?);
+        if let Some(n) = gather::parse_scatter(s)? {
+            scatter_count += n;
+        } else {
+            sequence.extend(gather::parse_sequence(s)?);
+        }
     }
+    let scatter = (scatter_count > 0).then_some(gather::ScatterRequest {
+        count: scatter_count,
+        seed: gather::SCATTER_SEED,
+    });
 
     // Optional per-format gamut-probe prerequisite.
     let gamut = if args.iter().any(|a| a == "--probe-gamut") {
@@ -711,13 +722,14 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
         border,
         formats,
         sequence,
+        scatter,
         gamut,
     };
 
+    let per_format = config.sequence.len() + config.scatter.as_ref().map_or(0, |s| s.count);
     eprintln!(
-        "capture: output={output}, {} formats, {} samples/format, window={window_fraction}{}, -> {out_path}",
+        "capture: output={output}, {} formats, ~{per_format} samples/format, window={window_fraction}{}, -> {out_path}",
         config.formats.len(),
-        config.sequence.len(),
         if config.gamut.is_some() {
             ", gamut probe"
         } else {
@@ -728,8 +740,7 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     // Drive the shared gatherer with a stderr-logging callback; the CLI never
     // cancels (run to completion).
-    let seq_len = config.sequence.len();
-    let capture = gather::run_capture(&config, |ev| log_event(&ev, seq_len), || false)?;
+    let capture = gather::run_capture(&config, |ev| log_event(&ev), || false)?;
 
     capture.save(&out_path)?;
     eprintln!("Done. Wrote capture to {out_path}.");
@@ -737,7 +748,7 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 /// Mirror the progress of a capture run to stderr.
-fn log_event(ev: &gather::GatherEvent, seq_len: usize) {
+fn log_event(ev: &gather::GatherEvent) {
     use gather::GatherEvent::*;
     match ev {
         DeviceReady {
@@ -766,13 +777,18 @@ fn log_event(ev: &gather::GatherEvent, seq_len: usize) {
         GamutProbed {
             vertices, folds, ..
         } => eprintln!("  gamut probed: {vertices} vertices, {folds} folds (clamped)"),
-        Sample { index, sample, .. } => {
+        Sample {
+            index,
+            total,
+            sample,
+            ..
+        } => {
             let cv = sample.requested;
             let xyz = sample.measured.xyz;
             eprintln!(
                 "  [{:>3}/{}] cv=({:.3},{:.3},{:.3}) -> X={:.3} Y={:.3} Z={:.3}",
                 index + 1,
-                seq_len,
+                total,
                 cv[0],
                 cv[1],
                 cv[2],

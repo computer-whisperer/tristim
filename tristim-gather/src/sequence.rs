@@ -7,11 +7,25 @@ pub fn parse_sequence(spec: &str) -> Result<Vec<[f64; 3]>, String> {
     match name {
         "grey" | "gray" => Ok(grey_ramp(parse_count(arg, 11)?)),
         "primaries" => Ok(primary_ramps(parse_count(arg, 5)?)),
-        // Fixed seed → reproducible scatter across runs.
-        "scatter" => Ok(scatter(parse_count(arg, 32)?, 0x7472_6973_7469_6d01)),
+        "scatter" => Ok(scatter(parse_count(arg, 32)?, SCATTER_SEED)),
         other => Err(format!(
             "unknown sequence {other:?} (known: grey, primaries, scatter)"
         )),
+    }
+}
+
+/// Default scatter seed — fixed so scatter is reproducible across runs.
+pub const SCATTER_SEED: u64 = 0x7472_6973_7469_6d01;
+
+/// If `spec` is a `scatter[:N]` spec, return its sample count; otherwise `None`.
+/// Scatter is split out from the fixed sequence so it can be generated
+/// per-format at capture time — and there, constrained to the measured gamut.
+pub fn parse_scatter(spec: &str) -> Result<Option<usize>, String> {
+    let (name, arg) = spec.split_once(':').unwrap_or((spec, ""));
+    if name == "scatter" {
+        Ok(Some(parse_count(arg, 32)?))
+    } else {
+        Ok(None)
     }
 }
 
@@ -53,6 +67,19 @@ pub fn primary_ramps(n: usize) -> Vec<[f64; 3]> {
 /// `n` uniform code-value triples in `[0, 1)`, deterministic from `seed`
 /// (splitmix64) so captures are reproducible and comparable across runs.
 pub fn scatter(n: usize, seed: u64) -> Vec<[f64; 3]> {
+    scatter_accepted(n, seed, |_| true)
+}
+
+/// Draw uniform `[0, 1)^3` candidates from the `seed` stream (splitmix64),
+/// keeping those `accept`ed, until `count` are kept or the attempt budget
+/// (`count * 100`, min 1000) is exhausted — a tight gamut can reject most.
+/// Deterministic for a given seed, so captures stay reproducible. With an
+/// accept-all predicate this reproduces [`scatter`] exactly.
+pub fn scatter_accepted(
+    count: usize,
+    seed: u64,
+    accept: impl Fn([f64; 3]) -> bool,
+) -> Vec<[f64; 3]> {
     let mut state = seed;
     let mut next = || {
         state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -62,7 +89,17 @@ pub fn scatter(n: usize, seed: u64) -> Vec<[f64; 3]> {
         z ^= z >> 31;
         (z >> 11) as f64 / (1u64 << 53) as f64
     };
-    (0..n).map(|_| [next(), next(), next()]).collect()
+    let budget = count.saturating_mul(100).max(1000);
+    let mut out = Vec::with_capacity(count);
+    let mut tries = 0;
+    while out.len() < count && tries < budget {
+        let p = [next(), next(), next()];
+        tries += 1;
+        if accept(p) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -96,5 +133,19 @@ mod tests {
                 assert!((0.0..1.0).contains(&c), "{c} out of range");
             }
         }
+    }
+
+    #[test]
+    fn scatter_accepted_fills_to_count_with_only_accepted_points() {
+        // Reject the half-cube x >= 0.5; we should still get exactly 20 points,
+        // all in the accepted half.
+        let pts = scatter_accepted(20, 0x99, |p| p[0] < 0.5);
+        assert_eq!(pts.len(), 20);
+        assert!(pts.iter().all(|p| p[0] < 0.5));
+    }
+
+    #[test]
+    fn scatter_accepted_all_matches_scatter() {
+        assert_eq!(scatter(16, 0x1234), scatter_accepted(16, 0x1234, |_| true));
     }
 }
