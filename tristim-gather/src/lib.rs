@@ -15,10 +15,12 @@
 //! the surface — saving the returned [`Capture`] is the caller's job.
 
 mod format;
+mod gamut;
 mod sequence;
 mod time;
 
 pub use format::{FormatSpec, KNOWN_FORMATS, parse_format};
+pub use gamut::{GamutConfig, GamutEvent, GamutProbe, GamutVertex, probe_gamut};
 pub use sequence::{grey_ramp, parse_sequence, primary_ramps, scatter};
 pub use time::rfc3339_utc_now;
 
@@ -95,6 +97,8 @@ pub enum GatherError {
     Device(#[from] tristim_driver::device::Error),
     #[error("display: {0}")]
     Display(#[from] display::Error),
+    #[error("compositor rejected format ({cause}): {message}")]
+    FormatRejected { cause: String, message: String },
 }
 
 /// Run a full capture session, reporting progress through `on_event` and
@@ -283,7 +287,7 @@ pub fn run_capture(
 /// negotiation policy: a compositor that exposes no color manager still gets a
 /// plain unmanaged buffer of the same pixel format; an outright rejection is
 /// recorded without sending anything.
-fn open_format(
+pub(crate) fn open_format(
     output: &str,
     fs: &FormatSpec,
 ) -> Result<(Option<PatchSurface>, cap::Negotiation), GatherError> {

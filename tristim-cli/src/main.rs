@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use tristim_analyze::{GroundTruth, GroundTruthSource, analyze};
 use tristim_capture as cap;
+use tristim_color::metrics::triangle_area_xy;
 use tristim_display::{PatchSurface, list_outputs};
 use tristim_driver::{Colorimeter, MeasurementConfidence, TrustFlag};
 use tristim_gather as gather;
@@ -36,6 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "info" => cmd_info(),
         "measure" => cmd_measure(&argv[2..]),
         "characterize" | "char" => cmd_characterize(&argv[2..]),
+        "gamut" => cmd_gamut(&argv[2..]),
         "capture" => cmd_capture(&argv[2..]),
         "report" => cmd_report(&argv[2..]),
         "help" | "-h" | "--help" => {
@@ -68,6 +70,16 @@ fn print_usage() {
     eprintln!("          --burst            reset once then read back-to-back (isolates read");
     eprintln!("                             noise); default auto-zeros before every reading");
     eprintln!("          --raw              also print per-channel raw mean/sd/headroom");
+    eprintln!("  gamut --output NAME --format SPEC [opts]");
+    eprintln!("        Probe the display's reproduced gamut for one encoding by measuring");
+    eprintln!("        the code-cube surface (8 corners + 6 face centers), each with a");
+    eprintln!("        trust verdict. Options:");
+    eprintln!("          --cal N            calibration index (default: 0)");
+    eprintln!("          --repeats N        measurements per probe point (default: 16)");
+    eprintln!("          --settle-ms N      ms to wait after each patch (default: 250)");
+    eprintln!("          --prep-secs N      seconds to wait for puck placement (default: 6)");
+    eprintln!("          --window F         centered-window area fraction (default: 1.0)");
+    eprintln!("          --border R,G,B     surround code values for windowed/anti-ABL use");
     eprintln!("  capture --output NAME [opts]");
     eprintln!("        Run a capture session and write a tristim-capture JSON file.");
     eprintln!("        Options:");
@@ -297,6 +309,133 @@ fn fmt_flags(flags: &[TrustFlag]) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+// ── gamut ───────────────────────────────────────────────────────────────────
+
+/// sRGB / BT.709 primary triangle area in the xy plane — a familiar yardstick
+/// for the measured gamut's coverage.
+const SRGB_TRIANGLE_AREA: f64 = 0.1121;
+
+fn cmd_gamut(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let output = arg_value(args, "--output")
+        .ok_or("--output NAME is required (try `tristim list-outputs`)")?;
+    let format_spec =
+        arg_value(args, "--format").ok_or("--format SPEC is required (see `tristim help`)")?;
+    let cal_index: u8 = parse_opt(args, "--cal", 0);
+    let repeats: usize = parse_opt(args, "--repeats", 16);
+    let settle_ms: u64 = parse_opt(args, "--settle-ms", 250);
+    let prep_secs: u64 = parse_opt(args, "--prep-secs", 6);
+    let window_fraction: f64 = parse_opt(args, "--window", 1.0);
+    let border: Option<[f64; 3]> = match arg_value(args, "--border") {
+        Some(s) => Some(parse_rgb(&s)?),
+        None => None,
+    };
+
+    let config = gather::GamutConfig {
+        output: output.clone(),
+        cal_index,
+        format: gather::parse_format(&format_spec)?,
+        repeats,
+        settle: Duration::from_millis(settle_ms),
+        prep: Duration::from_secs(prep_secs),
+        window_fraction,
+        border,
+    };
+
+    eprintln!("gamut: output={output}, format={format_spec}, {repeats} repeats/point");
+    eprintln!("Place the puck flat against '{output}'. Probe starts in {prep_secs}s.");
+
+    let probe = gather::probe_gamut(&config, log_gamut_event, || false)?;
+    print_gamut_summary(&probe);
+    Ok(())
+}
+
+/// Mirror the progress of a gamut probe to stderr.
+fn log_gamut_event(ev: gather::GamutEvent) {
+    use gather::GamutEvent::*;
+    match ev {
+        DeviceReady {
+            product,
+            serial,
+            hw_version,
+        } => eprintln!(
+            "{product} SN {serial} HW {}.{:02}",
+            hw_version.0, hw_version.1
+        ),
+        Negotiation(n) => match n {
+            cap::Negotiation::Accepted { identity } => {
+                eprintln!("  accepted (identity {identity})")
+            }
+            cap::Negotiation::Rejected { cause, message } => {
+                eprintln!("  rejected: {cause}: {message}")
+            }
+            cap::Negotiation::Unmanaged => eprintln!("  unmanaged buffer (assumed sRGB)"),
+        },
+        Countdown { remaining } => eprintln!("  starting in {remaining}s..."),
+        Point {
+            index,
+            total,
+            label,
+            measured,
+            flags,
+            ..
+        } => eprintln!(
+            "  [{:>2}/{}] {:>8}  Y={:>8.3}  xy={}  {}",
+            index + 1,
+            total,
+            label,
+            measured.y,
+            fmt_xy(measured.chromaticity().map(|(x, y)| [x, y])),
+            fmt_flags(&flags),
+        ),
+    }
+}
+
+/// Print the measured gamut: a per-vertex table, the white point, and the
+/// measured RGB primary triangle area relative to sRGB.
+fn print_gamut_summary(probe: &gather::GamutProbe) {
+    println!();
+    println!("measured gamut ({} points):", probe.vertices.len());
+    println!(
+        "{:>8}  {:>16}  {:>9}  {:>17}  flags",
+        "point", "code value", "Y(cd/m²)", "xy"
+    );
+    for v in &probe.vertices {
+        println!(
+            "{:>8}  {:>16}  {:>9.3}  {:>17}  {}",
+            v.label,
+            format!(
+                "({:.2},{:.2},{:.2})",
+                v.code_value[0], v.code_value[1], v.code_value[2]
+            ),
+            v.measured.y,
+            fmt_xy(v.measured.chromaticity().map(|(x, y)| [x, y])),
+            fmt_flags(&v.confidence.flags()),
+        );
+    }
+
+    if let Some((wx, wy)) = probe.white.chromaticity() {
+        println!();
+        println!("white: xy=({wx:.4}, {wy:.4})  Y={:.2} cd/m²", probe.white.y);
+    }
+
+    // Measured RGB primary triangle (xy) vs the sRGB yardstick.
+    let prim = |label: &str| {
+        probe
+            .vertices
+            .iter()
+            .find(|v| v.label == label)
+            .and_then(|v| v.measured.chromaticity())
+            .map(|(x, y)| [x, y])
+    };
+    if let (Some(r), Some(g), Some(b)) = (prim("red"), prim("green"), prim("blue")) {
+        let area = triangle_area_xy(r, g, b);
+        println!(
+            "measured RGB primary triangle (xy): area {area:.4}  ({:.0}% of sRGB)",
+            100.0 * area / SRGB_TRIANGLE_AREA,
+        );
+    }
 }
 
 // ── report ──────────────────────────────────────────────────────────────────
