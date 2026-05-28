@@ -327,6 +327,7 @@ impl PresenterApp {
     pub fn setup() -> Self {
         let mut form = CaptureForm::new();
         form.refresh_outputs();
+        form.refresh_capabilities();
         Self {
             mode: Mode::Setup,
             presented: None,
@@ -448,6 +449,12 @@ impl PresenterApp {
     /// to lint the expanded setup layout.
     pub fn set_setup_probe_gamut(&mut self, on: bool) {
         self.form.set_probe_gamut(on);
+    }
+
+    /// Inject a capability set into the setup form. Used by the headless dump to
+    /// lint the grayed-out unreachable-format rows without a live compositor.
+    pub fn set_setup_capabilities(&mut self, caps: tristim_display::DisplayCapabilities) {
+        self.form.set_capabilities(caps);
     }
 
     /// Spawn the capture on a background thread and switch to Running. Progress
@@ -945,6 +952,7 @@ impl PresenterApp {
                 }
                 Some("new-capture") => {
                     self.form.refresh_outputs();
+                    self.form.refresh_capabilities();
                     self.mode = Mode::Setup;
                 }
                 Some(k) => {

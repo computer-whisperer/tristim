@@ -88,6 +88,11 @@ fn main() -> ExitCode {
     // repeats/depth steppers row only renders when probing is on).
     let mut setup_gamut_app = PresenterApp::setup();
     setup_gamut_app.set_setup_probe_gamut(true);
+    // And the form gated to a minimal (niri-like) compositor: no color
+    // management, no fp16, so every managed format renders disabled with its
+    // reason chip — the grayed-row layout we want to lint.
+    let mut setup_capgated_app = PresenterApp::setup();
+    setup_capgated_app.set_setup_capabilities(tristim_display::DisplayCapabilities::default());
     // And the live running view (progress strip + live plots), reusing the
     // capture as if it were mid-run.
     let running_app = PresenterApp::debug_running(capture.clone());
@@ -106,6 +111,7 @@ fn main() -> ExitCode {
         for (probe, tag) in [
             (&setup_app, "setup"),
             (&setup_gamut_app, "setup-gamut"),
+            (&setup_capgated_app, "setup-capgated"),
             (&running_app, "running"),
         ] {
             match render(probe, &format!("{tag}-{}w", vw as u32)) {

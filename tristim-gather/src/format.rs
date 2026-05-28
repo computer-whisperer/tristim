@@ -38,6 +38,28 @@ impl FormatSpec {
         self.description.clone()
     }
 
+    /// Check whether this format can be reproduced on a compositor with the
+    /// given [`DisplayCapabilities`]. `Ok(())` means reachable; the `Err`
+    /// carries the first unmet requirement (buffer format, color-management
+    /// protocol, transfer function, or primaries) for display.
+    pub fn reachability(&self, caps: &display::DisplayCapabilities) -> Result<(), Unreachable> {
+        if !caps.supports_buffer_format(self.buffer_format) {
+            return Err(Unreachable::BufferFormat(self.buffer_format));
+        }
+        if let Some(d) = &self.description {
+            if !caps.has_color_management() {
+                return Err(Unreachable::NoColorManagement);
+            }
+            if !caps.supports_transfer_function(&d.transfer_function) {
+                return Err(Unreachable::TransferFunction(d.transfer_function.clone()));
+            }
+            if !caps.supports_primaries(&d.primaries) {
+                return Err(Unreachable::Primaries(d.primaries.clone()));
+            }
+        }
+        Ok(())
+    }
+
     /// The capture-schema description mirroring what we requested.
     pub(crate) fn color_description(&self) -> Option<cap::ColorDescription> {
         self.description.as_ref().map(|d| cap::ColorDescription {
@@ -51,6 +73,35 @@ impl FormatSpec {
                 max_fall_nits: m.max_fall_nits,
             }),
         })
+    }
+}
+
+/// Why a format can't be reached on the current compositor. See
+/// [`FormatSpec::reachability`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unreachable {
+    /// The compositor doesn't advertise the required `wl_shm` buffer format
+    /// (in practice, the fp16 buffer for HDR / wide encodings).
+    BufferFormat(BufferFormat),
+    /// The format needs a color description but the compositor exposes no
+    /// `wp_color_manager_v1`.
+    NoColorManagement,
+    /// The transfer function isn't in the compositor's advertised set.
+    TransferFunction(String),
+    /// The primaries aren't in the compositor's advertised set.
+    Primaries(String),
+}
+
+impl Unreachable {
+    /// A short reason suitable for a chip next to a disabled format toggle.
+    pub fn reason(&self) -> String {
+        match self {
+            Unreachable::BufferFormat(BufferFormat::Xbgr16161616f) => "no fp16 buffer".to_string(),
+            Unreachable::BufferFormat(BufferFormat::Xrgb8888) => "no 8-bit buffer".to_string(),
+            Unreachable::NoColorManagement => "no color management".to_string(),
+            Unreachable::TransferFunction(tf) => format!("TF {tf} unsupported"),
+            Unreachable::Primaries(p) => format!("primaries {p} unsupported"),
+        }
     }
 }
 
@@ -132,6 +183,70 @@ fn parse_params(s: &str) -> Result<HashMap<String, f64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tristim_display::DisplayCapabilities;
+
+    #[test]
+    fn reachability_gates_on_capabilities() {
+        // niri-like: no color management, only the 8-bit buffer.
+        let bare = DisplayCapabilities::default();
+        assert!(
+            parse_format("unmanaged")
+                .unwrap()
+                .reachability(&bare)
+                .is_ok()
+        );
+        assert_eq!(
+            parse_format("srgb").unwrap().reachability(&bare),
+            Err(Unreachable::NoColorManagement)
+        );
+        // fp16 is checked before color management, so the HDR format trips on
+        // the buffer first.
+        assert!(matches!(
+            parse_format("pq-bt2020").unwrap().reachability(&bare),
+            Err(Unreachable::BufferFormat(_))
+        ));
+
+        // A wide-gamut + HDR compositor: everything reachable.
+        let rich = DisplayCapabilities::advertising(
+            &["srgb", "st2084_pq"],
+            &["srgb", "bt2020", "display_p3"],
+            true,
+        );
+        for tok in KNOWN_FORMATS {
+            assert!(
+                parse_format(tok).unwrap().reachability(&rich).is_ok(),
+                "{tok} should be reachable on a full compositor"
+            );
+        }
+
+        // Same, but without display_p3 primaries → the P3 formats trip.
+        let no_p3 =
+            DisplayCapabilities::advertising(&["srgb", "st2084_pq"], &["srgb", "bt2020"], true);
+        assert!(matches!(
+            parse_format("srgb-p3").unwrap().reachability(&no_p3),
+            Err(Unreachable::Primaries(_))
+        ));
+        assert!(
+            parse_format("pq-bt2020")
+                .unwrap()
+                .reachability(&no_p3)
+                .is_ok()
+        );
+
+        // fp16 absent but color management present → only the PQ formats trip,
+        // and on the buffer.
+        let sdr_cm = DisplayCapabilities::advertising(&["srgb"], &["srgb", "display_p3"], false);
+        assert!(
+            parse_format("srgb-p3")
+                .unwrap()
+                .reachability(&sdr_cm)
+                .is_ok()
+        );
+        assert!(matches!(
+            parse_format("pq-p3").unwrap().reachability(&sdr_cm),
+            Err(Unreachable::BufferFormat(_))
+        ));
+    }
 
     #[test]
     fn format_unmanaged_has_no_description() {

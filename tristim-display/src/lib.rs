@@ -523,6 +523,136 @@ pub struct OutputDescription {
     pub size: Option<(i32, i32)>,
 }
 
+/// What the compositor can do, queried up front without placing a surface: the
+/// `wp_color_manager_v1` advertised set plus the `wl_shm` buffer formats.
+/// Lets a caller tell, *before* a capture, which trial formats the compositor
+/// can actually reproduce (vs. failing at run time). These facts are
+/// connection-global, not per-output.
+#[derive(Clone, Debug, Default)]
+pub struct DisplayCapabilities {
+    /// Color-management capabilities. `done == false` with empty lists means
+    /// the compositor advertises no `wp_color_manager_v1` at all.
+    pub color: ColorCapabilities,
+    /// The `wl_shm` buffer formats the compositor advertised.
+    shm_formats: Vec<wl_shm::Format>,
+}
+
+impl DisplayCapabilities {
+    /// Build a capability set advertising the named transfer functions and
+    /// primaries (same names as [`DescriptionRequest`]) plus optional fp16
+    /// buffer support. The live equivalent comes from [`query_capabilities`];
+    /// this is for callers (and tests) holding the facts another way. Names
+    /// this build doesn't map are dropped; `done` is set iff any TF is known.
+    pub fn advertising(transfer_functions: &[&str], primaries: &[&str], fp16: bool) -> Self {
+        let tf: Vec<String> = transfer_functions
+            .iter()
+            .filter_map(|n| color_mgmt::tf_named(n).map(|t| format!("{t:?}")))
+            .collect();
+        let prim: Vec<String> = primaries
+            .iter()
+            .filter_map(|n| color_mgmt::primaries_named(n).map(|p| format!("{p:?}")))
+            .collect();
+        let done = !tf.is_empty();
+        let mut shm_formats = vec![wl_shm::Format::Xrgb8888];
+        if fp16 {
+            shm_formats.push(wl_shm::Format::Xbgr16161616f);
+        }
+        Self {
+            color: ColorCapabilities {
+                transfer_functions: tf,
+                primaries: prim,
+                features: Vec::new(),
+                render_intents: Vec::new(),
+                done,
+            },
+            shm_formats,
+        }
+    }
+
+    /// Whether the compositor can present this buffer format. `Xrgb8888` is
+    /// mandatory per the `wl_shm` spec, so it's always available; `fp16` must
+    /// be explicitly advertised.
+    pub fn supports_buffer_format(&self, f: BufferFormat) -> bool {
+        match f {
+            BufferFormat::Xrgb8888 => true,
+            BufferFormat::Xbgr16161616f => {
+                self.shm_formats.contains(&wl_shm::Format::Xbgr16161616f)
+            }
+        }
+    }
+
+    /// Whether the compositor exposes color management at all (the
+    /// `wp_color_manager_v1` global, with its enumeration completed).
+    pub fn has_color_management(&self) -> bool {
+        self.color.done && !self.color.transfer_functions.is_empty()
+    }
+
+    /// Whether the named transfer function (e.g. `"srgb"`, `"st2084_pq"`) is in
+    /// the advertised set. Names match [`DescriptionRequest::transfer_function`].
+    pub fn supports_transfer_function(&self, name: &str) -> bool {
+        match color_mgmt::tf_named(name) {
+            Some(tf) => self
+                .color
+                .transfer_functions
+                .iter()
+                .any(|s| *s == format!("{tf:?}")),
+            None => false,
+        }
+    }
+
+    /// Whether the named primaries (e.g. `"srgb"`, `"bt2020"`) are advertised.
+    pub fn supports_primaries(&self, name: &str) -> bool {
+        match color_mgmt::primaries_named(name) {
+            Some(p) => self.color.primaries.iter().any(|s| *s == format!("{p:?}")),
+            None => false,
+        }
+    }
+}
+
+/// Query what the compositor can do — color management + buffer formats —
+/// without placing a surface. A quick connect + bind + roundtrip, like
+/// [`list_outputs`]. Requires `wlr-layer-shell` (as the capture itself does),
+/// so the error path matches.
+pub fn query_capabilities() -> Result<DisplayCapabilities, Error> {
+    let conn = Connection::connect_to_env()?;
+    let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)?;
+    let qh = event_queue.handle();
+    let registry_state = RegistryState::new(&globals);
+    let output_state = OutputState::new(&globals, &qh);
+    // Bind the manager so it emits its supported_* enumeration. Absent on
+    // compositors without color management (capabilities then stay empty).
+    let color_manager = globals.bind::<WpColorManagerV1, _, _>(&qh, 1..=2, ()).ok();
+
+    let mut state = AppState {
+        registry_state,
+        output_state,
+        compositor_state: CompositorState::bind(&globals, &qh).map_err(Error::Bind)?,
+        layer_shell: LayerShell::bind(&globals, &qh).map_err(|_| Error::NoLayerShell)?,
+        shm: Shm::bind(&globals, &qh).map_err(Error::Bind)?,
+        pool: None,
+        surface_state: SurfaceState::WaitingForOutputs,
+        current_content: PatchContent::Sdr(0),
+        current_width: PATCH_WIDTH,
+        current_height: PATCH_HEIGHT,
+        redraw_pending: false,
+        color_manager,
+        color_managed: None,
+        capabilities: ColorCapabilities::default(),
+        description: None,
+        window_fraction: 1.0,
+        border_content: None,
+    };
+    // Two roundtrips: the first delivers the `wl_shm` formats, the second the
+    // manager's `supported_*` + `done` enumeration.
+    event_queue.roundtrip(&mut state)?;
+    event_queue.roundtrip(&mut state)?;
+
+    Ok(DisplayCapabilities {
+        color: state.capabilities,
+        shm_formats: state.shm.formats().to_vec(),
+    })
+}
+
 /// The compositor's binary name, via the Wayland socket's peer credentials.
 ///
 /// `SO_PEERCRED` on the connection fd gives the server-side PID; its

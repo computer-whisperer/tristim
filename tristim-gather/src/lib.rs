@@ -19,7 +19,7 @@ mod gamut;
 mod sequence;
 mod time;
 
-pub use format::{FormatSpec, KNOWN_FORMATS, parse_format};
+pub use format::{FormatSpec, KNOWN_FORMATS, Unreachable, parse_format};
 pub use gamut::{
     GamutConfig, GamutEvent, GamutMesh, GamutProbe, GamutVertex, MeshVertex, Patch, PatchStatus,
     RefineParams, ReproChecker, probe_gamut, probe_gamut_refined, refine_gamut,

@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use aetna_core::prelude::*;
-use tristim_display::list_outputs;
+use tristim_display::{self as display, list_outputs};
 use tristim_gather::{self as gather, CaptureConfig, KNOWN_FORMATS};
 
 /// What a routed form event asks the app to do.
@@ -55,6 +55,10 @@ pub struct CaptureForm {
     gamut_repeats: usize,
     /// Adaptive-refinement depth cap for the gamut probe.
     gamut_max_depth: u32,
+    /// What the compositor can fulfil, queried up front. `None` until
+    /// [`Self::refresh_capabilities`] succeeds; while `None`, all formats are
+    /// offered (we don't know better yet).
+    capabilities: Option<display::DisplayCapabilities>,
     /// Last validation / enumeration error, shown beneath the form.
     error: Option<String>,
 }
@@ -104,6 +108,7 @@ impl CaptureForm {
             probe_gamut: false,
             gamut_repeats: 8,
             gamut_max_depth: 3,
+            capabilities: None,
             error: None,
         }
     }
@@ -117,6 +122,43 @@ impl CaptureForm {
     /// lint the expanded setup layout (the repeats/depth steppers row).
     pub fn set_probe_gamut(&mut self, on: bool) {
         self.probe_gamut = on;
+    }
+
+    /// Inject a capability set directly (the headless dump uses this to lint
+    /// the grayed-out, unreachable-format rows without a live compositor).
+    pub fn set_capabilities(&mut self, caps: display::DisplayCapabilities) {
+        self.apply_capabilities(caps);
+    }
+
+    /// Re-query what the compositor can fulfil (a quick Wayland roundtrip, like
+    /// [`Self::refresh_outputs`]). Formats the compositor can't reach are then
+    /// shown disabled; any already-selected unreachable format is turned off.
+    pub fn refresh_capabilities(&mut self) {
+        match display::query_capabilities() {
+            Ok(caps) => self.apply_capabilities(caps),
+            Err(e) => self.error = Some(format!("capability query failed: {e}")),
+        }
+    }
+
+    /// Store capabilities and force off any selected format they don't cover.
+    fn apply_capabilities(&mut self, caps: display::DisplayCapabilities) {
+        for f in &mut self.formats {
+            if f.on {
+                if let Ok(spec) = gather::parse_format(f.token) {
+                    if spec.reachability(&caps).is_err() {
+                        f.on = false;
+                    }
+                }
+            }
+        }
+        self.capabilities = Some(caps);
+    }
+
+    /// Why `token` can't be reached on the current compositor, or `None` if it's
+    /// reachable (or capabilities haven't been queried yet, so we don't gate).
+    fn unreachable(&self, token: &str) -> Option<gather::Unreachable> {
+        let caps = self.capabilities.as_ref()?;
+        gather::parse_format(token).ok()?.reachability(caps).err()
     }
 
     /// Re-enumerate the compositor's outputs (a quick Wayland roundtrip).
@@ -162,8 +204,12 @@ impl CaptureForm {
             self.error = None;
             self.refresh_outputs();
         } else if let Some(tok) = route.strip_prefix("fmt:") {
-            if let Some(f) = self.formats.iter_mut().find(|f| f.token == tok) {
-                f.on = !f.on;
+            // Unreachable formats render as static labels, but guard the route
+            // too so a stale click can't select one.
+            if self.unreachable(tok).is_none() {
+                if let Some(f) = self.formats.iter_mut().find(|f| f.token == tok) {
+                    f.on = !f.on;
+                }
             }
         } else if let Some(name) = route.strip_prefix("seq:") {
             if let Some(s) = self.seqs.iter_mut().find(|s| s.name == name) {
@@ -212,6 +258,19 @@ impl CaptureForm {
             .and_then(|i| self.outputs.get(i))
             .map(|o| o.name.clone())
             .ok_or("select an output to measure")?;
+
+        // Defensive: an unreachable format should already be off (the UI
+        // disables it), but never hand one to a capture — it would only fail
+        // at negotiation.
+        if let Some(f) = self
+            .formats
+            .iter()
+            .filter(|f| f.on)
+            .find(|f| self.unreachable(f.token).is_some())
+        {
+            let why = self.unreachable(f.token).unwrap().reason();
+            return Err(format!("format {} is unreachable here: {why}", f.token));
+        }
 
         let formats = self
             .formats
@@ -396,15 +455,36 @@ impl CaptureForm {
     }
 
     fn formats_view(&self) -> El {
-        let items: Vec<El> = self
+        // A vertical list: an unreachable format carries a reason chip that's
+        // too long to share a horizontal row of toggles without overflowing.
+        let rows: Vec<El> = self
             .formats
             .iter()
-            .map(|f| {
-                let b = button(f.token).key(format!("fmt:{}", f.token));
-                if f.on { b.primary() } else { b.secondary() }
+            .map(|f| match self.unreachable(f.token) {
+                Some(reason) => row([
+                    mono(f.token)
+                        .font_size(13.0)
+                        .muted()
+                        .width(Size::Fixed(120.0)),
+                    text(reason.reason())
+                        .font_size(12.0)
+                        .muted()
+                        .wrap_text()
+                        .width(Size::Fill(1.0)),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
+                None => {
+                    let b = button(f.token)
+                        .key(format!("fmt:{}", f.token))
+                        .width(Size::Fixed(120.0));
+                    let b = if f.on { b.primary() } else { b.secondary() };
+                    row([b]).width(Size::Fill(1.0))
+                }
             })
             .collect();
-        row(items).gap(tokens::SPACE_2)
+        column(rows).gap(tokens::SPACE_2).width(Size::Fill(1.0))
     }
 
     fn seqs_view(&self) -> El {
