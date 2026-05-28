@@ -27,10 +27,11 @@ use thiserror::Error;
 /// readers should reject captures whose `schema_version` they don't understand.
 ///
 /// v2 added the optional [`Capture::compositor`] section. v3 added the optional
-/// per-trial [`FormatTrial::gamut`] section. Both are `#[serde(default)]`, so
-/// older captures still load (with the section absent) and `load` does no
-/// version gate.
-pub const SCHEMA_VERSION: u32 = 3;
+/// per-trial [`FormatTrial::gamut`] section. v4 added [`Sample::source`] /
+/// [`Sample::repeats`] (gamut-probe vertices folded in as samples). All are
+/// `#[serde(default)]`, so older captures still load (with the section/field
+/// absent or at its default) and `load` does no version gate.
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -260,6 +261,37 @@ pub enum Negotiation {
     Unmanaged,
 }
 
+/// How a [`Sample`] was obtained. Sweep samples are single-shot readings of
+/// the deterministic sequence + scatter; gamut-probe samples are the
+/// repeat-averaged code-cube boundary vertices the gamut probe measured, folded
+/// in so the probe's measurements count toward the results rather than being
+/// discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleSource {
+    /// A point from the sequence + scatter sweep (single reading).
+    #[default]
+    Sweep,
+    /// A gamut-probe boundary vertex (repeat-averaged; see [`Sample::repeats`]).
+    GamutProbe,
+}
+
+impl SampleSource {
+    /// Whether this is the default ([`SampleSource::Sweep`]); used to omit the
+    /// field for sweep samples on serialization.
+    pub fn is_sweep(&self) -> bool {
+        matches!(self, SampleSource::Sweep)
+    }
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn is_one(n: &u32) -> bool {
+    *n == 1
+}
+
 /// One measured patch: what we sent, what came back, under what conditions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
@@ -272,6 +304,15 @@ pub struct Sample {
     pub measured: Measured,
     /// Conditions the measurement was taken under.
     pub context: SampleContext,
+    /// How the sample was obtained. Omitted (defaults to [`SampleSource::Sweep`])
+    /// for ordinary sweep samples.
+    #[serde(default, skip_serializing_if = "SampleSource::is_sweep")]
+    pub source: SampleSource,
+    /// Number of repeated readings averaged into [`Sample::measured`]. `1` for
+    /// single-shot sweep samples; the probe's repeat count for gamut-probe
+    /// samples (whose `measured.raw` is the rounded per-channel mean).
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub repeats: u32,
 }
 
 /// A colorimeter reading.
@@ -401,6 +442,8 @@ mod tests {
                         border: None,
                         settle_ms: 250,
                     },
+                    source: SampleSource::Sweep,
+                    repeats: 1,
                 }],
             }],
         }
@@ -493,6 +536,55 @@ mod tests {
         assert!(!json.contains("\"gamut\""));
         let back = Capture::from_json(&json).expect("deserialize");
         assert!(back.trials[0].gamut.is_none());
+    }
+
+    /// A gamut-probe sample carries its source + repeat count through a
+    /// round-trip, while an ordinary sweep sample omits both (they default to
+    /// `Sweep` / `1`), so older captures and the common case stay compact.
+    #[test]
+    fn sample_source_round_trips_and_omits_default() {
+        let mut capture = sample_capture();
+        // The fixture sample is a sweep sample: both fields should be absent.
+        let json = capture.to_json_pretty().expect("serialize");
+        assert!(!json.contains("\"source\""));
+        assert!(!json.contains("\"repeats\""));
+
+        // Add a probe-derived sample and confirm both fields survive.
+        capture.trials[0].samples.push(Sample {
+            requested: [1.0, 0.0, 0.0],
+            measured: Measured {
+                raw: [120, 4, 5, 6, 7, 8],
+                xyz: [44.0, 22.0, 2.0],
+                xy: Some([0.64, 0.33]),
+            },
+            context: SampleContext {
+                window_fraction: 1.0,
+                border: None,
+                settle_ms: 250,
+            },
+            source: SampleSource::GamutProbe,
+            repeats: 8,
+        });
+        let json = capture.to_json_pretty().expect("serialize");
+        assert!(json.contains("\"gamut_probe\""));
+        assert!(json.contains("\"repeats\""));
+        let back = Capture::from_json(&json).expect("deserialize");
+        assert_eq!(capture, back);
+
+        // A document with both fields stripped loads to the defaults.
+        let stripped: serde_json::Value = {
+            let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            for s in v["trials"][0]["samples"].as_array_mut().unwrap() {
+                let o = s.as_object_mut().unwrap();
+                o.remove("source");
+                o.remove("repeats");
+            }
+            v
+        };
+        let back = Capture::from_json(&stripped.to_string()).expect("deserialize stripped");
+        let s = back.trials[0].samples.last().unwrap();
+        assert_eq!(s.source, SampleSource::Sweep);
+        assert_eq!(s.repeats, 1);
     }
 
     /// A v1 capture (no `compositor` section) still loads — the field is

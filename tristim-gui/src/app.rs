@@ -1558,6 +1558,8 @@ mod tests {
                 border: None,
                 settle_ms: 0,
             },
+            source: cap::SampleSource::Sweep,
+            repeats: 1,
         }
     }
 

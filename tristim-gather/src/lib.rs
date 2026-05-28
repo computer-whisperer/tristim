@@ -240,13 +240,36 @@ pub fn run_capture(
             // its borrows release when `refine_gamut` returns, before the sweep.
             if let Some(opts) = &config.gamut {
                 if !should_cancel() {
+                    // Each unique probed vertex is also a real measurement, so
+                    // fold it into the trial's samples rather than discarding it
+                    // after the gamut shell is built. The refine cache calls
+                    // `measure` exactly once per distinct code value, so this
+                    // collects one (repeat-averaged) sample per vertex.
                     let measure = |cv: [f64; 3]| -> Result<ProbeSample, GatherError> {
                         surface.set_code_values(cv)?;
                         sleep(config.settle);
                         let raws = device.measure_raw_repeated(&setup, opts.repeats, false)?;
                         let conf = MeasurementConfidence::from_repeats(&raws, &setup, &cal);
+                        let xyz = conf.mean;
+                        samples.push(cap::Sample {
+                            requested: cv,
+                            measured: cap::Measured {
+                                raw: std::array::from_fn(|ch| {
+                                    conf.raw_mean[ch].round().clamp(0.0, u16::MAX as f64) as u16
+                                }),
+                                xyz: [xyz.x, xyz.y, xyz.z],
+                                xy: xyz.chromaticity().map(|(x, y)| [x, y]),
+                            },
+                            context: cap::SampleContext {
+                                window_fraction: config.window_fraction,
+                                border: config.border,
+                                settle_ms,
+                            },
+                            source: cap::SampleSource::GamutProbe,
+                            repeats: conf.n as u32,
+                        });
                         Ok(ProbeSample {
-                            measured: conf.mean,
+                            measured: xyz,
                             trustworthy: conf.is_trustworthy(),
                         })
                     };
@@ -300,6 +323,8 @@ pub fn run_capture(
                         border: config.border,
                         settle_ms,
                     },
+                    source: cap::SampleSource::Sweep,
+                    repeats: 1,
                 };
                 on_event(GatherEvent::Sample {
                     format_index: fi,

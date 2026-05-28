@@ -344,7 +344,7 @@ fn summarize(samples: &[AnalyzedSample], anchor_y: f64) -> Option<TrialSummary> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tristim_capture::{ColorDescription, Measured, Sample, SampleContext};
+    use tristim_capture::{ColorDescription, Measured, Sample, SampleContext, SampleSource};
     use tristim_color::{ColorSpace, mat3_mul_vec, transfer};
 
     /// Build a single-trial capture from samples + outcome.
@@ -391,6 +391,8 @@ mod tests {
                 border: None,
                 settle_ms: 0,
             },
+            source: SampleSource::Sweep,
+            repeats: 1,
         }
     }
 
