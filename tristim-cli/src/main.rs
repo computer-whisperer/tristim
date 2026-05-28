@@ -774,6 +774,14 @@ fn log_event(ev: &gather::GatherEvent) {
             }
             cap::Negotiation::Unmanaged => eprintln!("  unmanaged buffer (assumed sRGB)"),
         },
+        ProbeSample { sample, .. } => {
+            let cv = sample.requested;
+            let xyz = sample.measured.xyz;
+            eprintln!(
+                "  [probe] cv=({:.3},{:.3},{:.3}) -> Y={:.3} (×{})",
+                cv[0], cv[1], cv[2], xyz[1], sample.repeats,
+            );
+        }
         GamutProbed {
             vertices, folds, ..
         } => eprintln!("  gamut probed: {vertices} vertices, {folds} folds (clamped)"),

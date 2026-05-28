@@ -122,6 +122,14 @@ pub enum GatherEvent {
         total: usize,
         sample: cap::Sample,
     },
+    /// A gamut-probe vertex was just measured, during the probe and before the
+    /// sweep. Streamed so a live consumer can plot the boundary points as they
+    /// come in. It carries no `index`/`total` (the adaptive probe's count isn't
+    /// known in advance) and is *not* part of the sweep progress.
+    ProbeSample {
+        format_index: usize,
+        sample: cap::Sample,
+    },
     /// A format's gamut probe finished, before its sweep. `folds` is the number
     /// of clamped (`Folded`) leaf patches detected.
     GamutProbed {
@@ -251,7 +259,7 @@ pub fn run_capture(
                         let raws = device.measure_raw_repeated(&setup, opts.repeats, false)?;
                         let conf = MeasurementConfidence::from_repeats(&raws, &setup, &cal);
                         let xyz = conf.mean;
-                        samples.push(cap::Sample {
+                        let sample = cap::Sample {
                             requested: cv,
                             measured: cap::Measured {
                                 raw: std::array::from_fn(|ch| {
@@ -267,7 +275,13 @@ pub fn run_capture(
                             },
                             source: cap::SampleSource::GamutProbe,
                             repeats: conf.n as u32,
+                        };
+                        // Stream it for the live view, then keep it for the file.
+                        on_event(GatherEvent::ProbeSample {
+                            format_index: fi,
+                            sample: sample.clone(),
                         });
+                        samples.push(sample);
                         Ok(ProbeSample {
                             measured: xyz,
                             trustworthy: conf.is_trustworthy(),

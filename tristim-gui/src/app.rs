@@ -203,14 +203,23 @@ impl Running {
                 self.measured += 1;
                 self.rebuild_live();
             }
+            // Gamut-probe vertices: fold into the in-progress trial so they
+            // plot live, but don't count them toward the sweep progress (the
+            // probe runs before the sweep and has its own, unknown, count).
+            GatherEvent::ProbeSample { sample, .. } => {
+                if let Some(c) = &mut self.cur {
+                    c.samples.push(sample);
+                }
+                self.rebuild_live();
+            }
             GatherEvent::FormatDone { .. } => {
                 if let Some(done) = self.cur.take() {
                     self.trials.push(done.to_trial());
                 }
                 self.rebuild_live();
             }
-            // The GUI capture form doesn't request a gamut probe yet, so this
-            // never fires here; ignore it to stay exhaustive.
+            // The per-vertex `ProbeSample` events already populate the plots;
+            // the summary event needs no separate live handling.
             GatherEvent::GamutProbed { .. } => {}
         }
     }
@@ -1637,5 +1646,38 @@ mod tests {
         assert!(r.cur.is_none());
         assert_eq!(r.trials.len(), 1);
         assert_eq!(r.live.as_ref().unwrap().analyzed.trials.len(), 1);
+    }
+
+    /// Gamut-probe samples plot live (land in the trial) but don't advance the
+    /// sweep progress counter.
+    #[test]
+    fn probe_samples_plot_but_dont_count_as_sweep_progress() {
+        let mut r = empty_running();
+        r.apply(GatherEvent::FormatStart {
+            index: 0,
+            total: 1,
+            token: "srgb".into(),
+            pixel_format: "xrgb8888".into(),
+            requested: None,
+        });
+        let mut probe = sample(80.0);
+        probe.source = cap::SampleSource::GamutProbe;
+        probe.repeats = 8;
+        r.apply(GatherEvent::ProbeSample {
+            format_index: 0,
+            sample: probe,
+        });
+        r.apply(GatherEvent::Sample {
+            format_index: 0,
+            index: 0,
+            total: 3,
+            sample: sample(50.0),
+        });
+
+        let live = r.live.as_ref().expect("live snapshot present");
+        // Both the probe vertex and the sweep sample are in the plot data.
+        assert_eq!(live.capture.trials[0].samples.len(), 2);
+        // But only the sweep sample advanced the progress counter.
+        assert_eq!(r.measured, 1);
     }
 }
