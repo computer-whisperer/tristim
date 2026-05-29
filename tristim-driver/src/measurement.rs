@@ -309,6 +309,35 @@ impl Calibration {
     }
 }
 
+/// Which tier produced an [`AdaptiveMeasurement`] — for telemetry and event
+/// reporting. Callers that want to weight tiers (or count escalations) should
+/// branch on this rather than inspecting setup.s2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveTier {
+    /// Adaptive was disabled (or the requested fast integration was out of
+    /// range): a single default-integration measurement was taken.
+    SingleFull,
+    /// Two-tier: the fast measurement passed `is_trustworthy()` on the first
+    /// attempt and is what's returned.
+    Fast,
+    /// Two-tier: the fast measurement was untrustworthy; the returned data is
+    /// the default-integration re-measurement that followed.
+    EscalatedFull,
+}
+
+/// Result of [`Colorimeter::measure_adaptive`]. The `setup` and `cal` fields
+/// are the pair that actually produced `raws` (possibly the override pair, or
+/// the originals if no override or after escalation). Pass them to
+/// [`MeasurementConfidence::from_repeats`](crate::confidence::MeasurementConfidence::from_repeats)
+/// for correct XYZ scaling.
+#[derive(Debug, Clone)]
+pub struct AdaptiveMeasurement {
+    pub raws: Vec<RawMeasurement>,
+    pub setup: Setup,
+    pub cal: Calibration,
+    pub tier: AdaptiveTier,
+}
+
 /// Build a [`Setup`] + [`Calibration`] pair for measuring at a non-default
 /// integration time. **Use the returned pair together** — the setup tells the
 /// device how long to integrate, the calibration scales raw counts so that

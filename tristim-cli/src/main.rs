@@ -25,7 +25,9 @@ use tristim_analyze::{GroundTruth, GroundTruthSource, analyze};
 use tristim_capture as cap;
 use tristim_color::metrics::triangle_area_xy;
 use tristim_display::{PatchSurface, list_outputs};
-use tristim_driver::{Colorimeter, MeasurementConfidence, TrustFlag, override_integration};
+use tristim_driver::{
+    AdaptiveTier, Colorimeter, MeasurementConfidence, TrustFlag, override_integration,
+};
 use tristim_gather as gather;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -107,6 +109,8 @@ fn print_usage() {
     eprintln!("          --border R,G,B     surround code values for windowed/anti-ABL use");
     eprintln!("          --refine           adaptively subdivide the faces + detect clamping");
     eprintln!("          --max-depth N      max subdivision depth with --refine (default: 3)");
+    eprintln!("          --fast-integration MS  adaptive integration: bright points probe at MS,");
+    eprintln!("                             escalate to default only on untrust (3× speedup at 200)");
     eprintln!("  capture --output NAME [opts]");
     eprintln!("        Run a capture session and write a tristim-capture JSON file.");
     eprintln!("        Options:");
@@ -123,6 +127,7 @@ fn print_usage() {
     );
     eprintln!("          --gamut-repeats N  repeats per gamut probe point (default: 4)");
     eprintln!("          --gamut-max-depth N  gamut refinement depth (default: 3)");
+    eprintln!("          --gamut-fast-integration MS  adaptive integration on the gamut probe");
     eprintln!();
     eprintln!("        --format SPEC (name[:k=v,...]):");
     eprintln!("          unmanaged                      plain 8-bit buffer, no description");
@@ -633,12 +638,16 @@ fn cmd_gamut(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some(s) => Some(parse_rgb(&s)?),
         None => None,
     };
+    let fast_integration_ms: Option<u16> =
+        arg_value(args, "--fast-integration").map(|s| s.parse()).transpose()
+            .map_err(|_| "--fast-integration: expected integer ms")?;
 
     let config = gather::GamutConfig {
         output: output.clone(),
         cal_index,
         format: gather::parse_format(&format_spec)?,
         repeats,
+        fast_integration_ms,
         settle: Duration::from_millis(settle_ms),
         prep: Duration::from_secs(prep_secs),
         window_fraction,
@@ -646,9 +655,14 @@ fn cmd_gamut(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
 
     let refine = args.iter().any(|a| a == "--refine");
+    let adapt_note = match fast_integration_ms {
+        Some(ms) => format!(", adaptive fast={ms}ms"),
+        None => String::new(),
+    };
     eprintln!(
-        "gamut: output={output}, format={format_spec}, {repeats} repeats/point{}",
-        if refine { ", adaptive" } else { "" }
+        "gamut: output={output}, format={format_spec}, {repeats} repeats/point{}{}",
+        if refine { ", refine" } else { "" },
+        adapt_note,
     );
     eprintln!("Place the puck flat against '{output}'. Probe starts in {prep_secs}s.");
 
@@ -694,23 +708,26 @@ fn log_gamut_event(ev: gather::GamutEvent) {
             label,
             measured,
             flags,
+            tier,
             ..
         } => eprintln!(
-            "  [{:>2}/{}] {:>8}  Y={:>8.3}  xy={}  {}",
+            "  [{:>2}/{}] {:>8}  Y={:>8.3}  xy={}  {}{}",
             index + 1,
             total,
             label,
             measured.y,
             fmt_xy(measured.chromaticity().map(|(x, y)| [x, y])),
             fmt_flags(&flags),
+            fmt_tier(tier),
         ),
         Measured {
             index,
             code_value,
             measured,
             flags,
+            tier,
         } => eprintln!(
-            "  [{:>3}] ({:.3},{:.3},{:.3})  Y={:>8.3}  xy={}  {}",
+            "  [{:>3}] ({:.3},{:.3},{:.3})  Y={:>8.3}  xy={}  {}{}",
             index + 1,
             code_value[0],
             code_value[1],
@@ -718,7 +735,18 @@ fn log_gamut_event(ev: gather::GamutEvent) {
             measured.y,
             fmt_xy(measured.chromaticity().map(|(x, y)| [x, y])),
             fmt_flags(&flags),
+            fmt_tier(tier),
         ),
+    }
+}
+
+/// Trailing badge for the adaptive tier — empty when adaptive is off, so the
+/// non-adaptive log stays uncluttered.
+fn fmt_tier(t: AdaptiveTier) -> &'static str {
+    match t {
+        AdaptiveTier::SingleFull => "",
+        AdaptiveTier::Fast => " [fast]",
+        AdaptiveTier::EscalatedFull => " [esc]",
     }
 }
 
@@ -997,8 +1025,13 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     // Optional per-format gamut-probe prerequisite.
     let gamut = if args.iter().any(|a| a == "--probe-gamut") {
+        let fast_ms: Option<u16> = arg_value(args, "--gamut-fast-integration")
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|_| "--gamut-fast-integration: expected integer ms")?;
         Some(gather::GamutProbeOpts {
             repeats: parse_opt(args, "--gamut-repeats", 4),
+            fast_integration_ms: fast_ms,
             refine: gather::RefineParams {
                 max_depth: parse_opt(args, "--gamut-max-depth", 3),
                 ..Default::default()

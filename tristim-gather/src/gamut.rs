@@ -1,16 +1,23 @@
-//! Closed-loop gamut probe — cube-surface form (coarse, non-adaptive).
+//! Closed-loop gamut probe — cube-surface form.
 //!
 //! The measured gamut is the image of the code-value cube under the
 //! (compositor + display + encoding) pipeline. For a continuous pipeline the
 //! boundary of that solid is the image of the cube's *surface*, so we probe the
 //! surface directly — every measurement is a boundary point, no inverse search.
-//! This first cut measures a fixed coarse set (the 8 corners + 6 face centers);
-//! adaptive subdivision and fold/clip detection come later.
+//! [`probe_gamut`] measures a fixed coarse set (8 corners + 6 face centers);
+//! [`probe_gamut_refined`] adds adaptive subdivision with fold/clip detection.
 //!
 //! Each point is measured as a burst of repeats and scored with
 //! [`MeasurementConfidence`], so a low-trust corner (e.g. a saturated primary
 //! the display can't reach, read near the sensor floor) is *flagged* rather
 //! than silently trusted — the protection the naive primary-scan lacked.
+//!
+//! Optionally adaptive *per-point integration*: when
+//! [`GamutConfig::fast_integration_ms`] is set, each point first burst-measures
+//! at a short integration (e.g. 200 ms — ~3× faster than the calibration
+//! default), and only re-measures at the default if the fast result isn't
+//! trustworthy. The tier used is reported on [`GamutEvent::Point`] /
+//! [`GamutEvent::Measured`] so a frontend can log fast/escalated vertices.
 
 use std::collections::HashMap;
 use std::thread::sleep;
@@ -20,7 +27,9 @@ use tristim_capture as cap;
 use tristim_color::metrics::{delta_e76, xyz_to_lab};
 use tristim_color::{ColorSpace, mat3_inverse, mat3_mul_vec, transfer};
 use tristim_display::PatchSurface;
-use tristim_driver::{Calibration, Colorimeter, MeasurementConfidence, Setup, TrustFlag, Xyz};
+use tristim_driver::{
+    AdaptiveTier, Calibration, Colorimeter, MeasurementConfidence, Setup, TrustFlag, Xyz,
+};
 
 use crate::format::FormatSpec;
 use crate::{GatherError, open_format};
@@ -58,6 +67,12 @@ pub struct GamutConfig {
     pub format: FormatSpec,
     /// Repeated measurements per probe point (burst within a point).
     pub repeats: usize,
+    /// Optional adaptive fast-tier integration time in milliseconds. When
+    /// `Some(ms)`, every probe point first burst-measures at that integration
+    /// (3× faster at the typical 200 ms) and only re-measures at the
+    /// calibration default if the fast result fails `is_trustworthy()`.
+    /// `None` keeps the legacy single-tier default-integration behavior.
+    pub fast_integration_ms: Option<u16>,
     /// How long to wait after committing a patch before measuring.
     pub settle: Duration,
     /// Countdown given for puck placement before the first measurement.
@@ -109,6 +124,8 @@ pub enum GamutEvent {
         code_value: [f64; 3],
         measured: Xyz,
         flags: Vec<TrustFlag>,
+        /// Which adaptive tier produced the measurement (see [`AdaptiveTier`]).
+        tier: AdaptiveTier,
     },
     /// A point was just measured during adaptive refinement (no fixed total).
     Measured {
@@ -116,6 +133,7 @@ pub enum GamutEvent {
         code_value: [f64; 3],
         measured: Xyz,
         flags: Vec<TrustFlag>,
+        tier: AdaptiveTier,
     },
 }
 
@@ -197,8 +215,13 @@ pub fn probe_gamut(
         // Burst within a point (reset once, then read): auto-zeroing between
         // readings is free accuracy-wise but the per-reading reset is pure
         // overhead in a tight repeat loop (see `characterize --burst`).
-        let raws = device.measure_raw_repeated(&setup, config.repeats, false)?;
-        let confidence = MeasurementConfidence::from_repeats(&raws, &setup, &cal);
+        // Adaptive: when `fast_integration_ms` is set, the device first burst-
+        // measures at the short integration and only escalates to the default
+        // if trust fails — see [`Colorimeter::measure_adaptive`].
+        let result =
+            device.measure_adaptive(&setup, &cal, config.repeats, config.fast_integration_ms)?;
+        let confidence =
+            MeasurementConfidence::from_repeats(&result.raws, &result.setup, &result.cal);
         on_event(GamutEvent::Point {
             index,
             total,
@@ -206,6 +229,7 @@ pub fn probe_gamut(
             code_value: *cv,
             measured: confidence.mean,
             flags: confidence.flags(),
+            tier: result.tier,
         });
         vertices.push(GamutVertex {
             label,
@@ -571,14 +595,16 @@ pub fn probe_gamut_refined(
     let measure = |cv: [f64; 3]| -> Result<ProbeSample, GatherError> {
         surface.set_code_values(cv)?;
         sleep(config.settle);
-        // Burst within a point; reset between points (auto_zero=false resets once).
-        let raws = device.measure_raw_repeated(&setup, config.repeats, false)?;
-        let confidence = MeasurementConfidence::from_repeats(&raws, &setup, &cal);
+        let result =
+            device.measure_adaptive(&setup, &cal, config.repeats, config.fast_integration_ms)?;
+        let confidence =
+            MeasurementConfidence::from_repeats(&result.raws, &result.setup, &result.cal);
         on_event(GamutEvent::Measured {
             index,
             code_value: cv,
             measured: confidence.mean,
             flags: confidence.flags(),
+            tier: result.tier,
         });
         index += 1;
         Ok(ProbeSample {

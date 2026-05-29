@@ -86,6 +86,9 @@ pub struct ScatterRequest {
 pub struct GamutProbeOpts {
     /// Repeated measurements per probe point (burst within a point).
     pub repeats: usize,
+    /// Optional adaptive fast-tier integration in milliseconds (see
+    /// [`GamutConfig::fast_integration_ms`](crate::gamut::GamutConfig::fast_integration_ms)).
+    pub fast_integration_ms: Option<u16>,
     /// Adaptive-refinement thresholds.
     pub refine: RefineParams,
 }
@@ -256,8 +259,17 @@ pub fn run_capture(
                     let measure = |cv: [f64; 3]| -> Result<ProbeSample, GatherError> {
                         surface.set_code_values(cv)?;
                         sleep(config.settle);
-                        let raws = device.measure_raw_repeated(&setup, opts.repeats, false)?;
-                        let conf = MeasurementConfidence::from_repeats(&raws, &setup, &cal);
+                        let result = device.measure_adaptive(
+                            &setup,
+                            &cal,
+                            opts.repeats,
+                            opts.fast_integration_ms,
+                        )?;
+                        let conf = MeasurementConfidence::from_repeats(
+                            &result.raws,
+                            &result.setup,
+                            &result.cal,
+                        );
                         let xyz = conf.mean;
                         let sample = cap::Sample {
                             requested: cv,

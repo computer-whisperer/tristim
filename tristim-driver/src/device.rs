@@ -1,8 +1,10 @@
 //! High-level handle for an open Datacolor Spyder colorimeter.
 
+use crate::confidence::MeasurementConfidence;
 use crate::measurement::{
-    self, Calibration, RawMeasurement, Setup, Xyz, encode_measure_request, parse_calibration,
-    parse_raw_measurement, parse_setup,
+    self, AdaptiveMeasurement, AdaptiveTier, Calibration, RawMeasurement, Setup, Xyz,
+    encode_measure_request, override_integration, parse_calibration, parse_raw_measurement,
+    parse_setup,
 };
 use crate::protocol::{DATACOLOR_VID, EP_IN, EP_OUT, HEADER_LEN, Opcode, pid};
 use rusb::{Context, DeviceHandle, UsbContext};
@@ -294,6 +296,10 @@ impl Colorimeter {
     /// Issues `send_reset()` (auto-zero) then opcode `0xF2`. The integration
     /// time embedded in `setup.s2` determines how long the device takes to
     /// reply — for our default (~714 msec), expect ~1 second wall time.
+    ///
+    /// For batch measurement loops (gamut probes, dense LUT calibration), prefer
+    /// [`measure_adaptive`](Self::measure_adaptive): it amortizes the reset, optionally
+    /// shortens integration on bright points, and gates trust automatically.
     pub fn measure_raw(&mut self, setup: &Setup) -> Result<RawMeasurement> {
         // Argyll resets before every measurement (auto-zero behavior).
         self.send_reset()?;
@@ -357,6 +363,66 @@ impl Colorimeter {
             out.push(raw);
         }
         Ok(out)
+    }
+
+    /// Two-tier adaptive measurement, the right primitive for dense LUT or
+    /// gamut-probe loops that want bright-point speedup without giving up
+    /// trust at dim points.
+    ///
+    /// When `fast_ms` is `Some(ms)` (and in range), a burst of `repeats`
+    /// readings is first taken at the override integration time. If the
+    /// resulting [`MeasurementConfidence`] is trustworthy at the default
+    /// thresholds, that's the result ([`AdaptiveTier::Fast`]). Otherwise a
+    /// second burst is taken at the calibration default, and *that* is
+    /// returned ([`AdaptiveTier::EscalatedFull`]) — the fast result is
+    /// discarded.
+    ///
+    /// When `fast_ms` is `None` or fails [`override_integration`]'s range
+    /// check, a single default-integration burst is taken
+    /// ([`AdaptiveTier::SingleFull`]) — useful as a uniform call site
+    /// regardless of whether adaptive mode is enabled.
+    ///
+    /// The returned `setup`/`cal` are the pair that actually produced `raws`,
+    /// so they can be passed straight to
+    /// [`MeasurementConfidence::from_repeats`] for correctly-scaled XYZ.
+    pub fn measure_adaptive(
+        &mut self,
+        base_setup: &Setup,
+        base_cal: &Calibration,
+        repeats: usize,
+        fast_ms: Option<u16>,
+    ) -> Result<AdaptiveMeasurement> {
+        let fast_pair = fast_ms
+            .and_then(|ms| override_integration(base_setup, base_cal, ms).ok());
+
+        let Some((setup_fast, cal_fast)) = fast_pair else {
+            let raws = self.measure_raw_repeated(base_setup, repeats, false)?;
+            return Ok(AdaptiveMeasurement {
+                raws,
+                setup: base_setup.clone(),
+                cal: base_cal.clone(),
+                tier: AdaptiveTier::SingleFull,
+            });
+        };
+
+        let raws_fast = self.measure_raw_repeated(&setup_fast, repeats, false)?;
+        let conf_fast = MeasurementConfidence::from_repeats(&raws_fast, &setup_fast, &cal_fast);
+        if conf_fast.is_trustworthy() {
+            return Ok(AdaptiveMeasurement {
+                raws: raws_fast,
+                setup: setup_fast,
+                cal: cal_fast,
+                tier: AdaptiveTier::Fast,
+            });
+        }
+
+        let raws_full = self.measure_raw_repeated(base_setup, repeats, false)?;
+        Ok(AdaptiveMeasurement {
+            raws: raws_full,
+            setup: base_setup.clone(),
+            cal: base_cal.clone(),
+            tier: AdaptiveTier::EscalatedFull,
+        })
     }
 
     /// End-to-end XYZ measurement using calibration index `cal_index`.

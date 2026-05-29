@@ -307,6 +307,7 @@ impl CaptureForm {
 
         let gamut = self.probe_gamut.then(|| gather::GamutProbeOpts {
             repeats: self.gamut_repeats,
+            fast_integration_ms: None,
             refine: gather::RefineParams {
                 max_depth: self.gamut_max_depth,
                 ..Default::default()

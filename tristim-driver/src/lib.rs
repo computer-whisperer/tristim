@@ -15,7 +15,7 @@ pub mod protocol;
 pub use confidence::{MeasurementConfidence, TrustFlag};
 pub use device::{Colorimeter, DeviceInfo};
 pub use measurement::{
-    Calibration, IntegrationError, MIN_INTEGRATION_MS, RawMeasurement, Setup, Xyz,
-    override_integration,
+    AdaptiveMeasurement, AdaptiveTier, Calibration, IntegrationError, MIN_INTEGRATION_MS,
+    RawMeasurement, Setup, Xyz, override_integration,
 };
 pub use protocol::{DATACOLOR_VID, Opcode};
