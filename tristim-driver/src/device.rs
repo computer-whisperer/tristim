@@ -392,8 +392,7 @@ impl Colorimeter {
         repeats: usize,
         fast_ms: Option<u16>,
     ) -> Result<AdaptiveMeasurement> {
-        let fast_pair = fast_ms
-            .and_then(|ms| override_integration(base_setup, base_cal, ms).ok());
+        let fast_pair = fast_ms.and_then(|ms| override_integration(base_setup, base_cal, ms).ok());
 
         let Some((setup_fast, cal_fast)) = fast_pair else {
             let raws = self.measure_raw_repeated(base_setup, repeats, false)?;

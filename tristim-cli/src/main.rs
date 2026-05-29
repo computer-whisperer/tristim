@@ -87,7 +87,9 @@ fn print_usage() {
     eprintln!("        Options:");
     eprintln!("          --cal N            calibration index (default: 0)");
     eprintln!("          --shots K          shots per cell (default: 16; caps the repeats list)");
-    eprintln!("          --levels a,b,c     grey code values to test (default: 1.0,0.25,0.063,0.0)");
+    eprintln!(
+        "          --levels a,b,c     grey code values to test (default: 1.0,0.25,0.063,0.0)"
+    );
     eprintln!("          --repeats N1,N2,.. N values to derive trust at (default: 1,2,4,8,16)");
     eprintln!("          --mode M           'auto-zero', 'burst', or 'both' (default: both)");
     eprintln!("          --settle-ms N      ms to wait after each level (default: 400)");
@@ -116,7 +118,9 @@ fn print_usage() {
     eprintln!("          --refine           adaptively subdivide the faces + detect clamping");
     eprintln!("          --max-depth N      max subdivision depth with --refine (default: 3)");
     eprintln!("          --fast-integration MS  adaptive integration: bright points probe at MS,");
-    eprintln!("                             escalate to default only on untrust (3× speedup at 200)");
+    eprintln!(
+        "                             escalate to default only on untrust (3× speedup at 200)"
+    );
     eprintln!("  capture --output NAME [opts]");
     eprintln!("        Run a capture session and write a tristim-capture JSON file.");
     eprintln!("        Options:");
@@ -449,10 +453,7 @@ fn cmd_speed(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
             let mean_shot_ms = shot_ms.iter().sum::<f64>() / shot_ms.len() as f64;
 
-            println!(
-                "  {mode_label} (t/shot = {:.0} ms):",
-                mean_shot_ms,
-            );
+            println!("  {mode_label} (t/shot = {:.0} ms):", mean_shot_ms,);
             println!(
                 "    {:>4}  {:>8}  {:>10}  {:>8}  {:>9}  {:>8}  flags",
                 "N", "total", "Y(cd/m²)", "sY/Y", "Δu'v'", "floor_σ",
@@ -644,9 +645,10 @@ fn cmd_gamut(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some(s) => Some(parse_rgb(&s)?),
         None => None,
     };
-    let fast_integration_ms: Option<u16> =
-        arg_value(args, "--fast-integration").map(|s| s.parse()).transpose()
-            .map_err(|_| "--fast-integration: expected integer ms")?;
+    let fast_integration_ms: Option<u16> = arg_value(args, "--fast-integration")
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|_| "--fast-integration: expected integer ms")?;
 
     let config = gather::GamutConfig {
         output: output.clone(),
