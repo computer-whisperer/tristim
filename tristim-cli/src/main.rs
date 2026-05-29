@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "info" => cmd_info(),
         "measure" => cmd_measure(&argv[2..]),
         "characterize" | "char" => cmd_characterize(&argv[2..]),
+        "speed" => cmd_speed(&argv[2..]),
         "gamut" => cmd_gamut(&argv[2..]),
         "capture" => cmd_capture(&argv[2..]),
         "report" => cmd_report(&argv[2..]),
@@ -70,12 +71,24 @@ fn print_usage() {
     eprintln!("          --burst            reset once then read back-to-back (isolates read");
     eprintln!("                             noise); default auto-zeros before every reading");
     eprintln!("          --raw              also print per-channel raw mean/sd/headroom");
+    eprintln!("  speed --output NAME [opts]");
+    eprintln!("        Push the sensor as hard as it'll go: per (level × mode) cell, take");
+    eprintln!("        K shots back-to-back (timed each) and derive trust at every N in the");
+    eprintln!("        repeats list. Answers \"what's the fastest setting that still trusts?\"");
+    eprintln!("        Options:");
+    eprintln!("          --cal N            calibration index (default: 0)");
+    eprintln!("          --shots K          shots per cell (default: 16; caps the repeats list)");
+    eprintln!("          --levels a,b,c     grey code values to test (default: 1.0,0.25,0.063,0.0)");
+    eprintln!("          --repeats N1,N2,.. N values to derive trust at (default: 1,2,4,8,16)");
+    eprintln!("          --mode M           'auto-zero', 'burst', or 'both' (default: both)");
+    eprintln!("          --settle-ms N      ms to wait after each level (default: 400)");
+    eprintln!("          --prep-secs N      seconds to wait for puck placement (default: 6)");
     eprintln!("  gamut --output NAME --format SPEC [opts]");
     eprintln!("        Probe the display's reproduced gamut for one encoding by measuring");
     eprintln!("        the code-cube surface (8 corners + 6 face centers), each with a");
     eprintln!("        trust verdict. Options:");
     eprintln!("          --cal N            calibration index (default: 0)");
-    eprintln!("          --repeats N        measurements per probe point (default: 16)");
+    eprintln!("          --repeats N        measurements per probe point (default: 4)");
     eprintln!("          --settle-ms N      ms to wait after each patch (default: 250)");
     eprintln!("          --prep-secs N      seconds to wait for puck placement (default: 6)");
     eprintln!("          --window F         centered-window area fraction (default: 1.0)");
@@ -96,7 +109,7 @@ fn print_usage() {
     eprintln!(
         "          --probe-gamut      probe each format's gamut first, record it on the trial"
     );
-    eprintln!("          --gamut-repeats N  repeats per gamut probe point (default: 8)");
+    eprintln!("          --gamut-repeats N  repeats per gamut probe point (default: 4)");
     eprintln!("          --gamut-max-depth N  gamut refinement depth (default: 3)");
     eprintln!();
     eprintln!("        --format SPEC (name[:k=v,...]):");
@@ -318,6 +331,160 @@ fn fmt_flags(flags: &[TrustFlag]) -> String {
         .join(",")
 }
 
+// ── speed ──────────────────────────────────────────────────────────────────
+
+/// Levels chosen to span the trust regime: white (best case), upper-quarter
+/// (well-trusted), the cv≈0.063 boundary where DUV first fires on DP-8, and
+/// panel black (worst case). User can override with --levels.
+const SPEED_DEFAULT_LEVELS: &[f64] = &[1.0, 0.25, 16.0 / 255.0, 0.0];
+
+const SPEED_DEFAULT_REPEATS: &[usize] = &[1, 2, 4, 8, 16];
+
+fn cmd_speed(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let output = arg_value(args, "--output")
+        .ok_or("--output NAME is required (try `tristim list-outputs`)")?;
+    let cal_index: u8 = parse_opt(args, "--cal", 0);
+    let shots: usize = parse_opt(args, "--shots", 16);
+    let settle_ms: u64 = parse_opt(args, "--settle-ms", 400);
+    let prep_secs: u64 = parse_opt(args, "--prep-secs", 6);
+    let levels: Vec<f64> = match arg_value(args, "--levels") {
+        Some(s) => parse_f64_list(&s)?,
+        None => SPEED_DEFAULT_LEVELS.to_vec(),
+    };
+    let mut repeats_list: Vec<usize> = match arg_value(args, "--repeats") {
+        Some(s) => parse_usize_list(&s)?,
+        None => SPEED_DEFAULT_REPEATS.to_vec(),
+    };
+    repeats_list.retain(|&n| n >= 1 && n <= shots);
+    repeats_list.sort_unstable();
+    repeats_list.dedup();
+    if repeats_list.is_empty() {
+        return Err(format!("--repeats: no valid N values (must be 1..={shots})").into());
+    }
+    let mode_arg = arg_value(args, "--mode").unwrap_or_else(|| "both".into());
+    let modes: Vec<bool> = match mode_arg.as_str() {
+        "auto-zero" | "auto" => vec![true],
+        "burst" => vec![false],
+        "both" => vec![true, false],
+        other => {
+            return Err(format!("--mode: expected auto-zero|burst|both, got {other:?}").into());
+        }
+    };
+
+    let mut device = Colorimeter::open_any()?;
+    let info = device.get_info()?;
+    let cal = device.get_calibration(cal_index)?;
+    let setup = device.get_setup(&cal)?;
+    let product = if device.is_spyder_2024() {
+        "Spyder 2024"
+    } else {
+        "SpyderX2"
+    };
+
+    eprintln!(
+        "{product} SN {} — speed test, cal {cal_index}, {shots} shots/cell, N ∈ {:?}",
+        info.serial, repeats_list,
+    );
+    eprintln!(
+        "  black-cal s5 = {:?}   integration s2 = 0x{:04x}",
+        setup.s5, setup.s2,
+    );
+    eprintln!("Place the puck flat against '{output}'. Starting in {prep_secs}s.");
+
+    let mut surface = PatchSurface::open_sdr(&output)?;
+    surface.set_code_values([0.0, 0.0, 0.0])?;
+    for remaining in (1..=prep_secs).rev() {
+        eprintln!("  starting in {remaining}s...");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    for &cv in &levels {
+        let cv = cv.clamp(0.0, 1.0);
+        surface.set_code_values([cv, cv, cv])?;
+        std::thread::sleep(Duration::from_millis(settle_ms));
+        println!();
+        println!("[level cv={cv:.4}]");
+
+        for &auto_zero in &modes {
+            let mode_label = if auto_zero { "auto-zero" } else { "burst" };
+
+            if !auto_zero {
+                device.send_reset()?;
+            }
+            let mut raws = Vec::with_capacity(shots);
+            let mut shot_ms = Vec::with_capacity(shots);
+            for _ in 0..shots {
+                let t0 = std::time::Instant::now();
+                let raw = if auto_zero {
+                    device.measure_raw(&setup)?
+                } else {
+                    device.measure_raw_no_reset(&setup)?
+                };
+                let dt = t0.elapsed().as_secs_f64() * 1000.0;
+                raws.push(raw);
+                shot_ms.push(dt);
+            }
+            let mean_shot_ms = shot_ms.iter().sum::<f64>() / shot_ms.len() as f64;
+
+            println!(
+                "  {mode_label} (t/shot = {:.0} ms):",
+                mean_shot_ms,
+            );
+            println!(
+                "    {:>4}  {:>8}  {:>10}  {:>8}  {:>9}  {:>8}  flags",
+                "N", "total", "Y(cd/m²)", "sY/Y", "Δu'v'", "floor_σ",
+            );
+            for &n in &repeats_list {
+                let conf = MeasurementConfidence::from_repeats(&raws[..n], &setup, &cal);
+                let total_s = mean_shot_ms * n as f64 / 1000.0;
+                // For N=1 the temporal std is necessarily zero — flag verdict as quant-only
+                // so the reader doesn't mistake it for a real trust check.
+                let flags_col = if n < 2 {
+                    "quant-only".to_string()
+                } else {
+                    fmt_flags(&conf.flags())
+                };
+                println!(
+                    "    {:>4}  {:>6.2} s  {:>10.3}  {:>7.2}%  {:>9}  {:>8.1}  {}",
+                    n,
+                    total_s,
+                    conf.mean.y,
+                    100.0 * conf.y_rel_uncertainty(),
+                    fmt_duv(conf.uv_std()),
+                    conf.min_floor_sigma,
+                    flags_col,
+                );
+            }
+
+            // Drift check: does Y wander across the K shots? Compare mean Y of
+            // the first vs the second half. Burst's worry is dark-current creep
+            // between resets — a non-zero drift here is the first sign.
+            if shots >= 4 {
+                let half = shots / 2;
+                let first: Vec<_> = raws[..half].to_vec();
+                let last: Vec<_> = raws[shots - half..].to_vec();
+                let cf = MeasurementConfidence::from_repeats(&first, &setup, &cal);
+                let cl = MeasurementConfidence::from_repeats(&last, &setup, &cal);
+                let dy = cl.mean.y - cf.mean.y;
+                let rel = if cf.mean.y.abs() > 1e-9 {
+                    dy / cf.mean.y
+                } else {
+                    0.0
+                };
+                println!(
+                    "    drift: first {half}={:.3}, last {half}={:.3}  (ΔY={:+.3} = {:+.2}%)",
+                    cf.mean.y,
+                    cl.mean.y,
+                    dy,
+                    100.0 * rel,
+                );
+            }
+        }
+    }
+    let _ = surface.set_code_values([0.0, 0.0, 0.0]);
+    Ok(())
+}
+
 // ── gamut ───────────────────────────────────────────────────────────────────
 
 /// sRGB / BT.709 primary triangle area in the xy plane — a familiar yardstick
@@ -330,7 +497,7 @@ fn cmd_gamut(args: &[String]) -> Result<(), Box<dyn Error>> {
     let format_spec =
         arg_value(args, "--format").ok_or("--format SPEC is required (see `tristim help`)")?;
     let cal_index: u8 = parse_opt(args, "--cal", 0);
-    let repeats: usize = parse_opt(args, "--repeats", 16);
+    let repeats: usize = parse_opt(args, "--repeats", 4);
     let settle_ms: u64 = parse_opt(args, "--settle-ms", 250);
     let prep_secs: u64 = parse_opt(args, "--prep-secs", 6);
     let window_fraction: f64 = parse_opt(args, "--window", 1.0);
@@ -703,7 +870,7 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
     // Optional per-format gamut-probe prerequisite.
     let gamut = if args.iter().any(|a| a == "--probe-gamut") {
         Some(gather::GamutProbeOpts {
-            repeats: parse_opt(args, "--gamut-repeats", 8),
+            repeats: parse_opt(args, "--gamut-repeats", 4),
             refine: gather::RefineParams {
                 max_depth: parse_opt(args, "--gamut-max-depth", 3),
                 ..Default::default()
@@ -837,6 +1004,26 @@ fn parse_opt<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> T
     arg_value(args, flag)
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+fn parse_f64_list(s: &str) -> Result<Vec<f64>, String> {
+    s.split(',')
+        .map(|p| {
+            p.trim()
+                .parse::<f64>()
+                .map_err(|_| format!("bad number {p:?} in list {s:?}"))
+        })
+        .collect()
+}
+
+fn parse_usize_list(s: &str) -> Result<Vec<usize>, String> {
+    s.split(',')
+        .map(|p| {
+            p.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("bad integer {p:?} in list {s:?}"))
+        })
+        .collect()
 }
 
 fn parse_rgb(s: &str) -> Result<[f64; 3], String> {

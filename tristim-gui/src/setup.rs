@@ -106,7 +106,7 @@ impl CaptureForm {
             prep_secs: 6,
             window_pct: 100,
             probe_gamut: false,
-            gamut_repeats: 8,
+            gamut_repeats: 4,
             gamut_max_depth: 3,
             capabilities: None,
             error: None,
