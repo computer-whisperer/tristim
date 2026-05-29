@@ -55,8 +55,15 @@ pub struct Setup {
     /// Echoed v1 (must match the v1 from [`Calibration`]).
     pub s1: u8,
 
-    /// 16-bit integration parameter (BE). Distinct from `Calibration::v2`
-    /// despite the similar role — Argyll comments call this a "magic" value.
+    /// Integration time in milliseconds (16-bit BE). Empirically linear with
+    /// wall time and raw count magnitude across `[10, cal.v2]` on Spyder 2024;
+    /// above `cal.v2` (the device's calibrated default) the firmware silently
+    /// misbehaves — both wall time and raw counts go nonsensical. So `cal.v2`
+    /// is the practical ceiling, even though the field type is `u16`. Argyll
+    /// keeps this distinct from `cal.v2` and treats it as opaque; for the
+    /// SpyderX2 / Spyder 2024 lineup the device returns it equal to `cal.v2`
+    /// and we now use it as the integration knob (see
+    /// [`override_integration`]).
     pub s2: u16,
 
     /// 6 channel-index bytes (typically pass-through to measure cmd).
@@ -275,4 +282,168 @@ pub enum ParseError {
 
     #[error("setup v1 mismatch: expected {expected}, got {got}")]
     SetupV1Mismatch { expected: u8, got: u8 },
+}
+
+// ---------------------------------------------------------------------------
+// Integration-time override
+// ---------------------------------------------------------------------------
+
+/// Below this the protocol overhead dominates wall time and SNR collapses on
+/// any non-trivial signal. Above this the firmware silently misbehaves (raw
+/// counts and wall time both go nonsensical past ~720 ms, the per-unit
+/// calibration ceiling).
+pub const MIN_INTEGRATION_MS: u16 = 10;
+
+#[derive(Debug, thiserror::Error)]
+pub enum IntegrationError {
+    #[error("integration time {got} ms out of range [{min}, {max}]")]
+    OutOfRange { got: u16, min: u16, max: u16 },
+}
+
+impl Calibration {
+    /// The integration time (ms) this per-unit calibration was characterized
+    /// at — and the device's natural firmware ceiling. Same as `v2`; named for
+    /// readability at call sites.
+    pub fn integration_ms(&self) -> u16 {
+        self.v2
+    }
+}
+
+/// Build a [`Setup`] + [`Calibration`] pair for measuring at a non-default
+/// integration time. **Use the returned pair together** — the setup tells the
+/// device how long to integrate, the calibration scales raw counts so that
+/// [`raw_to_xyz`] (and downstream
+/// [`MeasurementConfidence`](crate::confidence::MeasurementConfidence)) return
+/// XYZ in the same absolute units as a default-integration measurement.
+/// Pairing the returned setup with the original calibration (or vice versa)
+/// silently misreports luminance by the integration ratio.
+///
+/// The matrix is scaled by `cal.integration_ms() / target_ms` so that
+/// `XYZ = matrix_scaled · (raw_at_target − s5) · gain + offset` reproduces the
+/// XYZ a default-integration measurement of the same scene would have given.
+/// Gain and offset are unchanged (they're integration-independent calibration
+/// terms applied after the matrix).
+///
+/// `target_ms` must lie in `[`[`MIN_INTEGRATION_MS`]`, cal.integration_ms()]`
+/// — the upper end is the firmware's actual ceiling.
+///
+/// # Caveats
+/// The dark-cal floor `s5` is left unscaled. True dark current is proportional
+/// to integration time, so subtracting the calibrated (default-integration) s5
+/// at a shorter integration over-corrects by a few counts. The bias is below
+/// 1% for any meaningfully bright signal — the regime where short integration
+/// is worth using.
+pub fn override_integration(
+    setup: &Setup,
+    cal: &Calibration,
+    target_ms: u16,
+) -> Result<(Setup, Calibration), IntegrationError> {
+    let max_ms = cal.integration_ms();
+    if target_ms < MIN_INTEGRATION_MS || target_ms > max_ms {
+        return Err(IntegrationError::OutOfRange {
+            got: target_ms,
+            min: MIN_INTEGRATION_MS,
+            max: max_ms,
+        });
+    }
+
+    let scale = cal.v2 as f64 / target_ms as f64;
+    let mut scaled_cal = cal.clone();
+    for row in &mut scaled_cal.matrix {
+        for entry in row {
+            *entry *= scale;
+        }
+    }
+    let new_setup = Setup {
+        s2: target_ms,
+        ..setup.clone()
+    };
+    Ok((new_setup, scaled_cal))
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    fn unit_cal_v2(v2: u16) -> Calibration {
+        let mut matrix = [[0.0f64; 6]; 3];
+        matrix[0][0] = 1.0;
+        matrix[1][1] = 1.0;
+        matrix[2][2] = 1.0;
+        Calibration {
+            index: 0,
+            v1: 0,
+            v2,
+            v4: [0; 6],
+            matrix,
+            gain: [1.0; 3],
+            offset: [0.0; 3],
+            v3: 0,
+        }
+    }
+
+    fn zero_floor_setup() -> Setup {
+        Setup {
+            s1: 0,
+            s2: 714,
+            s3: [0; 6],
+            s4: [0; 6],
+            s5: [0; 6],
+        }
+    }
+
+    /// Half-integration measurement should reconstruct the same XYZ as the
+    /// default once we use the returned scaled calibration. This is the
+    /// guarantee the API exists to make.
+    #[test]
+    fn override_preserves_absolute_xyz() {
+        let cal = unit_cal_v2(714);
+        let setup = zero_floor_setup();
+        let raw_full = RawMeasurement([200, 150, 100, 0, 0, 0]);
+        let xyz_full = raw_to_xyz(&raw_full, &setup, &cal);
+
+        let (setup_half, cal_half) = override_integration(&setup, &cal, 357).unwrap();
+        assert_eq!(setup_half.s2, 357);
+        let raw_half = RawMeasurement([100, 75, 50, 0, 0, 0]);
+        let xyz_half = raw_to_xyz(&raw_half, &setup_half, &cal_half);
+
+        assert!((xyz_full.x - xyz_half.x).abs() < 1e-9);
+        assert!((xyz_full.y - xyz_half.y).abs() < 1e-9);
+        assert!((xyz_full.z - xyz_half.z).abs() < 1e-9);
+    }
+
+    /// Below MIN or above cal.v2 the firmware misbehaves; the API refuses
+    /// rather than handing back garbage.
+    #[test]
+    fn override_rejects_out_of_range() {
+        let cal = unit_cal_v2(714);
+        let setup = zero_floor_setup();
+        assert!(matches!(
+            override_integration(&setup, &cal, 5),
+            Err(IntegrationError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            override_integration(&setup, &cal, 1000),
+            Err(IntegrationError::OutOfRange { .. })
+        ));
+        // Boundaries are accepted.
+        assert!(override_integration(&setup, &cal, MIN_INTEGRATION_MS).is_ok());
+        assert!(override_integration(&setup, &cal, cal.v2).is_ok());
+    }
+
+    /// The override at the device default must be a no-op — same setup, same
+    /// matrix entries. This is what lets a caller pass `cal.integration_ms()`
+    /// unconditionally without changing behavior.
+    #[test]
+    fn override_at_default_is_identity() {
+        let cal = unit_cal_v2(714);
+        let setup = zero_floor_setup();
+        let (setup_id, cal_id) = override_integration(&setup, &cal, 714).unwrap();
+        assert_eq!(setup_id.s2, setup.s2);
+        for i in 0..3 {
+            for j in 0..6 {
+                assert!((cal_id.matrix[i][j] - cal.matrix[i][j]).abs() < 1e-12);
+            }
+        }
+    }
 }

@@ -25,7 +25,7 @@ use tristim_analyze::{GroundTruth, GroundTruthSource, analyze};
 use tristim_capture as cap;
 use tristim_color::metrics::triangle_area_xy;
 use tristim_display::{PatchSurface, list_outputs};
-use tristim_driver::{Colorimeter, MeasurementConfidence, TrustFlag};
+use tristim_driver::{Colorimeter, MeasurementConfidence, TrustFlag, override_integration};
 use tristim_gather as gather;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "measure" => cmd_measure(&argv[2..]),
         "characterize" | "char" => cmd_characterize(&argv[2..]),
         "speed" => cmd_speed(&argv[2..]),
+        "integration" => cmd_integration(&argv[2..]),
         "gamut" => cmd_gamut(&argv[2..]),
         "capture" => cmd_capture(&argv[2..]),
         "report" => cmd_report(&argv[2..]),
@@ -82,6 +83,17 @@ fn print_usage() {
     eprintln!("          --repeats N1,N2,.. N values to derive trust at (default: 1,2,4,8,16)");
     eprintln!("          --mode M           'auto-zero', 'burst', or 'both' (default: both)");
     eprintln!("          --settle-ms N      ms to wait after each level (default: 400)");
+    eprintln!("          --prep-secs N      seconds to wait for puck placement (default: 6)");
+    eprintln!("  integration --output NAME --integrations a,b,c [opts]");
+    eprintln!("        Override the device's integration time (setup.s2) and sweep it at one");
+    eprintln!("        grey level. Reports wall time and trust per s2 — answers \"does the");
+    eprintln!("        device honor a non-default s2, and does it scale linearly?\"");
+    eprintln!("        Options:");
+    eprintln!("          --integrations a,b,c  s2 values in ms (required, e.g. 100,300,714,1000)");
+    eprintln!("          --level CV         grey code value to sit on (default: 1.0)");
+    eprintln!("          --cal N            calibration index (default: 0)");
+    eprintln!("          --repeats N        burst repeats per s2 (default: 8)");
+    eprintln!("          --settle-ms N      ms to wait after setting the level (default: 400)");
     eprintln!("          --prep-secs N      seconds to wait for puck placement (default: 6)");
     eprintln!("  gamut --output NAME --format SPEC [opts]");
     eprintln!("        Probe the display's reproduced gamut for one encoding by measuring");
@@ -480,6 +492,122 @@ fn cmd_speed(args: &[String]) -> Result<(), Box<dyn Error>> {
                 );
             }
         }
+    }
+    let _ = surface.set_code_values([0.0, 0.0, 0.0]);
+    Ok(())
+}
+
+// ── integration ────────────────────────────────────────────────────────────
+
+fn cmd_integration(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let output = arg_value(args, "--output")
+        .ok_or("--output NAME is required (try `tristim list-outputs`)")?;
+    let integrations_s = arg_value(args, "--integrations")
+        .ok_or("--integrations LIST is required (e.g. --integrations 100,300,714)")?;
+    let integrations: Vec<u16> = parse_usize_list(&integrations_s)?
+        .into_iter()
+        .map(|n| n.min(u16::MAX as usize) as u16)
+        .collect();
+    if integrations.is_empty() {
+        return Err("--integrations: empty list".into());
+    }
+    let cal_index: u8 = parse_opt(args, "--cal", 0);
+    let level: f64 = parse_opt(args, "--level", 1.0_f64).clamp(0.0, 1.0);
+    let repeats: usize = parse_opt(args, "--repeats", 8);
+    let settle_ms: u64 = parse_opt(args, "--settle-ms", 400);
+    let prep_secs: u64 = parse_opt(args, "--prep-secs", 6);
+
+    let mut device = Colorimeter::open_any()?;
+    let info = device.get_info()?;
+    let cal = device.get_calibration(cal_index)?;
+    let setup = device.get_setup(&cal)?;
+    let product = if device.is_spyder_2024() {
+        "Spyder 2024"
+    } else {
+        "SpyderX2"
+    };
+
+    eprintln!(
+        "{product} SN {} — integration sweep, cal {cal_index}, level cv={level:.4}, {repeats} burst repeats",
+        info.serial,
+    );
+    eprintln!(
+        "  device default: setup.s2 = 0x{:04x} ({} ms) = cal.v2",
+        setup.s2, setup.s2,
+    );
+    eprintln!("  black-cal s5 = {:?}", setup.s5);
+    eprintln!("Place the puck flat against '{output}'. Starting in {prep_secs}s.");
+
+    let mut surface = PatchSurface::open_sdr(&output)?;
+    surface.set_code_values([level, level, level])?;
+    for remaining in (1..=prep_secs).rev() {
+        eprintln!("  starting in {remaining}s...");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    std::thread::sleep(Duration::from_millis(settle_ms));
+
+    // Y here is absolute (the override scales the calibration), so cells should
+    // agree across s2 — a quick mental check that the override is doing its job.
+    println!(
+        "{:>8}  {:>9}  {:>8}  {:>10}  {:>8}  {:>10}  {:>8}  flags",
+        "s2(ms)", "t/shot", "raw_max", "Y(cd/m²)", "sY/Y", "Δu'v'", "floor_σ",
+    );
+
+    for &s2 in &integrations {
+        let (setup_at, cal_at) = match override_integration(&setup, &cal, s2) {
+            Ok(pair) => pair,
+            Err(e) => {
+                println!("{s2:>8}  rejected: {e}");
+                continue;
+            }
+        };
+
+        device.send_reset()?;
+        let mut raws = Vec::with_capacity(repeats);
+        let mut shot_ms = Vec::with_capacity(repeats);
+        // measure_raw_no_reset is the right call here: send_reset above primes
+        // the burst, so we burst all repeats then move on (next s2 resets again).
+        let mut ok = true;
+        for _ in 0..repeats {
+            let t0 = std::time::Instant::now();
+            match device.measure_raw_no_reset(&setup_at) {
+                Ok(r) => {
+                    shot_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                    raws.push(r);
+                }
+                Err(e) => {
+                    println!("{s2:>8}  device error: {e}");
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let mean_shot_ms = shot_ms.iter().sum::<f64>() / shot_ms.len() as f64;
+        let conf = MeasurementConfidence::from_repeats(&raws, &setup_at, &cal_at);
+        let raw_max = raws
+            .iter()
+            .map(|r| *r.0.iter().max().unwrap_or(&0))
+            .max()
+            .unwrap_or(0);
+        let flags = if repeats < 2 {
+            "quant-only".to_string()
+        } else {
+            fmt_flags(&conf.flags())
+        };
+        println!(
+            "{:>8}  {:>6.0} ms  {:>8}  {:>10.3}  {:>7.2}%  {:>10}  {:>8.1}  {}",
+            s2,
+            mean_shot_ms,
+            raw_max,
+            conf.mean.y,
+            100.0 * conf.y_rel_uncertainty(),
+            fmt_duv(conf.uv_std()),
+            conf.min_floor_sigma,
+            flags,
+        );
     }
     let _ = surface.set_code_values([0.0, 0.0, 0.0]);
     Ok(())
