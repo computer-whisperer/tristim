@@ -12,11 +12,17 @@
 //! the GUI); this binary parses args, drives it with a stderr-logging
 //! callback, and saves the result.
 //!
-//! Subcommands:
+//! Subcommands (see `tristim help` for the full option set):
 //!   tristim list-outputs                 enumerate connected outputs
 //!   tristim info                         open the colorimeter, print HW info
 //!   tristim measure [--cal N]            take one XYZ measurement (aim manually)
+//!   tristim characterize --output NAME   sweep grey levels to characterize sensor noise / trust
+//!   tristim speed --output NAME          push the sensor: per-cell wall time × N at each level
+//!   tristim integration --output NAME    sweep `setup.s2` integration time at one level
+//!   tristim gamut --output NAME --format SPEC
+//!                                        probe one encoding's reproduced gamut
 //!   tristim capture --output NAME ...    run a capture session, write JSON
+//!   tristim report FILE.json             analyze a capture, print per-trial error
 
 use std::error::Error;
 use std::time::Duration;

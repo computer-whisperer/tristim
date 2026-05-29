@@ -47,15 +47,23 @@ working from the documented wire format, not a code translation.
 ## Workspace layout
 
 - `tristim-driver/` — rusb-based device protocol (init, calibration-data
-  download, measurement). The reusable core; no Wayland dependency.
+  download, measurement). The reusable core; no Wayland dependency. Exposes
+  per-measurement [`MeasurementConfidence`] (σY/Y, Δu'v', floor σ vs. trust
+  thresholds), an `override_integration` helper for bright-point speedup
+  without losing absolute XYZ, and a two-tier `measure_adaptive` primitive
+  for batch loops like dense 3D LUT calibration.
 - `tristim-display/` — Wayland layer-shell client that renders known SDR/HDR
   patches on a chosen output, with optional centered-window mode for
   ABL-limited OLED peak measurement.
 - `tristim-capture/` — serde schema for capture files: the contract between
   the gatherer and the analysis/presentation tools. No heavy deps.
-- `tristim-cli/` — the gatherer binary `tristim` (`list-outputs`, `info`,
-  `measure`, `capture`). `capture` drives a format × color-sequence sweep and
-  writes a capture JSON.
+- `tristim-cli/` — the gatherer binary `tristim`. Subcommands:
+  `list-outputs`, `info`, `measure` (one shot); `characterize` (sensor
+  noise / trust sweep); `speed` (per-cell wall-time × repeat count probe);
+  `integration` (sweep `setup.s2` integration time at one level);
+  `gamut` (probe a format's reproduced gamut, optionally with adaptive
+  integration via `--fast-integration MS`); `capture` (format × color-sequence
+  sweep → capture JSON); `report` (analyze a capture).
 
 ArgyllCMS source is referenced (read-only) under `refs/argyll/` for
 protocol-decoding purposes. We don't link it.
