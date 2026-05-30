@@ -1,6 +1,6 @@
 # tristim-gui
 
-An [aetna](https://github.com/computer-whisperer/aetna)-based front end for
+An [damascene](https://github.com/computer-whisperer/damascene)-based front end for
 tristim. Launched with a capture JSON it opens straight into the visualization
 of how faithfully a compositor reproduced color on the output under test — a CIE
 chromaticity field with per-sample error vectors, a measured-vs-expected
@@ -15,10 +15,10 @@ rather than a fork of them.
 
 ## Why this crate is outside the workspace
 
-`tristim-gui` depends on aetna through a **local path dependency**
-(`../../aetna/aetna.main`), which CI cannot fetch and which drags in the GPU
+`tristim-gui` depends on damascene through a **local path dependency**
+(`../../damascene/damascene.main`), which CI cannot fetch and which drags in the GPU
 stack (wgpu, winit, …). To keep the portable backend libraries — the crates
-intended for crates.io — building and testing in CI without aetna present, this
+intended for crates.io — building and testing in CI without damascene present, this
 crate is listed under `[workspace].exclude` in the repo root rather than
 `members`. It therefore lives in the repo but is its own standalone crate with
 its own `Cargo.lock`, built independently:
@@ -29,7 +29,7 @@ cargo run -- ../capture.json   # view an existing capture
 cargo run                      # capture-setup form (run a new capture)
 ```
 
-It expects a sibling aetna checkout at `../../aetna/aetna.main` relative to the
+It expects a sibling damascene checkout at `../../damascene/damascene.main` relative to the
 tristim repo root. Adjust the path dependencies in `Cargo.toml` if yours lives
 elsewhere.
 
@@ -60,7 +60,7 @@ on Wayland without linking GTK and without freezing the window.
 ## Headless layout check (`dump`)
 
 The `dump` binary builds the presenter tree for each trial in a capture and runs
-aetna's `render_bundle` + lint pass — no window required. It writes SVG, a
+damascene's `render_bundle` + lint pass — no window required. It writes SVG, a
 source-mapped tree dump, the draw-op list, and a shader manifest to an output
 directory, and prints lint findings (overflow, clipped text, alignment/spacing
 smells, raw non-token colors, panels that should be stock widgets). It exits
@@ -93,6 +93,6 @@ with it on. The `xy ⇄ u'v'` toggle switches the chromaticity projection.
 ## Color preferences
 
 The presenter declares `ColorPreferences::wide_gamut()` so it is ready to render
-the chromaticity field in wide-gamut color once aetna's host gains a
-wgpu swapchain-colorspace path. Today that field is **advisory** — aetna still
+the chromaticity field in wide-gamut color once damascene's host gains a
+wgpu swapchain-colorspace path. Today that field is **advisory** — damascene still
 composites in sRGB — so the window renders sRGB-clipped for now.

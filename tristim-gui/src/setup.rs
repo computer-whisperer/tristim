@@ -2,14 +2,14 @@
 //!
 //! Everything routes through keyed buttons + `−/+` steppers (the same
 //! pattern the presenter uses for trial/view toggles), so the form needs no
-//! stateful aetna widgets. [`CaptureForm::build_config`] turns the form state
+//! stateful damascene widgets. [`CaptureForm::build_config`] turns the form state
 //! into a [`CaptureConfig`] for `tristim_gather::run_capture`, reusing the same
 //! `parse_format` / `parse_sequence` the CLI uses (so e.g. scatter draws from
 //! the identical seed).
 
 use std::time::Duration;
 
-use aetna_core::prelude::*;
+use damascene_core::prelude::*;
 use tristim_display::{self as display, list_outputs};
 use tristim_gather::{self as gather, CaptureConfig, KNOWN_FORMATS};
 

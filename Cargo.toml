@@ -9,9 +9,9 @@ members = [
     "tristim-gather",
     "tristim-cli",
 ]
-# tristim-gui depends on aetna via a local path dep, which CI can't fetch.
+# tristim-gui depends on damascene via a local path dep, which CI can't fetch.
 # Excluding it keeps it in the repo as a standalone crate (its own Cargo.lock,
-# built with `cd tristim-gui && cargo run`) without dragging aetna + the GPU
+# built with `cd tristim-gui && cargo run`) without dragging damascene + the GPU
 # stack into the workspace lockfile that CI resolves. See tristim-gui/README.md.
 exclude = ["tristim-gui"]
 

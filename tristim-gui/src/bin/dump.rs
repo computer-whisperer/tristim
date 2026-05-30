@@ -1,10 +1,10 @@
 //! Headless layout check for the presenter.
 //!
-//! Builds the presenter tree for each trial in a capture and runs aetna's
+//! Builds the presenter tree for each trial in a capture and runs damascene's
 //! [`render_bundle_themed`] + lint pass, writing the SVG / tree-dump /
 //! draw-ops / shader-manifest artifacts and printing lint findings. This is
 //! the chief way to validate the GUI's layout without opening a window:
-//! aetna's lint catches overflow, clipped text, alignment/spacing smells,
+//! damascene's lint catches overflow, clipped text, alignment/spacing smells,
 //! raw (non-token) colors, and panels that should be stock widgets.
 //!
 //! Usage: `cargo run --bin dump -- <capture.json> [out_dir]`
@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use aetna_core::prelude::*;
+use damascene_core::prelude::*;
 use tristim_gui::PresenterApp;
 use tristim_gui::app::Tab;
 use tristim_gui::plot::Space;

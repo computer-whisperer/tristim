@@ -5,7 +5,7 @@
 //! `tristim_gather::run_capture` drives the colorimeter on a background thread;
 //! **Presenting** is the visualization — a trial selector plus a panel
 //! describing the presenter's own display (from the host's
-//! [`aetna_core::event::HostDiagnostics`]), beside a content panel that shows,
+//! [`damascene_core::event::HostDiagnostics`]), beside a content panel that shows,
 //! per a view selector, either the [`crate::chart`] chromaticity diagram (with
 //! an opt-in color-field backdrop bounded to the presenter's negotiated gamut,
 //! and hover-to-inspect that swaps the legend for a per-sample inspector) or
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
-use aetna_core::prelude::*;
+use damascene_core::prelude::*;
 use tristim_analyze::{AnalyzedCapture, AnalyzedTrial, GroundTruth, GroundTruthSource, analyze};
 use tristim_capture::{self as cap, Capture};
 use tristim_color::{ColorSpace, mat3_mul_vec, metrics, transfer};
@@ -999,14 +999,14 @@ impl PresenterApp {
 /// matches the old bare-plot footprint and the stat column keeps its width.
 const PLOT_CARD_PAD: f32 = tokens::SPACE_4;
 
-/// Wrap a fixed-size plot in aetna's panel card, so all three views share one
+/// Wrap a fixed-size plot in damascene's panel card, so all three views share one
 /// content-separation surface (CARD fill + border + radius + shadow) instead of
 /// a hand-drawn frame. Hugs the square plot rather than filling the row width.
 fn plot_card(plot: El) -> El {
     card([plot]).width(Size::Hug).padding(PLOT_CARD_PAD)
 }
 
-/// The trial-sample index hovered in the 3D scene, from aetna's hover pick
+/// The trial-sample index hovered in the 3D scene, from damascene's hover pick
 /// (`cx.hovered_scene_point()`, a frame late). `None` unless the cursor is over
 /// a point in the sample cloud — mark 0; mark 1 is the gamut name labels, which
 /// we ignore. For a scored trial every sample is plotted in order, so the
@@ -1041,7 +1041,7 @@ fn plot_size(cx: &BuildCx, extra_chrome: f32) -> f32 {
 /// The presenter window's negotiated gamut, mapped from host diagnostics.
 /// `None` when no diagnostics are attached or the primaries aren't one we fill.
 fn presenter_gamut(cx: &BuildCx) -> Option<PresenterGamut> {
-    use aetna_core::color::Primaries;
+    use damascene_core::color::Primaries;
     match cx.diagnostics()?.working_color_space.primaries {
         Primaries::Srgb => Some(PresenterGamut::Srgb),
         Primaries::DisplayP3 => Some(PresenterGamut::DisplayP3),

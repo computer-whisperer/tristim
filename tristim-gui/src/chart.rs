@@ -1,4 +1,4 @@
-//! Render an analyzed trial as an aetna chart: a chromaticity diagram (CIE 1931
+//! Render an analyzed trial as a damascene chart: a chromaticity diagram (CIE 1931
 //! xy or 1976 u'v') with the spectral locus, the target gamut triangle and
 //! white point, and each measured sample joined by an error vector to where it
 //! should have landed — colored by ΔE\*ab.
@@ -8,7 +8,7 @@
 //! are a fixed-size square (the vector view_box / the element size), so the plot
 //! stays aspect-correct regardless of where layout places it.
 
-use aetna_core::prelude::*;
+use damascene_core::prelude::*;
 use tristim_analyze::{AnalyzedTrial, GroundTruth};
 use tristim_color::ColorSpace;
 

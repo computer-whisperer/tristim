@@ -1,8 +1,8 @@
 //! tristim-gui library surface.
 //!
-//! The presenter [`App`](aetna_core::event::App) lives here so it can be shared
+//! The presenter [`App`](damascene_core::event::App) lives here so it can be shared
 //! by the windowed binary (`src/main.rs`) and the headless bundle-dump binary
-//! (`src/bin/dump.rs`), which runs aetna's lint pass over the same tree.
+//! (`src/bin/dump.rs`), which runs damascene's lint pass over the same tree.
 
 pub mod app;
 pub mod chart;

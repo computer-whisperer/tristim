@@ -8,7 +8,7 @@
 //! relinearized onto the expected-luminance axis; for a scatter capture it
 //! shows luminance accuracy across the probed colors.
 
-use aetna_core::prelude::*;
+use damascene_core::prelude::*;
 use tristim_analyze::{AnalyzedTrial, GroundTruth};
 
 use crate::chart::{HIGHLIGHT, HIT, circle, heat};

@@ -25,87 +25,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "aetna-core"
-version = "0.4.0"
-dependencies = [
- "aetna-fonts",
- "bytemuck",
- "cosmic-text",
- "fdsm",
- "fdsm-ttf-parser",
- "glam 0.33.0",
- "image",
- "kurbo",
- "lru",
- "lyon_tessellation",
- "nalgebra",
- "roxmltree 0.21.1",
- "rustc-hash 2.1.2",
- "swash",
- "ttf-parser",
- "usvg",
- "web-time",
-]
-
-[[package]]
-name = "aetna-fonts"
-version = "0.4.0"
-dependencies = [
- "aetna-fonts-emoji",
- "aetna-fonts-inter",
- "aetna-fonts-jetbrains-mono",
- "aetna-fonts-symbols",
-]
-
-[[package]]
-name = "aetna-fonts-emoji"
-version = "0.1.0"
-
-[[package]]
-name = "aetna-fonts-inter"
-version = "0.1.0"
-
-[[package]]
-name = "aetna-fonts-jetbrains-mono"
-version = "0.1.0"
-
-[[package]]
-name = "aetna-fonts-symbols"
-version = "0.1.0"
-
-[[package]]
-name = "aetna-wgpu"
-version = "0.4.0"
-dependencies = [
- "aetna-core",
- "bytemuck",
- "cosmic-text",
- "ttf-parser",
- "web-time",
- "wgpu",
-]
-
-[[package]]
-name = "aetna-winit-wgpu"
-version = "0.4.0"
-dependencies = [
- "aetna-core",
- "aetna-wgpu",
- "arboard",
- "dlib",
- "jni",
- "open",
- "pollster",
- "raw-window-handle",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "wayland-sys",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -692,6 +611,87 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "damascene-core"
+version = "0.4.0"
+dependencies = [
+ "bytemuck",
+ "cosmic-text",
+ "damascene-fonts",
+ "fdsm",
+ "fdsm-ttf-parser",
+ "glam 0.33.0",
+ "image",
+ "kurbo",
+ "lru",
+ "lyon_tessellation",
+ "nalgebra",
+ "roxmltree 0.21.1",
+ "rustc-hash 2.1.2",
+ "swash",
+ "ttf-parser",
+ "usvg",
+ "web-time",
+]
+
+[[package]]
+name = "damascene-fonts"
+version = "0.4.0"
+dependencies = [
+ "damascene-fonts-emoji",
+ "damascene-fonts-inter",
+ "damascene-fonts-jetbrains-mono",
+ "damascene-fonts-symbols",
+]
+
+[[package]]
+name = "damascene-fonts-emoji"
+version = "0.1.0"
+
+[[package]]
+name = "damascene-fonts-inter"
+version = "0.1.0"
+
+[[package]]
+name = "damascene-fonts-jetbrains-mono"
+version = "0.1.0"
+
+[[package]]
+name = "damascene-fonts-symbols"
+version = "0.1.0"
+
+[[package]]
+name = "damascene-wgpu"
+version = "0.4.0"
+dependencies = [
+ "bytemuck",
+ "cosmic-text",
+ "damascene-core",
+ "ttf-parser",
+ "web-time",
+ "wgpu",
+]
+
+[[package]]
+name = "damascene-winit-wgpu"
+version = "0.4.0"
+dependencies = [
+ "arboard",
+ "damascene-core",
+ "damascene-wgpu",
+ "dlib",
+ "jni",
+ "open",
+ "pollster",
+ "raw-window-handle",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-sys",
+ "wgpu",
+ "winit",
+]
 
 [[package]]
 name = "data-url"
@@ -3443,8 +3443,8 @@ dependencies = [
 name = "tristim-gui"
 version = "0.1.0"
 dependencies = [
- "aetna-core",
- "aetna-winit-wgpu",
+ "damascene-core",
+ "damascene-winit-wgpu",
  "rfd",
  "tristim-analyze",
  "tristim-capture",

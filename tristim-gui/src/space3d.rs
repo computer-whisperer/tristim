@@ -23,9 +23,9 @@
 //! [`SceneSpec`] each frame, so the backend re-uploads nothing while the camera
 //! moves.
 
-use aetna_core::prelude::*;
-use aetna_core::scene::glam::Vec3;
-use aetna_core::scene::{
+use damascene_core::prelude::*;
+use damascene_core::scene::glam::Vec3;
+use damascene_core::scene::{
     AxisKind, GridPlanes, GridSettings, LabelPlacement, LineData, LineSegment, LineStyle,
     LinesHandle, PointData, PointLabels, PointShape, PointStyle, PointsHandle, ScenePoint,
     SceneSpec, SceneStyle, SizeMode,

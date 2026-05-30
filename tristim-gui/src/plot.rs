@@ -2,8 +2,8 @@
 //! (CIE 1931 xy or CIE 1976 u'v'), the data→screen projection, the embedded
 //! spectral locus, and color-space gamut triangles.
 //!
-//! Deliberately free of any aetna types so it can be unit tested in isolation;
-//! the [`crate::chart`] module turns these coordinates into aetna vector paths.
+//! Deliberately free of any damascene types so it can be unit tested in isolation;
+//! the [`crate::chart`] module turns these coordinates into damascene vector paths.
 
 use tristim_color::ColorSpace;
 use tristim_color::metrics::{uv_prime_to_xy, xy_to_uv_prime};

@@ -1,4 +1,4 @@
-//! tristim-gui — an Aetna presenter for tristim captures.
+//! tristim-gui — a Damascene presenter for tristim captures.
 //!
 //! Loads a capture JSON, runs [`tristim_analyze::analyze`], and opens a window
 //! that visualizes where the compositor reproduced color faithfully versus
@@ -9,9 +9,9 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use aetna_core::color::ColorPreferences;
-use aetna_core::prelude::Rect;
-use aetna_winit_wgpu::{HostConfig, run_with_config};
+use damascene_core::color::ColorPreferences;
+use damascene_core::prelude::Rect;
+use damascene_winit_wgpu::{HostConfig, run_with_config};
 
 use tristim_gui::PresenterApp;
 
@@ -52,7 +52,7 @@ fn main() -> ExitCode {
         app.set_show_field(true);
     }
 
-    // Declare wide-gamut intent. aetna's host treats `color_preferences` as
+    // Declare wide-gamut intent. damascene's host treats `color_preferences` as
     // advisory today — it still composites in sRGB pending a wgpu
     // swapchain-colorspace knob — so this is forward-looking: when that path
     // lands, the chromaticity field can render true wide-gamut color with no
