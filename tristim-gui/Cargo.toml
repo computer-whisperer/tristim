@@ -6,19 +6,19 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/computer-whisperer/tristim"
 description = "Damascene-based presenter for tristim captures: load a capture, analyze it, and visualize where a compositor reproduces color faithfully vs. where it drifts."
-# Excluded from the tristim workspace (see ../Cargo.toml): the damascene path deps
-# below are not fetchable in CI, so this crate carries its own Cargo.lock and is
-# built independently with `cargo run` from this directory.
+# Excluded from the tristim workspace (see ../Cargo.toml) to keep the heavy
+# damascene + GPU/winit stack out of the lockfile CI resolves; this crate carries
+# its own Cargo.lock and is built independently with `cargo run` from this directory.
 
 [[bin]]
 name = "tristim-gui"
 path = "src/main.rs"
 
 [dependencies]
-# Presenter UI stack. Local path deps to a sibling damascene checkout; pin to the
-# git version (0.4.x) for the explicit color-mode support.
-damascene-core = { path = "../../damascene/damascene.main/crates/damascene-core" }
-damascene-winit-wgpu = { path = "../../damascene/damascene.main/crates/damascene-winit-wgpu" }
+# Presenter UI stack, from crates.io. 0.4.x carries the 3D scene support and
+# explicit wide-gamut color-mode handling the GUI relies on.
+damascene-core = "0.4"
+damascene-winit-wgpu = "0.4"
 
 # tristim backend libraries (members of the main workspace, reached by path).
 tristim-capture = { path = "../tristim-capture" }

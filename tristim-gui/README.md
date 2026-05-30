@@ -1,6 +1,6 @@
 # tristim-gui
 
-An [damascene](https://github.com/computer-whisperer/damascene)-based front end for
+A [damascene](https://github.com/computer-whisperer/damascene)-based front end for
 tristim. Launched with a capture JSON it opens straight into the visualization
 of how faithfully a compositor reproduced color on the output under test — a CIE
 chromaticity field with per-sample error vectors, a measured-vs-expected
@@ -15,23 +15,18 @@ rather than a fork of them.
 
 ## Why this crate is outside the workspace
 
-`tristim-gui` depends on damascene through a **local path dependency**
-(`../../damascene/damascene.main`), which CI cannot fetch and which drags in the GPU
-stack (wgpu, winit, …). To keep the portable backend libraries — the crates
-intended for crates.io — building and testing in CI without damascene present, this
-crate is listed under `[workspace].exclude` in the repo root rather than
-`members`. It therefore lives in the repo but is its own standalone crate with
-its own `Cargo.lock`, built independently:
+`tristim-gui` depends on [damascene](https://crates.io/crates/damascene-core)
+(crates.io), which drags in the GPU stack (wgpu, winit, …). To keep the portable
+backend libraries — the crates intended for crates.io — building and testing in
+CI without that heavy UI tree, this crate is listed under `[workspace].exclude`
+in the repo root rather than `members`. It therefore lives in the repo but is its
+own standalone crate with its own `Cargo.lock`, built independently:
 
 ```sh
 cd tristim-gui
 cargo run -- ../capture.json   # view an existing capture
 cargo run                      # capture-setup form (run a new capture)
 ```
-
-It expects a sibling damascene checkout at `../../damascene/damascene.main` relative to the
-tristim repo root. Adjust the path dependencies in `Cargo.toml` if yours lives
-elsewhere.
 
 ## Running a capture
 
