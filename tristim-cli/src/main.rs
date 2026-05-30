@@ -307,25 +307,26 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
         std::thread::sleep(Duration::from_millis(settle_ms));
         let raws = device.measure_raw_repeated(&setup, repeats, auto_zero)?;
         let conf = MeasurementConfidence::from_repeats(&raws, &setup, &cal);
+        let rs = conf.raw.as_ref().expect("raw stats present on the Spyder path");
         println!(
             "{:>7.4}  {:>10.3}  {:>6.1}%  {:>8}  {:>8.1}  {}",
             cv,
             conf.mean.y,
             100.0 * conf.y_rel_uncertainty(),
             fmt_duv(conf.uv_std()),
-            conf.min_floor_sigma,
+            rs.min_floor_sigma,
             fmt_flags(&conf.flags()),
         );
         if verbose {
             for ch in 0..6 {
                 println!(
                     "          ch{ch}: mean {:>8.1}  sd {:>6.2}  s5 {:>4}  corrected {:>8.1}  floor {:>7.1}s  {}",
-                    conf.raw_mean[ch],
-                    conf.raw_std[ch],
+                    rs.raw_mean[ch],
+                    rs.raw_std[ch],
                     setup.s5[ch],
-                    conf.corrected[ch],
-                    conf.floor_sigma[ch],
-                    if conf.is_signal[ch] { "signal" } else { "dark" },
+                    rs.corrected[ch],
+                    rs.floor_sigma[ch],
+                    if rs.is_signal[ch] { "signal" } else { "dark" },
                 );
             }
         }
@@ -475,7 +476,7 @@ fn cmd_speed(args: &[String]) -> Result<(), Box<dyn Error>> {
                     conf.mean.y,
                     100.0 * conf.y_rel_uncertainty(),
                     fmt_duv(conf.uv_std()),
-                    conf.min_floor_sigma,
+                    conf.raw.as_ref().map_or(0.0, |rs| rs.min_floor_sigma),
                     flags_col,
                 );
             }
@@ -617,7 +618,7 @@ fn cmd_integration(args: &[String]) -> Result<(), Box<dyn Error>> {
             conf.mean.y,
             100.0 * conf.y_rel_uncertainty(),
             fmt_duv(conf.uv_std()),
-            conf.min_floor_sigma,
+            conf.raw.as_ref().map_or(0.0, |rs| rs.min_floor_sigma),
             flags,
         );
     }

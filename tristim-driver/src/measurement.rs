@@ -81,38 +81,9 @@ pub struct Setup {
 #[derive(Debug, Clone, Copy)]
 pub struct RawMeasurement(pub [u16; 6]);
 
-/// CIE XYZ tristimulus values. Units depend on calibration choice — for the
-/// 2024 emissive cal indexes, Y is approximately luminance in cd/m² when the
-/// device is held against an active display.
-#[derive(Debug, Clone, Copy)]
-pub struct Xyz {
-    pub x: f64,
-    pub y: f64,
-    pub z: f64,
-}
-
-impl Xyz {
-    /// CIE 1931 xy chromaticity coordinates from this XYZ.
-    /// Returns `None` if `X + Y + Z == 0` (pure black).
-    pub fn chromaticity(&self) -> Option<(f64, f64)> {
-        let sum = self.x + self.y + self.z;
-        if sum <= 0.0 {
-            return None;
-        }
-        Some((self.x / sum, self.y / sum))
-    }
-
-    /// CIE 1976 u'v' chromaticity coordinates from this XYZ. These are the
-    /// (more perceptually uniform) coordinates Δu'v' is measured in.
-    /// Returns `None` if `X + 15Y + 3Z <= 0` (pure black).
-    pub fn uv_prime(&self) -> Option<(f64, f64)> {
-        let d = self.x + 15.0 * self.y + 3.0 * self.z;
-        if d <= 0.0 {
-            return None;
-        }
-        Some((4.0 * self.x / d, 9.0 * self.y / d))
-    }
-}
+// `Xyz` is device-agnostic and lives in [`crate::sample`]; re-exported here so
+// the historical `measurement::Xyz` path keeps resolving.
+pub use crate::sample::Xyz;
 
 // ---------------------------------------------------------------------------
 // Parsers

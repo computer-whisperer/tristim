@@ -11,11 +11,13 @@ pub mod confidence;
 pub mod device;
 pub mod measurement;
 pub mod protocol;
+pub mod sample;
 
-pub use confidence::{MeasurementConfidence, TrustFlag};
+pub use confidence::{MeasurementConfidence, RawStats, TrustFlag};
 pub use device::{Colorimeter, DeviceInfo};
 pub use measurement::{
     AdaptiveMeasurement, AdaptiveTier, Calibration, IntegrationError, MIN_INTEGRATION_MS,
-    RawMeasurement, Setup, Xyz, override_integration,
+    RawMeasurement, Setup, override_integration,
 };
 pub use protocol::{DATACOLOR_VID, Opcode};
+pub use sample::{RawRepeats, Sample, Xyz};

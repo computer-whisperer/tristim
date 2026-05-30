@@ -270,12 +270,16 @@ pub fn run_capture(
                             &result.setup,
                             &result.cal,
                         );
+                        let rs = conf
+                            .raw
+                            .as_ref()
+                            .expect("raw stats present on the Spyder path");
                         let xyz = conf.mean;
                         let sample = cap::Sample {
                             requested: cv,
                             measured: cap::Measured {
                                 raw: std::array::from_fn(|ch| {
-                                    conf.raw_mean[ch].round().clamp(0.0, u16::MAX as f64) as u16
+                                    rs.raw_mean[ch].round().clamp(0.0, u16::MAX as f64) as u16
                                 }),
                                 xyz: [xyz.x, xyz.y, xyz.z],
                                 xy: xyz.chromaticity().map(|(x, y)| [x, y]),
