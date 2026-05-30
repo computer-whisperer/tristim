@@ -87,4 +87,20 @@ impl Sample {
     pub fn repeats(&self) -> usize {
         self.xyz.len()
     }
+
+    /// A new sample holding only the repeats in `range` — both the XYZ and, when
+    /// present, the raw counts. The per-channel `floor`/`grad` are shared
+    /// unchanged (they describe the device, not a repeat). Panics if `range` is
+    /// out of bounds, matching slice semantics. Used to study how confidence
+    /// behaves over sub-windows of one measurement (e.g. the `speed` diagnostic).
+    pub fn slice(&self, range: std::ops::Range<usize>) -> Sample {
+        Sample {
+            xyz: self.xyz[range.clone()].to_vec(),
+            raw: self.raw.as_ref().map(|rr| RawRepeats {
+                counts: rr.counts[range].to_vec(),
+                floor: rr.floor.clone(),
+                grad: rr.grad.clone(),
+            }),
+        }
+    }
 }

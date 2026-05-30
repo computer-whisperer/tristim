@@ -32,7 +32,7 @@ use tristim_capture as cap;
 use tristim_color::metrics::triangle_area_xy;
 use tristim_display::{PatchSurface, list_outputs};
 use tristim_driver::{
-    AdaptiveTier, Colorimeter, MeasurementConfidence, TrustFlag, override_integration,
+    AdaptiveTier, CalibrationId, MeasurementConfidence, ResetDiscipline, TrustFlag,
 };
 use tristim_gather as gather;
 
@@ -183,42 +183,32 @@ fn cmd_list_outputs() -> Result<(), Box<dyn Error>> {
 }
 
 fn cmd_info() -> Result<(), Box<dyn Error>> {
-    let mut device = Colorimeter::open_any()?;
-    let info = device.get_info()?;
+    let device = tristim_driver::open_any()?;
+    let info = device.info();
     println!(
         "{} (PID 0x{:04x}) — HW {}.{:02} — SN {}",
-        if device.is_spyder_2024() {
-            "Spyder 2024"
-        } else {
-            "SpyderX2"
-        },
-        device.pid(),
-        info.hw_version.0,
-        info.hw_version.1,
-        info.serial,
+        info.model, info.usb_pid, info.firmware.0, info.firmware.1, info.serial,
     );
-    println!("high-level cmds: {}", info.high_level_commands);
     Ok(())
 }
 
 fn cmd_measure(args: &[String]) -> Result<(), Box<dyn Error>> {
     let cal: u8 = parse_opt(args, "--cal", 0);
-    let mut device = Colorimeter::open_any()?;
-    let info = device.get_info()?;
-    println!(
-        "{} SN {} — HW {}.{:02}",
-        if device.is_spyder_2024() {
-            "Spyder 2024"
-        } else {
-            "SpyderX2"
-        },
-        info.serial,
-        info.hw_version.0,
-        info.hw_version.1
-    );
+    let mut device = tristim_driver::open_any()?;
+    device.select_calibration(CalibrationId(cal))?;
+    {
+        let info = device.info();
+        println!(
+            "{} SN {} — HW {}.{:02}",
+            info.model, info.serial, info.firmware.0, info.firmware.1
+        );
+    }
     println!("Measuring (cal {cal})... aim the puck.");
-    let (xyz, raw, _, _) = device.measure_xyz(cal)?;
-    println!("Raw  : {:?}", raw.0);
+    let sample = device.measure(1)?;
+    let xyz = sample.xyz[0];
+    if let Some(rr) = &sample.raw {
+        println!("Raw  : {:?}", rr.counts[0]);
+    }
     println!("X={:.4}  Y={:.4} cd/m²  Z={:.4}", xyz.x, xyz.y, xyz.z);
     if let Some((x, y)) = xyz.chromaticity() {
         println!("xy   : ({x:.4}, {y:.4})");
@@ -262,24 +252,14 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
         None => DEFAULT_LEVELS.to_vec(),
     };
 
-    let mut device = Colorimeter::open_any()?;
-    let info = device.get_info()?;
-    let cal = device.get_calibration(cal_index)?;
-    let setup = device.get_setup(&cal)?;
-    let product = if device.is_spyder_2024() {
-        "Spyder 2024"
-    } else {
-        "SpyderX2"
-    };
+    let mut device = tristim_driver::open_any()?;
+    device.select_calibration(CalibrationId(cal_index))?;
+    let model = device.info().model.clone();
+    let serial = device.info().serial.clone();
 
     eprintln!(
-        "{product} SN {} — characterize cal {cal_index}, {repeats} repeats/level, auto-zero {}",
-        info.serial,
+        "{model} SN {serial} — characterize cal {cal_index}, {repeats} repeats/level, auto-zero {}",
         if burst { "off (burst)" } else { "on" },
-    );
-    eprintln!(
-        "  black-cal s5 = {:?}   integration s2 = 0x{:04x}",
-        setup.s5, setup.s2,
     );
     eprintln!("Place the puck flat against '{output}'. Starting in {prep_secs}s.");
 
@@ -290,8 +270,14 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
         std::thread::sleep(Duration::from_secs(1));
     }
 
+    let discipline = if burst {
+        ResetDiscipline::BurstOnce
+    } else {
+        ResetDiscipline::AutoZeroEach
+    };
+
     // floor_s = how many noise-σ the dimmest *signal* channel sits above its
-    // black-cal floor (s5). Small ⇒ the max(0, raw−s5) clamp is biting and the
+    // black-cal floor. Small ⇒ the max(0, raw−floor) clamp is biting and the
     // reading is untrustworthy. sY/Y folds in the ±½-count quantization floor
     // that bare repeat-variance hides at low light; d_uv is the same idea for
     // chromaticity (Δu'v'), which degrades far faster toward black. flags mark
@@ -300,14 +286,19 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
         "{:>7}  {:>10}  {:>7}  {:>8}  {:>8}  flags",
         "cv", "Y(cd/m²)", "sY/Y", "d_uv", "floor_s",
     );
-    let auto_zero = !burst;
     for &cv in &levels {
         let cv = cv.clamp(0.0, 1.0);
         surface.set_code_values([cv, cv, cv])?;
         std::thread::sleep(Duration::from_millis(settle_ms));
-        let raws = device.measure_raw_repeated(&setup, repeats, auto_zero)?;
-        let conf = MeasurementConfidence::from_repeats(&raws, &setup, &cal);
-        let rs = conf.raw.as_ref().expect("raw stats present on the Spyder path");
+        let diag = device
+            .raw_diagnostics()
+            .ok_or("device exposes no raw diagnostics")?;
+        let (sample, _times) = diag.measure_raw(repeats, discipline)?;
+        let conf = MeasurementConfidence::from_sample(&sample);
+        let rs = conf
+            .raw
+            .as_ref()
+            .expect("raw stats present for a raw sample");
         println!(
             "{:>7.4}  {:>10.3}  {:>6.1}%  {:>8}  {:>8.1}  {}",
             cv,
@@ -318,12 +309,17 @@ fn cmd_characterize(args: &[String]) -> Result<(), Box<dyn Error>> {
             fmt_flags(&conf.flags()),
         );
         if verbose {
+            let floor = sample
+                .raw
+                .as_ref()
+                .map(|r| r.floor.as_slice())
+                .unwrap_or(&[]);
             for ch in 0..6 {
                 println!(
-                    "          ch{ch}: mean {:>8.1}  sd {:>6.2}  s5 {:>4}  corrected {:>8.1}  floor {:>7.1}s  {}",
+                    "          ch{ch}: mean {:>8.1}  sd {:>6.2}  floor {:>4.0}  corrected {:>8.1}  headroom {:>7.1}s  {}",
                     rs.raw_mean[ch],
                     rs.raw_std[ch],
-                    setup.s5[ch],
+                    floor.get(ch).copied().unwrap_or(0.0),
                     rs.corrected[ch],
                     rs.floor_sigma[ch],
                     if rs.is_signal[ch] { "signal" } else { "dark" },
@@ -399,23 +395,14 @@ fn cmd_speed(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let mut device = Colorimeter::open_any()?;
-    let info = device.get_info()?;
-    let cal = device.get_calibration(cal_index)?;
-    let setup = device.get_setup(&cal)?;
-    let product = if device.is_spyder_2024() {
-        "Spyder 2024"
-    } else {
-        "SpyderX2"
-    };
+    let mut device = tristim_driver::open_any()?;
+    device.select_calibration(CalibrationId(cal_index))?;
+    let model = device.info().model.clone();
+    let serial = device.info().serial.clone();
 
     eprintln!(
-        "{product} SN {} — speed test, cal {cal_index}, {shots} shots/cell, N ∈ {:?}",
-        info.serial, repeats_list,
-    );
-    eprintln!(
-        "  black-cal s5 = {:?}   integration s2 = 0x{:04x}",
-        setup.s5, setup.s2,
+        "{model} SN {serial} — speed test, cal {cal_index}, {shots} shots/cell, N ∈ {:?}",
+        repeats_list,
     );
     eprintln!("Place the puck flat against '{output}'. Starting in {prep_secs}s.");
 
@@ -435,23 +422,16 @@ fn cmd_speed(args: &[String]) -> Result<(), Box<dyn Error>> {
 
         for &auto_zero in &modes {
             let mode_label = if auto_zero { "auto-zero" } else { "burst" };
+            let discipline = if auto_zero {
+                ResetDiscipline::AutoZeroEach
+            } else {
+                ResetDiscipline::BurstOnce
+            };
 
-            if !auto_zero {
-                device.send_reset()?;
-            }
-            let mut raws = Vec::with_capacity(shots);
-            let mut shot_ms = Vec::with_capacity(shots);
-            for _ in 0..shots {
-                let t0 = std::time::Instant::now();
-                let raw = if auto_zero {
-                    device.measure_raw(&setup)?
-                } else {
-                    device.measure_raw_no_reset(&setup)?
-                };
-                let dt = t0.elapsed().as_secs_f64() * 1000.0;
-                raws.push(raw);
-                shot_ms.push(dt);
-            }
+            let diag = device
+                .raw_diagnostics()
+                .ok_or("device exposes no raw diagnostics")?;
+            let (sample, shot_ms) = diag.measure_raw(shots, discipline)?;
             let mean_shot_ms = shot_ms.iter().sum::<f64>() / shot_ms.len() as f64;
 
             println!("  {mode_label} (t/shot = {:.0} ms):", mean_shot_ms,);
@@ -460,7 +440,7 @@ fn cmd_speed(args: &[String]) -> Result<(), Box<dyn Error>> {
                 "N", "total", "Y(cd/m²)", "sY/Y", "Δu'v'", "floor_σ",
             );
             for &n in &repeats_list {
-                let conf = MeasurementConfidence::from_repeats(&raws[..n], &setup, &cal);
+                let conf = MeasurementConfidence::from_sample(&sample.slice(0..n));
                 let total_s = mean_shot_ms * n as f64 / 1000.0;
                 // For N=1 the temporal std is necessarily zero — flag verdict as quant-only
                 // so the reader doesn't mistake it for a real trust check.
@@ -486,10 +466,8 @@ fn cmd_speed(args: &[String]) -> Result<(), Box<dyn Error>> {
             // between resets — a non-zero drift here is the first sign.
             if shots >= 4 {
                 let half = shots / 2;
-                let first: Vec<_> = raws[..half].to_vec();
-                let last: Vec<_> = raws[shots - half..].to_vec();
-                let cf = MeasurementConfidence::from_repeats(&first, &setup, &cal);
-                let cl = MeasurementConfidence::from_repeats(&last, &setup, &cal);
+                let cf = MeasurementConfidence::from_sample(&sample.slice(0..half));
+                let cl = MeasurementConfidence::from_sample(&sample.slice(shots - half..shots));
                 let dy = cl.mean.y - cf.mean.y;
                 let rel = if cf.mean.y.abs() > 1e-9 {
                     dy / cf.mean.y
@@ -530,25 +508,19 @@ fn cmd_integration(args: &[String]) -> Result<(), Box<dyn Error>> {
     let settle_ms: u64 = parse_opt(args, "--settle-ms", 400);
     let prep_secs: u64 = parse_opt(args, "--prep-secs", 6);
 
-    let mut device = Colorimeter::open_any()?;
-    let info = device.get_info()?;
-    let cal = device.get_calibration(cal_index)?;
-    let setup = device.get_setup(&cal)?;
-    let product = if device.is_spyder_2024() {
-        "Spyder 2024"
-    } else {
-        "SpyderX2"
-    };
+    let mut device = tristim_driver::open_any()?;
+    device.select_calibration(CalibrationId(cal_index))?;
+    let model = device.info().model.clone();
+    let serial = device.info().serial.clone();
+    let (min_ms, max_ms) = device
+        .raw_diagnostics()
+        .and_then(|d| d.integration_range())
+        .ok_or("device has no integration-time control")?;
 
     eprintln!(
-        "{product} SN {} — integration sweep, cal {cal_index}, level cv={level:.4}, {repeats} burst repeats",
-        info.serial,
+        "{model} SN {serial} — integration sweep, cal {cal_index}, level cv={level:.4}, {repeats} burst repeats",
     );
-    eprintln!(
-        "  device default: setup.s2 = 0x{:04x} ({} ms) = cal.v2",
-        setup.s2, setup.s2,
-    );
-    eprintln!("  black-cal s5 = {:?}", setup.s5);
+    eprintln!("  device exposure range: {min_ms}–{max_ms} ms (default {max_ms} ms)");
     eprintln!("Place the puck flat against '{output}'. Starting in {prep_secs}s.");
 
     let mut surface = PatchSurface::open_sdr(&output)?;
@@ -560,51 +532,28 @@ fn cmd_integration(args: &[String]) -> Result<(), Box<dyn Error>> {
     std::thread::sleep(Duration::from_millis(settle_ms));
 
     // Y here is absolute (the override scales the calibration), so cells should
-    // agree across s2 — a quick mental check that the override is doing its job.
+    // agree across exposure — a quick mental check the override is doing its job.
     println!(
         "{:>8}  {:>9}  {:>8}  {:>10}  {:>8}  {:>10}  {:>8}  flags",
-        "s2(ms)", "t/shot", "raw_max", "Y(cd/m²)", "sY/Y", "Δu'v'", "floor_σ",
+        "ms", "t/shot", "raw_max", "Y(cd/m²)", "sY/Y", "Δu'v'", "floor_σ",
     );
 
     for &s2 in &integrations {
-        let (setup_at, cal_at) = match override_integration(&setup, &cal, s2) {
-            Ok(pair) => pair,
+        let diag = device
+            .raw_diagnostics()
+            .ok_or("device exposes no raw diagnostics")?;
+        let (sample, shot_ms) = match diag.measure_raw_at(repeats, s2, ResetDiscipline::BurstOnce) {
+            Ok(v) => v,
             Err(e) => {
-                println!("{s2:>8}  rejected: {e}");
+                println!("{s2:>8}  skipped: {e}");
                 continue;
             }
         };
-
-        device.send_reset()?;
-        let mut raws = Vec::with_capacity(repeats);
-        let mut shot_ms = Vec::with_capacity(repeats);
-        // measure_raw_no_reset is the right call here: send_reset above primes
-        // the burst, so we burst all repeats then move on (next s2 resets again).
-        let mut ok = true;
-        for _ in 0..repeats {
-            let t0 = std::time::Instant::now();
-            match device.measure_raw_no_reset(&setup_at) {
-                Ok(r) => {
-                    shot_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-                    raws.push(r);
-                }
-                Err(e) => {
-                    println!("{s2:>8}  device error: {e}");
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if !ok {
-            continue;
-        }
         let mean_shot_ms = shot_ms.iter().sum::<f64>() / shot_ms.len() as f64;
-        let conf = MeasurementConfidence::from_repeats(&raws, &setup_at, &cal_at);
-        let raw_max = raws
-            .iter()
-            .map(|r| *r.0.iter().max().unwrap_or(&0))
-            .max()
-            .unwrap_or(0);
+        let conf = MeasurementConfidence::from_sample(&sample);
+        let raw_max = sample.raw.as_ref().map_or(0u32, |rr| {
+            rr.counts.iter().flatten().copied().max().unwrap_or(0)
+        });
         let flags = if repeats < 2 {
             "quant-only".to_string()
         } else {

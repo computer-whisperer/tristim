@@ -35,8 +35,24 @@ use std::time::Duration;
 use thiserror::Error;
 use tristim_capture as cap;
 use tristim_display::{self as display, DescriptionState, PatchSurface, list_outputs};
-use tristim_driver::measurement::raw_to_xyz;
-use tristim_driver::{Colorimeter, MeasurementConfidence};
+use tristim_driver::{CalibrationId, MeasurementConfidence};
+
+/// First-repeat raw sensor counts as the capture file's fixed 6-channel array,
+/// or zeros when the device exposes no raw counts. The capture contract records
+/// 6-channel Spyder counts; a future XYZ-only device stores zeros here (a known
+/// limitation of the current capture format, not of the driver layer).
+fn raw_counts(sample: &tristim_driver::Sample) -> [u16; 6] {
+    match &sample.raw {
+        Some(rr) if !rr.counts.is_empty() => std::array::from_fn(|ch| {
+            rr.counts[0]
+                .get(ch)
+                .copied()
+                .unwrap_or(0)
+                .min(u16::MAX as u32) as u16
+        }),
+        _ => [0; 6],
+    }
+}
 
 use crate::gamut::ProbeSample;
 
@@ -147,7 +163,7 @@ pub enum GatherEvent {
 #[derive(Debug, Error)]
 pub enum GatherError {
     #[error("colorimeter: {0}")]
-    Device(#[from] tristim_driver::device::Error),
+    Device(#[from] tristim_driver::Error),
     #[error("display: {0}")]
     Display(#[from] display::Error),
     #[error("compositor rejected format ({cause}): {message}")]
@@ -166,19 +182,13 @@ pub fn run_capture(
     should_cancel: impl Fn() -> bool,
 ) -> Result<cap::Capture, GatherError> {
     // Colorimeter up front so we fail fast (before asking for the puck).
-    let mut device = Colorimeter::open_any()?;
-    let info = device.get_info()?;
-    let cal = device.get_calibration(config.cal_index)?;
-    let setup = device.get_setup(&cal)?;
-    let product = if device.is_spyder_2024() {
-        "Spyder 2024"
-    } else {
-        "SpyderX2"
-    };
+    let mut device = tristim_driver::open_any()?;
+    device.select_calibration(CalibrationId(config.cal_index))?;
+    let info = device.info().clone();
     on_event(GatherEvent::DeviceReady {
-        product: product.to_string(),
+        product: info.model.clone(),
         serial: info.serial.clone(),
-        hw_version: info.hw_version,
+        hw_version: info.firmware,
     });
 
     let out_desc = list_outputs()?
@@ -259,17 +269,9 @@ pub fn run_capture(
                     let measure = |cv: [f64; 3]| -> Result<ProbeSample, GatherError> {
                         surface.set_code_values(cv)?;
                         sleep(config.settle);
-                        let result = device.measure_adaptive(
-                            &setup,
-                            &cal,
-                            opts.repeats,
-                            opts.fast_integration_ms,
-                        )?;
-                        let conf = MeasurementConfidence::from_repeats(
-                            &result.raws,
-                            &result.setup,
-                            &result.cal,
-                        );
+                        let result =
+                            device.measure_adaptive(opts.repeats, opts.fast_integration_ms)?;
+                        let conf = MeasurementConfidence::from_sample(&result.sample);
                         let rs = conf
                             .raw
                             .as_ref()
@@ -338,13 +340,14 @@ pub fn run_capture(
                 }
                 surface.set_code_values(*cv)?;
                 sleep(config.settle);
-                let raw = device.measure_raw(&setup)?;
-                let xyz = raw_to_xyz(&raw, &setup, &cal);
+                let measured = device.measure(1)?;
+                let xyz = measured.xyz[0];
+                let raw = raw_counts(&measured);
                 let xy = xyz.chromaticity().map(|(x, y)| [x, y]);
                 let sample = cap::Sample {
                     requested: *cv,
                     measured: cap::Measured {
-                        raw: raw.0,
+                        raw,
                         xyz: [xyz.x, xyz.y, xyz.z],
                         xy,
                     },
@@ -391,10 +394,10 @@ pub fn run_capture(
             git_revision: None,
         },
         device: cap::DeviceInfo {
-            product: product.into(),
-            usb_pid: device.pid(),
+            product: info.model,
+            usb_pid: info.usb_pid,
             serial: info.serial,
-            hw_version: info.hw_version,
+            hw_version: info.firmware,
             cal_index: config.cal_index,
         },
         output: cap::OutputInfo {

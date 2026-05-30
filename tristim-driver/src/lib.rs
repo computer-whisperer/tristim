@@ -1,23 +1,25 @@
-//! Driver for Datacolor Spyder-family colorimeters.
+//! Device-generic colorimeter driver layer for tristim.
 //!
-//! Currently scoped to the SpyderX-family wire protocol (PIDs in `0x0A0X` range).
-//! Hardware tested against SpyderExpress 2024 (PID `0x0A0B`).
+//! The public surface is the [`Colorimeter`] trait and the device-agnostic
+//! measurement types ([`Sample`], [`Xyz`], [`MeasurementConfidence`]). Open a
+//! device with [`open_any`]; everything above this crate talks to the trait and
+//! never names a concrete instrument.
 //!
-//! Protocol reverse-engineered by Graeme Gill for ArgyllCMS (`spectro/spydX.c`);
-//! this is a clean-room Rust re-implementation working from the documented
-//! wire format, not a code translation.
+//! The only driver implemented today is the Datacolor [`spyder`] family
+//! (SpyderX2 / Spyder 2024), reverse-engineered by Graeme Gill for ArgyllCMS
+//! (`spectro/spydX2.c`) and re-implemented clean-room here from the documented
+//! wire format. Its calibration mechanics live behind the trait in
+//! [`spyder`]; device-aware tooling (the examples) can reach them directly.
 
+pub mod colorimeter;
 pub mod confidence;
-pub mod device;
-pub mod measurement;
-pub mod protocol;
 pub mod sample;
+pub mod spyder;
 
-pub use confidence::{MeasurementConfidence, RawStats, TrustFlag};
-pub use device::{Colorimeter, DeviceInfo};
-pub use measurement::{
-    AdaptiveMeasurement, AdaptiveTier, Calibration, IntegrationError, MIN_INTEGRATION_MS,
-    RawMeasurement, Setup, override_integration,
+pub use colorimeter::{
+    AdaptiveMeasurement, AdaptiveTier, CalibrationId, Colorimeter, DeviceInfo, Error,
+    RawDiagnostics, ResetDiscipline, Result, open_any,
 };
-pub use protocol::{DATACOLOR_VID, Opcode};
+pub use confidence::{MeasurementConfidence, RawStats, TrustFlag};
 pub use sample::{RawRepeats, Sample, Xyz};
+pub use spyder::Spyder;

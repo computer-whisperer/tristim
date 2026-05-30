@@ -1,11 +1,10 @@
 //! Take one XYZ measurement. Hold the colorimeter against any patch on screen
 //! and watch the numbers.
 
-use tristim_driver::Colorimeter;
+use tristim_driver::{Colorimeter, Spyder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut device = Colorimeter::open_any()?;
-    let info = device.get_info()?;
+    let mut device = Spyder::open_any()?;
     println!(
         "Spyder {} (HW {}.{:02}, SN {})",
         if device.is_spyder_2024() {
@@ -13,9 +12,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "X2"
         },
-        info.hw_version.0,
-        info.hw_version.1,
-        info.serial,
+        device.info().firmware.0,
+        device.info().firmware.1,
+        device.info().serial,
     );
 
     println!("Taking one measurement (cal index 0)... hold the puck against a bright patch.");

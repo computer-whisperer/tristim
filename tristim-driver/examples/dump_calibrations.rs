@@ -26,8 +26,8 @@
 //!   cargo run -p tristim-driver --example dump_calibrations -- --measure
 
 use std::time::Duration;
-use tristim_driver::Colorimeter;
-use tristim_driver::measurement::raw_to_xyz;
+use tristim_driver::spyder::measurement::raw_to_xyz;
+use tristim_driver::{Colorimeter, Spyder};
 
 const MAX_INDEX: u8 = 7;
 const PREP_SECS: u64 = 5;
@@ -35,25 +35,30 @@ const PREP_SECS: u64 = 5;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let measure = std::env::args().any(|a| a == "--measure");
 
-    let mut device = Colorimeter::open_any()?;
-    let info = device.get_info()?;
-    eprintln!(
-        "Spyder SN {:?} HW {}.{:02}",
-        info.serial, info.hw_version.0, info.hw_version.1
-    );
-    if let Some(mask) = info.display_type_mask {
+    let mut device = Spyder::open_any()?;
+    {
+        let info = device.info();
         eprintln!(
-            "Device display-type mask: 0x{mask:04x} (high-level-cmd presets the firmware advertises)"
+            "Spyder SN {:?} HW {}.{:02}",
+            info.serial, info.firmware.0, info.firmware.1
         );
     }
-    if let Some(mx) = info.max_display_type {
-        eprintln!("Device max display-type (high-level): {mx}");
+    {
+        let caps = device.caps();
+        if let Some(mask) = caps.display_type_mask {
+            eprintln!(
+                "Device display-type mask: 0x{mask:04x} (high-level-cmd presets the firmware advertises)"
+            );
+        }
+        if let Some(mx) = caps.max_display_type {
+            eprintln!("Device max display-type (high-level): {mx}");
+        }
     }
 
     // Download every cal we can read. Some indices may fail / return
     // duplicates of index 0 if the device only has fewer than 7 unique
     // sets — we report what we find.
-    let mut cals: Vec<(u8, tristim_driver::measurement::Calibration)> = Vec::new();
+    let mut cals: Vec<(u8, tristim_driver::spyder::measurement::Calibration)> = Vec::new();
     for idx in 0..MAX_INDEX {
         match device.get_calibration(idx) {
             Ok(c) => {
@@ -211,7 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Using setup from cal {idx0} (v1={:#04x}, integ={} ms) for the raw measurement.",
         setup0.s1, cal0.v2
     );
-    let raw = device.measure_raw(&setup0)?;
+    let raw = device.measure_raw_once(&setup0)?;
     println!("\nRaw 6-channel counts: {:?}", raw.0);
 
     println!();

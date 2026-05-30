@@ -46,12 +46,16 @@ working from the documented wire format, not a code translation.
 
 ## Workspace layout
 
-- `tristim-driver/` — rusb-based device protocol (init, calibration-data
-  download, measurement). The reusable core; no Wayland dependency. Exposes
-  per-measurement [`MeasurementConfidence`] (σY/Y, Δu'v', floor σ vs. trust
-  thresholds), an `override_integration` helper for bright-point speedup
-  without losing absolute XYZ, and a two-tier `measure_adaptive` primitive
-  for batch loops like dense 3D LUT calibration.
+- `tristim-driver/` — device-generic colorimeter layer. The reusable core; no
+  Wayland dependency. Exposes a `Colorimeter` trait (open a device with
+  `open_any`), measurements as a device-agnostic `Sample` (absolute XYZ plus
+  optional raw sensor counts), per-measurement [`MeasurementConfidence`] (σY/Y,
+  Δu'v', floor σ vs. trust thresholds — computed from raw counts when present,
+  else from XYZ-repeat scatter), a per-device `measure_adaptive` primitive for
+  batch loops like dense 3D LUT calibration, and a `RawDiagnostics` capability
+  for low-level characterization. The one implemented driver is the Datacolor
+  `spyder` family (SpyderX2 / Spyder 2024); its wire protocol and calibration
+  mechanics stay behind the trait.
 - `tristim-display/` — Wayland layer-shell client that renders known SDR/HDR
   patches on a chosen output, with optional centered-window mode for
   ABL-limited OLED peak measurement.

@@ -22,8 +22,7 @@
 //! is irreducibly uncertain at a fixed exposure — this module reports that
 //! honestly rather than hiding it.
 
-use crate::measurement::{Calibration, RawMeasurement, Setup, Xyz, raw_to_xyz};
-use crate::sample::{RawRepeats, Sample};
+use crate::sample::{RawRepeats, Sample, Xyz};
 
 /// 1σ-equivalent uncertainty of a single integer count (uniform quantization
 /// noise, `q/√12`). Used as a noise floor that repeat-variance can't reveal:
@@ -164,38 +163,6 @@ impl MeasurementConfidence {
             chroma_defined,
             raw,
         }
-    }
-
-    /// Transitional shim for the legacy Spyder call path: build a [`Sample`]
-    /// from raw counts + the device calibration, then delegate to
-    /// [`from_sample`](Self::from_sample). Removed once all callers pass a
-    /// `Sample` directly.
-    pub fn from_repeats(raws: &[RawMeasurement], setup: &Setup, cal: &Calibration) -> Self {
-        let counts: Vec<Vec<u32>> = raws
-            .iter()
-            .map(|r| r.0.iter().map(|&c| c as u32).collect())
-            .collect();
-        let floor: Vec<f64> = setup.s5.iter().map(|&s| s as f64).collect();
-        // ∂XYZ/∂count for channel j is the j-th matrix column scaled by per-row gain.
-        let grad: Vec<[f64; 3]> = (0..6)
-            .map(|j| {
-                [
-                    cal.matrix[0][j] * cal.gain[0],
-                    cal.matrix[1][j] * cal.gain[1],
-                    cal.matrix[2][j] * cal.gain[2],
-                ]
-            })
-            .collect();
-        let xyz: Vec<Xyz> = raws.iter().map(|r| raw_to_xyz(r, setup, cal)).collect();
-        let sample = Sample {
-            xyz,
-            raw: Some(RawRepeats {
-                counts,
-                floor,
-                grad,
-            }),
-        };
-        Self::from_sample(&sample)
     }
 
     /// Combined Y uncertainty: temporal repeat noise ⊕ quantization floor.
@@ -381,35 +348,38 @@ mod tests {
     /// carries no signal and flags Floor.
     #[test]
     fn excludes_dark_channels_and_flags_floor() {
-        let cal = unit_cal();
-        let setup = setup_with_floor([20; 6]);
+        // Y = sum of corrected counts (every channel's Y gradient is 1); floor 20.
+        let grad = [[0.0, 1.0, 0.0]; 6];
+        let floor = [20.0; 6];
 
         // ch0–2 well above the floor; ch3–5 pinned at it (dark).
-        let bright = vec![
-            RawMeasurement([200, 200, 200, 20, 20, 20]),
-            RawMeasurement([202, 198, 201, 20, 20, 20]),
-            RawMeasurement([198, 202, 199, 20, 20, 20]),
-        ];
-        let c = MeasurementConfidence::from_repeats(&bright, &setup, &cal);
-        let rs = c
-            .raw
-            .as_ref()
-            .expect("raw stats present on the Spyder path");
+        let bright = sample_from(
+            &[
+                [200, 200, 200, 20, 20, 20],
+                [202, 198, 201, 20, 20, 20],
+                [198, 202, 199, 20, 20, 20],
+            ],
+            floor,
+            grad,
+        );
+        let c = MeasurementConfidence::from_sample(&bright);
+        let rs = c.raw.as_ref().expect("raw stats present for a raw sample");
         assert_eq!(rs.is_signal, [true, true, true, false, false, false]);
         assert!(rs.min_floor_sigma > FLOOR_SIGMA_MIN);
         assert!(c.is_trustworthy());
 
         // Every channel at/below its floor: nothing carries signal → Floor.
-        let dark = vec![
-            RawMeasurement([20, 18, 21, 19, 20, 22]),
-            RawMeasurement([19, 21, 20, 18, 21, 19]),
-            RawMeasurement([21, 19, 19, 20, 20, 20]),
-        ];
-        let c = MeasurementConfidence::from_repeats(&dark, &setup, &cal);
-        let rs = c
-            .raw
-            .as_ref()
-            .expect("raw stats present on the Spyder path");
+        let dark = sample_from(
+            &[
+                [20, 18, 21, 19, 20, 22],
+                [19, 21, 20, 18, 21, 19],
+                [21, 19, 19, 20, 20, 20],
+            ],
+            floor,
+            grad,
+        );
+        let c = MeasurementConfidence::from_sample(&dark);
+        let rs = c.raw.as_ref().expect("raw stats present for a raw sample");
         assert!(
             rs.is_signal.iter().all(|&s| !s),
             "no channel should count as signal at the floor"
@@ -422,17 +392,23 @@ mod tests {
     /// chromaticity, 10× dimmer ⇒ markedly larger Δu'v'.
     #[test]
     fn chromaticity_uncertainty_grows_toward_black() {
-        let cal = xyz_passthrough_cal();
-        let setup = setup_with_floor([0; 6]);
+        // ch0→X, ch1→Y, ch2→Z passthrough; ch3–5 dark. Floor 0.
+        let grad = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        let floor = [0.0; 6];
         // Stable repeats (no temporal spread) so we isolate the quant floor.
-        let bright = vec![RawMeasurement([100, 90, 80, 0, 0, 0]); 4];
-        let dark = vec![RawMeasurement([10, 9, 8, 0, 0, 0]); 4];
-        let b = MeasurementConfidence::from_repeats(&bright, &setup, &cal)
+        let bright = sample_from(&[[100, 90, 80, 0, 0, 0]; 4], floor, grad);
+        let dark = sample_from(&[[10, 9, 8, 0, 0, 0]; 4], floor, grad);
+        let b = MeasurementConfidence::from_sample(&bright)
             .uv_std()
             .unwrap();
-        let d = MeasurementConfidence::from_repeats(&dark, &setup, &cal)
-            .uv_std()
-            .unwrap();
+        let d = MeasurementConfidence::from_sample(&dark).uv_std().unwrap();
         assert!(b > 0.0 && d > 0.0);
         assert!(
             d > 2.0 * b,
@@ -440,48 +416,34 @@ mod tests {
         );
     }
 
-    /// Channels map straight to X/Y/Z (ch0→X, ch1→Y, ch2→Z) so chromaticity
-    /// is well-defined and exercised in tests.
-    fn xyz_passthrough_cal() -> Calibration {
-        let mut matrix = [[0.0; 6]; 3];
-        matrix[0][0] = 1.0;
-        matrix[1][1] = 1.0;
-        matrix[2][2] = 1.0;
-        Calibration {
-            index: 0,
-            v1: 0,
-            v2: 0,
-            v4: [0; 6],
-            matrix,
-            gain: [1.0; 3],
-            offset: [0.0; 3],
-            v3: 0,
-        }
-    }
-
-    /// Y = sum of corrected counts (row 1 all ones); X/Z rows zero.
-    fn unit_cal() -> Calibration {
-        let mut matrix = [[0.0; 6]; 3];
-        matrix[1] = [1.0; 6];
-        Calibration {
-            index: 0,
-            v1: 0,
-            v2: 0,
-            v4: [0; 6],
-            matrix,
-            gain: [1.0; 3],
-            offset: [0.0; 3],
-            v3: 0,
-        }
-    }
-
-    fn setup_with_floor(s5: [u8; 6]) -> Setup {
-        Setup {
-            s1: 0,
-            s2: 0,
-            s3: [0; 6],
-            s4: [0; 6],
-            s5,
+    /// Build a raw [`Sample`] the way a device would: corrected counts run
+    /// through the per-channel gradient to absolute XYZ (zero offset), with the
+    /// counts/floor/grad retained for the floor + quantization analysis.
+    fn sample_from(counts: &[[u32; 6]], floor: [f64; 6], grad: [[f64; 3]; 6]) -> Sample {
+        let xyz = counts
+            .iter()
+            .map(|c| {
+                let mut acc = [0.0; 3];
+                for ch in 0..6 {
+                    let corrected = (c[ch] as f64 - floor[ch]).max(0.0);
+                    for i in 0..3 {
+                        acc[i] += grad[ch][i] * corrected;
+                    }
+                }
+                Xyz {
+                    x: acc[0],
+                    y: acc[1],
+                    z: acc[2],
+                }
+            })
+            .collect();
+        Sample {
+            xyz,
+            raw: Some(RawRepeats {
+                counts: counts.iter().map(|c| c.to_vec()).collect(),
+                floor: floor.to_vec(),
+                grad: grad.to_vec(),
+            }),
         }
     }
 }

@@ -2,10 +2,11 @@
 //! bytes for a couple of opcodes.
 
 use std::time::Duration;
-use tristim_driver::{Colorimeter, Opcode};
+use tristim_driver::spyder::protocol::Opcode;
+use tristim_driver::{Colorimeter, Spyder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut device = Colorimeter::open_any()?;
+    let mut device = Spyder::open_any()?;
     println!("opened device, USB PID = 0x{:04x}", device.pid());
     println!(
         "(family: {})",
@@ -20,17 +21,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- 0xC2 (get device info) ---");
     let raw = device.command(Opcode::GetInfo, &[], 0x25, false, Duration::from_secs(5))?;
     println!("raw 37-byte reply: {}", hex(&raw));
-    let info = device.get_info()?;
     println!(
         "hw version:     {}.{:02}",
-        info.hw_version.0, info.hw_version.1
+        device.info().firmware.0,
+        device.info().firmware.1
     );
-    println!("serial:         {:?}", info.serial);
-    println!("high-level cmds:{}", info.high_level_commands);
-    if let Some(mx) = info.max_display_type {
+    println!("serial:         {:?}", device.info().serial);
+    let caps = device.caps();
+    println!("high-level cmds:{}", caps.high_level_commands);
+    if let Some(mx) = caps.max_display_type {
         println!("max display:    {}", mx);
     }
-    if let Some(mask) = info.display_type_mask {
+    if let Some(mask) = caps.display_type_mask {
         println!("display mask:   0x{:04x}", mask);
     }
 

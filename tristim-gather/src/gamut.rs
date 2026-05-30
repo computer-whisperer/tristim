@@ -28,7 +28,7 @@ use tristim_color::metrics::{delta_e76, xyz_to_lab};
 use tristim_color::{ColorSpace, mat3_inverse, mat3_mul_vec, transfer};
 use tristim_display::PatchSurface;
 use tristim_driver::{
-    AdaptiveTier, Calibration, Colorimeter, MeasurementConfidence, Setup, TrustFlag, Xyz,
+    AdaptiveTier, CalibrationId, Colorimeter, MeasurementConfidence, TrustFlag, Xyz,
 };
 
 use crate::format::FormatSpec;
@@ -145,20 +145,14 @@ fn open_session(
     config: &GamutConfig,
     on_event: &mut impl FnMut(GamutEvent),
     should_cancel: &impl Fn() -> bool,
-) -> Result<(Colorimeter, Calibration, Setup, PatchSurface), GatherError> {
-    let mut device = Colorimeter::open_any()?;
-    let info = device.get_info()?;
-    let cal = device.get_calibration(config.cal_index)?;
-    let setup = device.get_setup(&cal)?;
-    let product = if device.is_spyder_2024() {
-        "Spyder 2024"
-    } else {
-        "SpyderX2"
-    };
+) -> Result<(Box<dyn Colorimeter>, PatchSurface), GatherError> {
+    let mut device = tristim_driver::open_any()?;
+    device.select_calibration(CalibrationId(config.cal_index))?;
+    let info = device.info();
     on_event(GamutEvent::DeviceReady {
-        product: product.to_string(),
+        product: info.model.clone(),
         serial: info.serial.clone(),
-        hw_version: info.hw_version,
+        hw_version: info.firmware,
     });
 
     let (surface, outcome) = open_format(&config.output, &config.format)?;
@@ -187,7 +181,7 @@ fn open_session(
         sleep(Duration::from_secs(1));
     }
 
-    Ok((device, cal, setup, surface))
+    Ok((device, surface))
 }
 
 /// Run the coarse cube-surface gamut probe, reporting progress through
@@ -201,8 +195,7 @@ pub fn probe_gamut(
     mut on_event: impl FnMut(GamutEvent),
     should_cancel: impl Fn() -> bool,
 ) -> Result<GamutProbe, GatherError> {
-    let (mut device, cal, setup, mut surface) =
-        open_session(config, &mut on_event, &should_cancel)?;
+    let (mut device, mut surface) = open_session(config, &mut on_event, &should_cancel)?;
 
     let total = PROBE_POINTS.len();
     let mut vertices = Vec::with_capacity(total);
@@ -218,10 +211,8 @@ pub fn probe_gamut(
         // Adaptive: when `fast_integration_ms` is set, the device first burst-
         // measures at the short integration and only escalates to the default
         // if trust fails — see [`Colorimeter::measure_adaptive`].
-        let result =
-            device.measure_adaptive(&setup, &cal, config.repeats, config.fast_integration_ms)?;
-        let confidence =
-            MeasurementConfidence::from_repeats(&result.raws, &result.setup, &result.cal);
+        let result = device.measure_adaptive(config.repeats, config.fast_integration_ms)?;
+        let confidence = MeasurementConfidence::from_sample(&result.sample);
         on_event(GamutEvent::Point {
             index,
             total,
@@ -588,17 +579,14 @@ pub fn probe_gamut_refined(
     mut on_event: impl FnMut(GamutEvent),
     should_cancel: impl Fn() -> bool,
 ) -> Result<GamutMesh, GatherError> {
-    let (mut device, cal, setup, mut surface) =
-        open_session(config, &mut on_event, &should_cancel)?;
+    let (mut device, mut surface) = open_session(config, &mut on_event, &should_cancel)?;
 
     let mut index = 0usize;
     let measure = |cv: [f64; 3]| -> Result<ProbeSample, GatherError> {
         surface.set_code_values(cv)?;
         sleep(config.settle);
-        let result =
-            device.measure_adaptive(&setup, &cal, config.repeats, config.fast_integration_ms)?;
-        let confidence =
-            MeasurementConfidence::from_repeats(&result.raws, &result.setup, &result.cal);
+        let result = device.measure_adaptive(config.repeats, config.fast_integration_ms)?;
+        let confidence = MeasurementConfidence::from_sample(&result.sample);
         on_event(GamutEvent::Measured {
             index,
             code_value: cv,

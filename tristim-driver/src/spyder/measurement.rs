@@ -278,35 +278,36 @@ impl Calibration {
     pub fn integration_ms(&self) -> u16 {
         self.v2
     }
+
+    /// A neutral placeholder used only to construct a [`Spyder`](crate::Spyder)
+    /// before its real calibration is downloaded at open time. Never measured
+    /// against — `open_any` overwrites it before returning.
+    pub(crate) fn placeholder() -> Self {
+        Calibration {
+            index: 0,
+            v1: 0,
+            v2: 1,
+            v4: [0; 6],
+            matrix: [[0.0; 6]; 3],
+            gain: [1.0; 3],
+            offset: [0.0; 3],
+            v3: 0,
+        }
+    }
 }
 
-/// Which tier produced an [`AdaptiveMeasurement`] — for telemetry and event
-/// reporting. Callers that want to weight tiers (or count escalations) should
-/// branch on this rather than inspecting setup.s2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdaptiveTier {
-    /// Adaptive was disabled (or the requested fast integration was out of
-    /// range): a single default-integration measurement was taken.
-    SingleFull,
-    /// Two-tier: the fast measurement passed `is_trustworthy()` on the first
-    /// attempt and is what's returned.
-    Fast,
-    /// Two-tier: the fast measurement was untrustworthy; the returned data is
-    /// the default-integration re-measurement that followed.
-    EscalatedFull,
-}
-
-/// Result of [`Colorimeter::measure_adaptive`]. The `setup` and `cal` fields
-/// are the pair that actually produced `raws` (possibly the override pair, or
-/// the originals if no override or after escalation). Pass them to
-/// [`MeasurementConfidence::from_repeats`](crate::confidence::MeasurementConfidence::from_repeats)
-/// for correct XYZ scaling.
-#[derive(Debug, Clone)]
-pub struct AdaptiveMeasurement {
-    pub raws: Vec<RawMeasurement>,
-    pub setup: Setup,
-    pub cal: Calibration,
-    pub tier: AdaptiveTier,
+impl Setup {
+    /// Placeholder setup, paired with [`Calibration::placeholder`]. Overwritten
+    /// at open time before any measurement.
+    pub(crate) fn placeholder() -> Self {
+        Setup {
+            s1: 0,
+            s2: 1,
+            s3: [0; 6],
+            s4: [0; 6],
+            s5: [0; 6],
+        }
+    }
 }
 
 /// Build a [`Setup`] + [`Calibration`] pair for measuring at a non-default
