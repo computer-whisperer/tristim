@@ -25,7 +25,9 @@ use crate::chart::{PresenterGamut, chromaticity_chart};
 use crate::luminance::{luminance_chart, luminance_units};
 use crate::plot::Space;
 use crate::setup::{CaptureForm, FormAction};
-use crate::space3d::{N_REF_GAMUTS, REF_GAMUTS, RefSet, Space3dScene, space_chart, space_legend};
+use crate::space3d::{
+    N_REF_GAMUTS, REF_GAMUTS, RefSet, Space3dScene, Space3dView, space_chart, space_legend,
+};
 
 /// Which plot the content panel shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +77,7 @@ impl Presented {
     /// Ensure the cached 3D scene matches the focused trial, enabled reference
     /// gamuts, and measured-shell toggle, rebuilding its handles only when any
     /// moved.
-    fn ensure_space3d(&mut self, refs: RefSet, show_measured: bool) {
+    fn ensure_space3d(&mut self, view: Space3dView, refs: RefSet, show_measured: bool) {
         if self.analyzed.trials.is_empty() {
             self.space3d = None;
             return;
@@ -84,12 +86,13 @@ impl Presented {
         if !self
             .space3d
             .as_ref()
-            .is_some_and(|s| s.matches(i, refs, show_measured))
+            .is_some_and(|s| s.matches(i, view, refs, show_measured))
         {
             let gamut = self.capture.trials.get(i).and_then(|t| t.gamut.as_ref());
             self.space3d = Some(Space3dScene::build(
                 &self.analyzed.trials[i],
                 i,
+                view,
                 refs,
                 gamut,
                 show_measured,
@@ -310,6 +313,8 @@ pub struct PresenterApp {
     space3d_refs: RefSet,
     /// Whether the measured-gamut shell overlay is enabled in the 3D view.
     space3d_show_measured: bool,
+    /// Which colour space the 3D view projects samples into.
+    space3d_view: Space3dView,
 }
 
 impl PresenterApp {
@@ -329,6 +334,7 @@ impl PresenterApp {
             hovered_sample: None,
             space3d_refs: [false; N_REF_GAMUTS],
             space3d_show_measured: false,
+            space3d_view: Space3dView::default(),
         }
     }
 
@@ -351,6 +357,7 @@ impl PresenterApp {
             hovered_sample: None,
             space3d_refs: [false; N_REF_GAMUTS],
             space3d_show_measured: false,
+            space3d_view: Space3dView::default(),
         }
     }
 
@@ -399,6 +406,7 @@ impl PresenterApp {
             hovered_sample: None,
             space3d_refs: [false; N_REF_GAMUTS],
             space3d_show_measured: false,
+            space3d_view: Space3dView::default(),
         }
     }
 
@@ -419,10 +427,11 @@ impl PresenterApp {
         // The 3D view reads cached geometry handles; build them up front so a
         // headless render (which never calls `before_build`) still has a scene.
         if view == Tab::Space3D {
+            let s3v = self.space3d_view;
             let refs = self.space3d_refs;
             let show = self.space3d_show_measured;
             if let Some(p) = self.presented.as_mut() {
-                p.ensure_space3d(refs, show);
+                p.ensure_space3d(s3v, refs, show);
             }
         }
     }
@@ -431,6 +440,20 @@ impl PresenterApp {
     /// both spaces.
     pub fn set_space(&mut self, space: Space) {
         self.space = space;
+    }
+
+    /// Set the 3D projection. Used by the headless dump to lint each one's
+    /// heading + legend and to build its geometry on real samples. Rebuilds the
+    /// cached scene so a headless render (no `before_build`) has the right one.
+    pub fn set_space3d_view(&mut self, view: Space3dView) {
+        self.space3d_view = view;
+        if self.view == Tab::Space3D {
+            let refs = self.space3d_refs;
+            let show = self.space3d_show_measured;
+            if let Some(p) = self.presented.as_mut() {
+                p.ensure_space3d(view, refs, show);
+            }
+        }
     }
 
     /// Number of trials in the presented capture (0 if none).
@@ -721,8 +744,11 @@ impl PresenterApp {
         // sides, so the enclosing `plot_card` ends up at the budgeted footprint.
         let plot_px = plot_size(cx, extra_chrome) - 2.0 * PLOT_CARD_PAD;
 
-        // Heading: title + view selector, plus chromaticity-only controls.
-        let mut heading: Vec<El> = vec![
+        // Heading: title + the top-level view selector. Per-view controls (which
+        // can be many — the 3D view alone has a projection selector, three
+        // reference-gamut toggles, and a measured-shell toggle) go on their own
+        // full-width row below, so the heading never overflows on a narrow window.
+        let heading: Vec<El> = vec![
             column([
                 h3(self.trial_label(p, i)),
                 text(ground_truth_line(t)).muted().font_size(13.0),
@@ -731,6 +757,7 @@ impl PresenterApp {
             spacer(),
             view_selector(self.view),
         ];
+        let mut controls: Vec<El> = Vec::new();
 
         // Which sample (if any) is hovered, by the active view's mechanism: the
         // 2D charts set `hovered_sample` from pointer events over per-sample hit
@@ -746,14 +773,16 @@ impl PresenterApp {
         // The main plot + its tab-specific legend (shown when nothing is hovered).
         let (plot, legend) = match self.view {
             Tab::Space3D => {
+                // Which colour space to project samples into.
+                controls.push(space3d_view_selector(self.space3d_view));
                 // Reference-gamut overlay toggles (the trial's own gamut is
                 // always drawn as the target).
                 for (gi, g) in REF_GAMUTS.iter().enumerate() {
-                    heading.push(ref_toggle(g.name, g.key, self.space3d_refs[gi]));
+                    controls.push(ref_toggle(g.name, g.key, self.space3d_refs[gi]));
                 }
                 // The measured-gamut shell, only when this trial was probed.
                 if p.capture.trials.get(i).is_some_and(|t| t.gamut.is_some()) {
-                    heading.push(measured_toggle(self.space3d_show_measured));
+                    controls.push(measured_toggle(self.space3d_show_measured));
                 }
                 // The geometry handles are cached on `Presented` and refreshed
                 // in `before_build`; `None` only during a transient first frame.
@@ -763,14 +792,14 @@ impl PresenterApp {
                         .width(Size::Fixed(plot_px))
                         .height(Size::Fixed(plot_px)),
                 };
-                (chart, space_legend())
+                (chart, space_legend(self.space3d_view))
             }
             Tab::Chromaticity => {
                 // Color fill is bounded to the presenter's negotiated gamut.
                 let gamut = presenter_gamut(cx);
-                heading.push(space_toggle(self.space));
+                controls.push(space_toggle(self.space));
                 if gamut.is_some() {
-                    heading.push(field_toggle(self.show_field));
+                    controls.push(field_toggle(self.show_field));
                 }
                 let field = if self.show_field { gamut } else { None };
                 (
@@ -786,11 +815,23 @@ impl PresenterApp {
             None => legend,
         };
 
-        column([
+        let mut rows: Vec<El> = vec![
             row(heading)
                 .gap(tokens::SPACE_2)
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
+        ];
+        // The active view's controls, on their own row so they have the full
+        // width to spread into (Luminance has none, so the row is skipped).
+        if !controls.is_empty() {
+            rows.push(
+                row(controls)
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
+                    .width(Size::Fill(1.0)),
+            );
+        }
+        rows.push(
             row([
                 plot_card(plot),
                 column([
@@ -804,10 +845,12 @@ impl PresenterApp {
             .align(Align::Start)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0)),
-        ])
-        .gap(tokens::SPACE_4)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
+        );
+
+        column(rows)
+            .gap(tokens::SPACE_4)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
     }
 
     fn present_view(&self, p: &Presented, cx: &BuildCx) -> El {
@@ -951,6 +994,13 @@ impl PresenterApp {
                 Some("measured-toggle") => {
                     self.space3d_show_measured = !self.space3d_show_measured;
                 }
+                Some(k) if k.starts_with("s3v:") => {
+                    if let Some(v) = space3d_view_from_key(k) {
+                        self.space3d_view = v;
+                        // Hit geometry is per-projection; drop any stale highlight.
+                        self.hovered_sample = None;
+                    }
+                }
                 Some(k) if k.starts_with("ref:") => {
                     if let Some(i) = REF_GAMUTS
                         .iter()
@@ -1068,13 +1118,14 @@ impl App for PresenterApp {
         // trial. Done here (not in `build`, which is `&self`) so the handles
         // persist across frames and the backend re-uploads nothing on orbit.
         if self.view == Tab::Space3D {
+            let s3v = self.space3d_view;
             let refs = self.space3d_refs;
             let show = self.space3d_show_measured;
             if let Some(p) = self.presented.as_mut() {
-                p.ensure_space3d(refs, show);
+                p.ensure_space3d(s3v, refs, show);
             }
             if let Some(live) = self.running.as_mut().and_then(|r| r.live.as_mut()) {
-                live.ensure_space3d(refs, show);
+                live.ensure_space3d(s3v, refs, show);
             }
         }
     }
@@ -1210,6 +1261,36 @@ fn ref_toggle(name: &str, key: &str, on: bool) -> El {
 fn measured_toggle(on: bool) -> El {
     let b = button("measured").key("measured-toggle");
     if on { b.primary() } else { b.secondary() }
+}
+
+/// The four 3D projections, paired with their route keys and button labels —
+/// the single source of truth for the selector and the event router.
+const SPACE3D_VIEWS: [(Space3dView, &str, &str); 4] = [
+    (Space3dView::LabRelative, "s3v:lab", "Lab"),
+    (Space3dView::LabAbsolute, "s3v:lababs", "Lab·abs"),
+    (Space3dView::XyYNits, "s3v:xyy", "xyY·nits"),
+    (Space3dView::ICtCp, "s3v:ictcp", "ICtCp"),
+];
+
+/// Route key (`s3v:…`) → projection.
+fn space3d_view_from_key(key: &str) -> Option<Space3dView> {
+    SPACE3D_VIEWS
+        .iter()
+        .find(|(_, k, _)| *k == key)
+        .map(|(v, _, _)| *v)
+}
+
+/// Segmented selector for the 3D projection; the current one's button is primary.
+fn space3d_view_selector(current: Space3dView) -> El {
+    row(SPACE3D_VIEWS.map(|(v, key, label)| {
+        let b = button(label).key(key.to_string());
+        if v == current {
+            b.primary()
+        } else {
+            b.secondary()
+        }
+    }))
+    .gap(tokens::SPACE_2)
 }
 
 /// Segmented selector for the active view; the current view's button is primary.

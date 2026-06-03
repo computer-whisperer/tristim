@@ -1,25 +1,39 @@
 //! The **3D sample space**: a [`chart3d`] view that embeds a trial's samples in
-//! CIE L\*a\*b\* and shows, in one picture, where the compositor *should* have
-//! put each colour versus where it landed.
+//! a chosen colour space and shows, in one picture, where the compositor
+//! *should* have put each colour versus where it landed.
 //!
-//! Three marks, all in the same Lab frame the ΔE\*ab scores live in (the trial's
-//! reference white, from [`AnalyzedTrial::reference_white_xyz`]):
+//! Every mark starts from **absolute CIE XYZ** (cd/m²) — measured samples carry
+//! it directly, expected values are derived in the same absolute frame, and the
+//! ideal-gamut cages are synthesised from primaries scaled to a white
+//! luminance. A [`Space3dView`] then projects that absolute XYZ into world
+//! coordinates, so the same geometry can be shown four ways:
 //!
-//! - **points** — one per measured sample at its `measured_lab`, painted in its
-//!   own (sRGB-clamped) colour so the cloud reads like the picture it is.
-//! - **error vectors** (lines) — `expected_lab → measured_lab` per sample. Lab
-//!   is perceptually near-uniform, so each vector's *length* is the reported
-//!   ΔE\*ab and its *direction* shows the kind of error (hue / chroma / lightness).
+//! - **Lab (relative)** — CIE L\*a\*b\* against the trial's *measured* white, the
+//!   frame the ΔE\*ab scores live in. Each error vector's *length* is the
+//!   reported ΔE\*ab and its *direction* the kind of error. White sits at
+//!   L\*=100 regardless of how bright it actually was.
+//! - **Lab (absolute)** — the same Lab geometry but against a *fixed* 203 cd/m²
+//!   white, so absolute brightness survives: a 1000-nit white rises well above
+//!   L\*=100 instead of collapsing onto it.
+//! - **xyY (nits)** — CIE xy chromaticity as the floor, absolute luminance
+//!   (PQ-encoded so the SDR-to-HDR decade is legible) as height.
+//! - **ICtCp** — the BT.2100 absolute-luminance perceptual space: PQ intensity
+//!   up, opponent chroma on the floor. Purpose-built for sRGB-vs-BT.2020.
+//!
+//! The three marks:
+//!
+//! - **points** — one per measured sample, painted in its own (sRGB-clamped)
+//!   colour so the cloud reads like the picture it is.
+//! - **error vectors** (lines) — `expected → measured` per scorable sample.
 //! - **gamut cages** (lines) — the ideal RGB cube of a colour space, mapped
-//!   corner-by-corner into the same Lab frame and subdivided (cube edges curve
-//!   in Lab). It is the surface the measured points *would* sit on if the
-//!   display reproduced that space perfectly, so drift off it is visible at a
-//!   glance. The trial's negotiated space is always drawn (the *target*); the
-//!   standard reference gamuts in [`REF_GAMUTS`] can be overlaid for comparison,
-//!   each in its own colour with an in-plot name label.
+//!   corner-by-corner and subdivided (cube edges curve). The trial's negotiated
+//!   space is always drawn (the *target*, anchored at the measured white); the
+//!   standard reference gamuts in [`REF_GAMUTS`] can be overlaid, each anchored
+//!   in the absolute views at its own reference white luminance so a wider /
+//!   brighter gamut visibly reaches further.
 //!
-//! Geometry handles are built once per trial + reference set and cached on the
-//! presenter (see [`Space3dScene`]); `build` clones them into a fresh
+//! Geometry handles are built once per trial + view + reference set and cached
+//! on the presenter (see [`Space3dScene`]); `build` clones them into a fresh
 //! [`SceneSpec`] each frame, so the backend re-uploads nothing while the camera
 //! moves.
 
@@ -33,7 +47,158 @@ use damascene_core::scene::{
 
 use tristim_analyze::{AnalyzedSample, AnalyzedTrial, GroundTruth};
 use tristim_capture::MeasuredGamut;
-use tristim_color::{ColorSpace, mat3_mul_vec, metrics, transfer};
+use tristim_color::{
+    ColorSpace, chromaticity_to_xyz, ictcp, mat3_mul_vec, metrics, transfer, white,
+    xyz_to_chromaticity,
+};
+
+/// The colour space a [`Space3dScene`] embeds samples in. The first three reuse
+/// CIE-derived geometry; only the final projection of an absolute XYZ into world
+/// coordinates differs between them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Space3dView {
+    /// CIE L\*a\*b\* against the trial's measured white (the ΔE\*ab frame). Default.
+    #[default]
+    LabRelative,
+    /// CIE L\*a\*b\* against a fixed [`ABS_LAB_REF_NITS`] white (absolute lightness).
+    LabAbsolute,
+    /// CIE xy on the floor, absolute luminance (PQ-encoded) as height.
+    XyYNits,
+    /// ITU-R BT.2100 ICtCp: PQ intensity up, opponent chroma on the floor.
+    ICtCp,
+}
+
+/// The reference white for the absolute-Lab view (BT.2408 HDR/SDR diffuse
+/// white). Content at this luminance maps to L\*=100; brighter content exceeds it.
+pub const ABS_LAB_REF_NITS: f64 = 203.0;
+
+/// CIE xy (offset from D65) → world units, so the chromaticity floor spans a
+/// range comparable to the luminance height.
+const XYY_CHROMA_SCALE: f64 = 200.0;
+/// PQ-encoded luminance (`0..=1`) → world height.
+const NITS_PQ_HEIGHT: f64 = 100.0;
+/// ICtCp intensity (`0..=1`) → world height.
+const ICTCP_I_SCALE: f64 = 100.0;
+/// ICtCp opponent chroma (`±0.5`-ish) → world floor units.
+const ICTCP_CHROMA_SCALE: f64 = 200.0;
+
+impl Space3dView {
+    /// Project an absolute CIE XYZ (cd/m²) into scene world coordinates.
+    /// `trial_white` is the trial's measured-white XYZ, used only by the
+    /// relative-Lab view.
+    fn world(self, xyz: [f64; 3], trial_white: [f64; 3]) -> Vec3 {
+        match self {
+            Space3dView::LabRelative => lab_to_world(metrics::xyz_to_lab(xyz, trial_white)),
+            Space3dView::LabAbsolute => lab_to_world(metrics::xyz_to_lab(xyz, abs_lab_white())),
+            Space3dView::XyYNits => {
+                let c = xyz_to_chromaticity(xyz).unwrap_or(white::D65);
+                let h = transfer::pq_oetf(xyz[1].max(0.0)) * NITS_PQ_HEIGHT;
+                Vec3::new(
+                    ((c[0] - white::D65[0]) * XYY_CHROMA_SCALE) as f32,
+                    h as f32,
+                    ((c[1] - white::D65[1]) * XYY_CHROMA_SCALE) as f32,
+                )
+            }
+            Space3dView::ICtCp => {
+                let [i, ct, cp] = ictcp::xyz_to_ictcp(xyz);
+                Vec3::new(
+                    (ct * ICTCP_CHROMA_SCALE) as f32,
+                    (i * ICTCP_I_SCALE) as f32,
+                    (cp * ICTCP_CHROMA_SCALE) as f32,
+                )
+            }
+        }
+    }
+
+    /// The white luminance (cd/m²) a *reference-overlay* cage is anchored at.
+    /// The relative-Lab view keeps every cage at the trial's measured white (so
+    /// they all normalise to L\*=100, the established behaviour); the absolute
+    /// views use the gamut's own reference white, so a brighter gamut reaches
+    /// higher.
+    fn ref_cage_white_y(self, trial_white_y: f64, ref_nits: f64) -> f64 {
+        match self {
+            Space3dView::LabRelative => trial_white_y,
+            _ => ref_nits,
+        }
+    }
+
+    /// `(x, y-up, z)` axis titles for this view.
+    fn axis_titles(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Space3dView::LabRelative => ("a*", "L*", "b*"),
+            Space3dView::LabAbsolute => ("a*", "L* (abs)", "b*"),
+            Space3dView::XyYNits => ("x", "Y · cd/m² (PQ)", "y"),
+            Space3dView::ICtCp => ("Ct", "I (PQ)", "Cp"),
+        }
+    }
+
+    /// Fixed bounds for the up axis, or `None` to auto-fit. The absolute-Lab
+    /// view auto-fits because a high-nit cage (e.g. BT.2020 at 10000 cd/m²)
+    /// drives L\* well past 100; the others are bounded `[0, 100]`.
+    fn y_bounds(self) -> Option<(f32, f32)> {
+        match self {
+            Space3dView::LabAbsolute => None,
+            _ => Some((0.0, 100.0)),
+        }
+    }
+
+    /// Title for the legend card.
+    fn legend_title(self) -> &'static str {
+        match self {
+            Space3dView::LabRelative => "CIELAB space (relative white)",
+            Space3dView::LabAbsolute => "CIELAB space (absolute white)",
+            Space3dView::XyYNits => "xyY space (absolute nits)",
+            Space3dView::ICtCp => "ICtCp space (BT.2100)",
+        }
+    }
+
+    /// One-line description of what the height axis means, for the legend.
+    fn height_hint(self) -> &'static str {
+        match self {
+            Space3dView::LabRelative => "height = L* (0–100, against the measured white)",
+            Space3dView::LabAbsolute => {
+                "height = L* against a fixed 203 cd/m² white — brighter content rises past 100"
+            }
+            Space3dView::XyYNits => {
+                "height = luminance, cd/m² (PQ-encoded); floor = CIE xy around D65"
+            }
+            Space3dView::ICtCp => "height = PQ intensity (absolute); floor = Ct/Cp opponent chroma",
+        }
+    }
+
+    /// Short, view-appropriate per-sample hover label.
+    fn point_label(self, s: &AnalyzedSample) -> String {
+        let lead = match s.delta_e {
+            Some(de) => format!("ΔE {de:.1}"),
+            None => String::new(),
+        };
+        let tail = match self {
+            Space3dView::LabRelative | Space3dView::LabAbsolute => {
+                s.measured_lab.map(|l| format!("L* {:.0}", l[0]))
+            }
+            Space3dView::XyYNits | Space3dView::ICtCp => {
+                Some(format!("{:.0} cd/m²", s.measured_xyz[1]))
+            }
+        };
+        match (lead.is_empty(), tail) {
+            (false, Some(t)) => format!("{lead}  ·  {t}"),
+            (false, None) => lead,
+            (true, Some(t)) => t,
+            (true, None) => String::new(),
+        }
+    }
+}
+
+/// The fixed reference-white XYZ for [`Space3dView::LabAbsolute`]: D65 at
+/// [`ABS_LAB_REF_NITS`] cd/m².
+fn abs_lab_white() -> [f64; 3] {
+    let w = chromaticity_to_xyz(white::D65); // Y = 1
+    [
+        w[0] * ABS_LAB_REF_NITS,
+        ABS_LAB_REF_NITS,
+        w[2] * ABS_LAB_REF_NITS,
+    ]
+}
 
 /// A standard colour space the 3D view can outline as a reference overlay,
 /// alongside the trial's own (always-drawn) gamut.
@@ -44,6 +209,10 @@ pub struct RefGamut {
     /// Button / in-plot label text.
     pub name: &'static str,
     pub space: ColorSpace,
+    /// Reference white luminance (cd/m²) the cage is anchored at in the absolute
+    /// views — a gamut alone fixes no brightness, so this stands in for its
+    /// typical mastering: SDR for sRGB/P3, the PQ container max for BT.2020.
+    pub ref_white_nits: f64,
     /// Cage + label colour (authoring sRGBA).
     pub color: [f32; 4],
 }
@@ -58,18 +227,21 @@ pub const REF_GAMUTS: [RefGamut; N_REF_GAMUTS] = [
         key: "srgb",
         name: "sRGB",
         space: ColorSpace::SRGB,
+        ref_white_nits: 80.0,
         color: [0.42, 0.60, 1.0, 0.5],
     },
     RefGamut {
         key: "p3",
         name: "Display P3",
         space: ColorSpace::DISPLAY_P3,
+        ref_white_nits: 100.0,
         color: [0.36, 0.85, 0.52, 0.5],
     },
     RefGamut {
         key: "bt2020",
         name: "Rec.2020",
         space: ColorSpace::BT2020,
+        ref_white_nits: 10_000.0,
         color: [1.0, 0.70, 0.30, 0.5],
     },
 ];
@@ -79,22 +251,24 @@ pub type RefSet = [bool; N_REF_GAMUTS];
 
 /// Cached scene geometry for one analyzed trial. Cheap to clone into a
 /// [`SceneSpec`] each frame (the handles are `Arc`s); rebuilt only when the
-/// selected trial changes.
+/// selected trial, view, or overlays change.
 pub struct Space3dScene {
-    /// Trial index these handles were built for — half of the cache key.
+    /// Trial index these handles were built for — part of the cache key.
     pub trial: usize,
-    /// Reference overlays these handles were built for — the other half.
+    /// The projection these handles were built for — part of the cache key.
+    view: Space3dView,
+    /// Reference overlays these handles were built for — part of the cache key.
     refs: RefSet,
-    /// Measured samples, each at its `measured_lab`, coloured by measured colour.
+    /// Measured samples, each at its projected position, coloured by measured colour.
     points: PointsHandle,
-    /// Per-point hover labels (ΔE / L\*), aligned with `points`.
+    /// Per-point hover labels (ΔE / lightness or nits), aligned with `points`.
     point_labels: PointLabels,
     /// `expected → measured` displacement per scorable sample.
     vectors: LinesHandle,
     /// All gamut cages (target + enabled references + the measured shell when
     /// enabled), per-segment coloured.
     gamut: LinesHandle,
-    /// Whether the measured-gamut shell overlay is included — half the cache key.
+    /// Whether the measured-gamut shell overlay is included — part of the cache key.
     show_measured: bool,
     /// One label-anchor point per cage, at its green primary.
     gamut_label_geo: PointsHandle,
@@ -106,50 +280,61 @@ pub struct Space3dScene {
 
 impl Space3dScene {
     /// Whether these cached handles still match the requested view.
-    pub fn matches(&self, trial: usize, refs: RefSet, show_measured: bool) -> bool {
-        self.trial == trial && self.refs == refs && self.show_measured == show_measured
+    pub fn matches(
+        &self,
+        trial: usize,
+        view: Space3dView,
+        refs: RefSet,
+        show_measured: bool,
+    ) -> bool {
+        self.trial == trial
+            && self.view == view
+            && self.refs == refs
+            && self.show_measured == show_measured
     }
 
-    /// Build the cached geometry for `trial` (index `idx`) with the given
-    /// reference-gamut overlays enabled. When `show_measured` and `measured` is
-    /// present, the probed gamut shell is overlaid in the same Lab frame.
+    /// Build the cached geometry for `trial` (index `idx`) in `view` with the
+    /// given reference-gamut overlays enabled. When `show_measured` and
+    /// `measured` is present, the probed gamut shell is overlaid.
     pub fn build(
         trial: &AnalyzedTrial,
         idx: usize,
+        view: Space3dView,
         refs: RefSet,
         measured: Option<&MeasuredGamut>,
         show_measured: bool,
     ) -> Self {
-        // Reference white the analyzer placed samples against; 0 ⇒ unscored.
-        let white = trial.reference_white_xyz;
-        let white_y = white.map_or(0.0, |w| w[1]);
-
         let mut points = Vec::new();
         let mut labels = Vec::new();
         let mut vectors = Vec::new();
-        for s in &trial.samples {
-            let Some(mlab) = s.measured_lab else { continue };
-            points.push(ScenePoint {
-                position: lab_to_world(mlab),
-                color: display_color(s.measured_xyz, white_y),
-            });
-            labels.push(point_label(s, mlab));
-            if let Some(elab) = s.expected_lab {
-                vectors.push(LineSegment {
-                    start: lab_to_world(elab),
-                    end: lab_to_world(mlab),
-                    color: VECTOR_COLOR,
-                });
-            }
-        }
-
-        // Cages: the trial's negotiated space (always, as the target) plus each
-        // enabled reference overlay — all in the shared measured-white Lab
-        // frame, so they're directly comparable to the sample cloud.
         let mut cage = Vec::new();
         let mut anchor_pts = Vec::new();
         let mut anchor_txt = Vec::new();
-        if let Some(white_xyz) = white {
+
+        // A reference white (the brightest measured patch) is what makes a trial
+        // scorable; without it there is no expected locus to draw. Every mark is
+        // built from absolute XYZ and projected by `view`.
+        if let Some(white_xyz) = trial.reference_white_xyz {
+            let white_y = white_xyz[1];
+
+            for s in &trial.samples {
+                points.push(ScenePoint {
+                    position: view.world(s.measured_xyz, white_xyz),
+                    color: display_color(s.measured_xyz, white_y),
+                });
+                labels.push(view.point_label(s));
+                if let Some(exyz) = s.expected_xyz {
+                    vectors.push(LineSegment {
+                        start: view.world(exyz, white_xyz),
+                        end: view.world(s.measured_xyz, white_xyz),
+                        color: VECTOR_COLOR,
+                    });
+                }
+            }
+
+            // Cages: the trial's negotiated space (always, as the target, at the
+            // measured white) plus each enabled reference overlay (at its own
+            // reference white in the absolute views).
             let target = match &trial.ground_truth {
                 GroundTruth::Known { space, .. } => Some(*space),
                 _ => None,
@@ -159,7 +344,9 @@ impl Space3dScene {
                     &mut cage,
                     &mut anchor_pts,
                     &mut anchor_txt,
+                    view,
                     space,
+                    white_y,
                     white_xyz,
                     TARGET_CAGE_COLOR,
                     format!("{} · target", space_name(space)),
@@ -173,7 +360,9 @@ impl Space3dScene {
                         &mut cage,
                         &mut anchor_pts,
                         &mut anchor_txt,
+                        view,
                         &g.space,
+                        view.ref_cage_white_y(white_y, g.ref_white_nits),
                         white_xyz,
                         g.color,
                         g.name.to_string(),
@@ -181,13 +370,13 @@ impl Space3dScene {
                 }
             }
 
-            // The measured gamut shell: the *actual* probed boundary, drawn in
-            // the same Lab frame so drift from the ideal cages reads directly.
+            // The measured gamut shell: the *actual* probed boundary, projected
+            // the same way so drift from the ideal cages reads directly.
             if let Some(g) = measured.filter(|_| show_measured) {
-                cage.extend(measured_cage(g, white_xyz));
+                cage.extend(measured_cage(view, g, white_xyz));
                 if let Some(green) = g.vertices.iter().find(|v| v.code_value == [0.0, 1.0, 0.0]) {
                     anchor_pts.push(ScenePoint {
-                        position: lab_to_world(metrics::xyz_to_lab(green.xyz, white_xyz)),
+                        position: view.world(green.xyz, white_xyz),
                         color: MEASURED_CAGE_COLOR,
                     });
                     anchor_txt.push("measured".to_string());
@@ -198,6 +387,7 @@ impl Space3dScene {
         let has_data = !points.is_empty();
         Self {
             trial: idx,
+            view,
             refs,
             points: PointsHandle::new(PointData { points }),
             point_labels: PointLabels::new(labels).on_hover(),
@@ -219,7 +409,7 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
     if !scene.has_data {
         return column([
             text("No scored samples to embed.").muted(),
-            text("This trial has no ground truth (rejected, or a description this build can't map), so there is no L*a*b* frame to place samples in.")
+            text("This trial has no ground truth (rejected, or a description this build can't map), so there is no colour frame to place samples in.")
                 .muted()
                 .font_size(12.0)
                 .wrap_text(),
@@ -229,10 +419,10 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
         .height(Size::Fixed(px));
     }
 
-    // Size the reference grid to the Lab scale: lightness runs 0..100, a*/b*
-    // span roughly ±100 for wide content. No scene background — the scene
-    // composites over the enclosing card's panel surface (a dark surface in
-    // the default theme), so the swatches read against the same surface as
+    // A neutral reference floor/grid, sized to the world scale the projections
+    // share (lightness/intensity run ~0..100, the floor axes span roughly
+    // ±100). No scene background — the scene composites over the enclosing
+    // card's panel surface, so the swatches read against the same surface as
     // the rest of the UI.
     let style = SceneStyle {
         grid: GridSettings {
@@ -245,7 +435,8 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
         ..Default::default()
     };
 
-    let spec = SceneSpec::new()
+    let (ax, ay, az) = scene.view.axis_titles();
+    let mut spec = SceneSpec::new()
         .points_labeled(
             scene.points.clone(),
             PointStyle {
@@ -275,26 +466,28 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
             scene.gamut_labels.clone(),
         )
         .style(style)
-        // X = a* (green→red), Y = L* (dark→light, up), Z = b* (blue→yellow).
-        .axis_titles("a*", "L*", "b*")
-        // Lightness is one-sided: clip the L* axis to [0, 100] so it doesn't
-        // dive into meaningless negative space below the a*/b* floor. a*/b*
-        // stay bipolar (the symmetric default).
-        .axis_bounds(AxisKind::Y, 0.0, 100.0);
+        .axis_titles(ax, ay, az);
+
+    // Most views pin the up axis to a one-sided [0, 100] so it doesn't dive
+    // into meaningless negative space; the absolute-Lab view auto-fits because
+    // bright cages push L* past 100.
+    if let Some((lo, hi)) = scene.view.y_bounds() {
+        spec = spec.axis_bounds(AxisKind::Y, lo, hi);
+    }
 
     // No `.key(...)`: the scene sits at a stable spot in the tree, so its
     // structural node id keys the camera state (and the hover pick) across
-    // frames and trial switches — an explicit key buys nothing here.
+    // frames and trial/view switches — an explicit key buys nothing here.
     chart3d(spec).width(Size::Fixed(px)).height(Size::Fixed(px))
 }
 
 /// The legend/detail card for the 3D view.
-pub fn space_legend() -> El {
+pub fn space_legend(view: Space3dView) -> El {
     titled_card(
-        "CIELAB sample space",
+        view.legend_title(),
         [
             legend_row("dots", "measured samples, in their own colour"),
-            legend_row("lines", "expected → measured (length = ΔE*ab)"),
+            legend_row("lines", "expected → measured (length = ΔE*ab in Lab)"),
             legend_row(
                 "cages",
                 "gamut bounds — the trial's space (· target) plus any reference gamuts enabled above",
@@ -303,7 +496,8 @@ pub fn space_legend() -> El {
                 "measured",
                 "the probed gamut shell, when enabled (hot edges = clamped/folded regions)",
             ),
-            text("Drag to orbit · shift-drag to pan · wheel to zoom · hover a dot for ΔE.")
+            text(view.height_hint()).muted().font_size(12.0).wrap_text(),
+            text("Drag to orbit · shift-drag to pan · wheel to zoom · hover a dot for detail.")
                 .muted()
                 .font_size(12.0)
                 .wrap_text(),
@@ -341,19 +535,20 @@ const MEASURED_CAGE_COLOR: [f32; 4] = [0.93, 0.45, 0.85, 0.7];
 /// Clamped (folded) patches of the measured shell — where pushing the code value
 /// stopped moving the measurement; drawn hotter to flag the boundary it hit.
 const MEASURED_FOLD_COLOR: [f32; 4] = [1.0, 0.4, 0.25, 0.9];
-/// Subdivisions per gamut-cube edge (edges curve in Lab).
+/// Subdivisions per gamut-cube edge (edges curve in most projections).
 const GAMUT_SEGMENTS: usize = 16;
 
 /// Lab `[L*, a*, b*]` → scene world: **X = a\*, Y = L\* (up), Z = b\***. The
-/// a\*/b\* plane is the floor; lightness rises. Distances are preserved, so
-/// world distance ≈ ΔE\*ab.
+/// a\*/b\* plane is the floor; lightness rises. Distances are preserved, so in
+/// the Lab views world distance ≈ ΔE\*ab.
 fn lab_to_world(lab: [f64; 3]) -> Vec3 {
     Vec3::new(lab[1] as f32, lab[0] as f32, lab[2] as f32)
 }
 
 /// A measured XYZ as an authoring-space sRGBA swatch: normalise to the
 /// reference white, matrix into linear sRGB, clamp to gamut, sRGB-encode.
-/// Out-of-sRGB content clips but keeps its hue — enough to read the dot.
+/// Out-of-sRGB content clips but keeps its hue — enough to read the dot. The
+/// swatch is view-independent (it's the colour the patch *is*, not where it sits).
 fn display_color(xyz: [f64; 3], white_y: f64) -> [f32; 4] {
     let s = if white_y > 0.0 { 1.0 / white_y } else { 1.0 };
     let xyz_n = [xyz[0] * s, xyz[1] * s, xyz[2] * s];
@@ -362,24 +557,24 @@ fn display_color(xyz: [f64; 3], white_y: f64) -> [f32; 4] {
     [enc(lin[0]), enc(lin[1]), enc(lin[2]), 1.0]
 }
 
-/// Short hover label for a measured sample.
-fn point_label(s: &AnalyzedSample, mlab: [f64; 3]) -> String {
-    match s.delta_e {
-        Some(de) => format!("ΔE {de:.1}  ·  L* {:.0}", mlab[0]),
-        None => format!("L* {:.0}", mlab[0]),
-    }
-}
-
-/// One corner of the colour space's RGB cube, mapped into the trial's Lab
-/// frame. Linear RGB → XYZ (white at `Y = 1`) → scaled to the reference white's
-/// luminance → L\*a\*b\* against that white — the exact transform an *expected*
-/// sample of this code value would take, so the cage is the expected-locus
-/// boundary.
-fn lab_corner(m: &[[f64; 3]; 3], white_xyz: [f64; 3], rgb: [f64; 3]) -> Vec3 {
+/// One corner of the colour space's RGB cube, as absolute XYZ then projected.
+/// Linear RGB → XYZ (white at `Y = 1`) → scaled to the cage's white luminance →
+/// `view.world` — the exact transform an *expected* sample of this code value
+/// would take, so the cage is the expected-locus boundary.
+fn cage_corner(
+    view: Space3dView,
+    m: &[[f64; 3]; 3],
+    cage_white_y: f64,
+    trial_white: [f64; 3],
+    rgb: [f64; 3],
+) -> Vec3 {
     let xyz = mat3_mul_vec(m, &rgb);
-    let wy = white_xyz[1];
-    let xyz_abs = [xyz[0] * wy, xyz[1] * wy, xyz[2] * wy];
-    lab_to_world(metrics::xyz_to_lab(xyz_abs, white_xyz))
+    let xyz_abs = [
+        xyz[0] * cage_white_y,
+        xyz[1] * cage_white_y,
+        xyz[2] * cage_white_y,
+    ];
+    view.world(xyz_abs, trial_white)
 }
 
 /// Short display name for a colour space (for the in-plot cage label).
@@ -402,32 +597,39 @@ fn space_name(s: &ColorSpace) -> &'static str {
 /// Append one gamut cage (subdivided RGB-cube wireframe) plus a labelled anchor
 /// point at its green primary — the vertex that differs most between gamuts, so
 /// labels don't pile up at the shared white.
+#[allow(clippy::too_many_arguments)]
 fn add_cage(
     segs: &mut Vec<LineSegment>,
     anchor_pts: &mut Vec<ScenePoint>,
     anchor_txt: &mut Vec<String>,
+    view: Space3dView,
     space: &ColorSpace,
-    white_xyz: [f64; 3],
+    cage_white_y: f64,
+    trial_white: [f64; 3],
     color: [f32; 4],
     name: String,
 ) {
-    segs.extend(gamut_wireframe(space, white_xyz, color));
     let m = space.rgb_to_xyz();
+    segs.extend(gamut_wireframe(view, &m, cage_white_y, trial_white, color));
     anchor_pts.push(ScenePoint {
-        position: lab_corner(&m, white_xyz, [0.0, 1.0, 0.0]),
+        position: cage_corner(view, &m, cage_white_y, trial_white, [0.0, 1.0, 0.0]),
         color,
     });
     anchor_txt.push(name);
 }
 
-/// The measured gamut shell: each refined leaf patch drawn as a quad outline in
-/// the trial's Lab frame, with folded (clamped) patches flagged hotter. This is
+/// The measured gamut shell: each refined leaf patch drawn as a quad outline,
+/// projected by `view`, with folded (clamped) patches flagged hotter. This is
 /// the *actual* probed boundary surface, to read against the ideal cages.
-fn measured_cage(gamut: &MeasuredGamut, white_xyz: [f64; 3]) -> Vec<LineSegment> {
+fn measured_cage(
+    view: Space3dView,
+    gamut: &MeasuredGamut,
+    trial_white: [f64; 3],
+) -> Vec<LineSegment> {
     let world: Vec<Vec3> = gamut
         .vertices
         .iter()
-        .map(|v| lab_to_world(metrics::xyz_to_lab(v.xyz, white_xyz)))
+        .map(|v| view.world(v.xyz, trial_white))
         .collect();
     let mut out = Vec::new();
     for p in &gamut.patches {
@@ -449,10 +651,15 @@ fn measured_cage(gamut: &MeasuredGamut, white_xyz: [f64; 3]) -> Vec<LineSegment>
     out
 }
 
-/// The 12 edges of the colour space's RGB cube, each subdivided and mapped into
-/// the Lab frame (so curved edges read as curves, not chords), in `color`.
-fn gamut_wireframe(space: &ColorSpace, white_xyz: [f64; 3], color: [f32; 4]) -> Vec<LineSegment> {
-    let m = space.rgb_to_xyz();
+/// The 12 edges of the colour space's RGB cube, each subdivided and projected
+/// by `view` (so curved edges read as curves, not chords), in `color`.
+fn gamut_wireframe(
+    view: Space3dView,
+    m: &[[f64; 3]; 3],
+    cage_white_y: f64,
+    trial_white: [f64; 3],
+    color: [f32; 4],
+) -> Vec<LineSegment> {
     // The 8 cube corners. Two corners share an edge iff they differ in exactly
     // one channel — the nested loop below picks out the 12 such pairs.
     const CORNERS: [[f64; 3]; 8] = [
@@ -472,7 +679,7 @@ fn gamut_wireframe(space: &ColorSpace, white_xyz: [f64; 3], color: [f32; 4]) -> 
             if differing != 1 {
                 continue;
             }
-            let mut prev = lab_corner(&m, white_xyz, a);
+            let mut prev = cage_corner(view, m, cage_white_y, trial_white, a);
             for step in 1..=GAMUT_SEGMENTS {
                 let t = step as f64 / GAMUT_SEGMENTS as f64;
                 let rgb = [
@@ -480,7 +687,7 @@ fn gamut_wireframe(space: &ColorSpace, white_xyz: [f64; 3], color: [f32; 4]) -> 
                     a[1] + (b[1] - a[1]) * t,
                     a[2] + (b[2] - a[2]) * t,
                 ];
-                let cur = lab_corner(&m, white_xyz, rgb);
+                let cur = cage_corner(view, m, cage_white_y, trial_white, rgb);
                 out.push(LineSegment {
                     start: prev,
                     end: cur,
@@ -501,6 +708,7 @@ mod tests {
     fn sample(
         measured_xyz: [f64; 3],
         measured_lab: [f64; 3],
+        expected_xyz: [f64; 3],
         expected_lab: [f64; 3],
         de: f64,
     ) -> AnalyzedSample {
@@ -509,7 +717,7 @@ mod tests {
             measured_xyz,
             measured_xy: None,
             expected_xy: None,
-            expected_xyz: None,
+            expected_xyz: Some(expected_xyz),
             measured_lab: Some(measured_lab),
             expected_lab: Some(expected_lab),
             delta_uv: None,
@@ -520,10 +728,11 @@ mod tests {
 
     /// A scored sRGB trial builds finite, in-range geometry: one dot per
     /// sample (coloured in [0,1] sRGB), one error vector per scorable sample,
-    /// and a 12-edge gamut cage. White lands at L*≈100 on the up axis.
+    /// and a 12-edge gamut cage. In the relative-Lab view white lands at
+    /// L*≈100 on the up axis.
     #[test]
     fn builds_finite_geometry() {
-        let white_xyz = ColorSpace::SRGB.white_xyz();
+        let white_xyz = scaled_white(200.0);
         let trial = AnalyzedTrial {
             pixel_format: "xrgb8888".into(),
             ground_truth: GroundTruth::Known {
@@ -533,10 +742,17 @@ mod tests {
                 source: GroundTruthSource::Negotiated,
             },
             samples: vec![
-                sample([0.95, 1.0, 1.09], [100.0, 0.0, 0.0], [100.0, 0.0, 0.0], 0.0),
                 sample(
-                    [0.4, 0.2, 0.02],
+                    white_xyz,
+                    [100.0, 0.0, 0.0],
+                    white_xyz,
+                    [100.0, 0.0, 0.0],
+                    0.0,
+                ),
+                sample(
+                    [80.0, 40.0, 4.0],
                     [51.0, 60.0, 40.0],
+                    [88.0, 52.0, 6.0],
                     [54.0, 80.0, 67.0],
                     25.0,
                 ),
@@ -545,11 +761,19 @@ mod tests {
             reference_white_xyz: Some(white_xyz),
         };
 
-        let scene = Space3dScene::build(&trial, 3, [false; N_REF_GAMUTS], None, false);
+        let scene = Space3dScene::build(
+            &trial,
+            3,
+            Space3dView::LabRelative,
+            [false; N_REF_GAMUTS],
+            None,
+            false,
+        );
         assert_eq!(scene.trial, 3);
-        assert!(scene.matches(3, [false; N_REF_GAMUTS], false));
-        assert!(!scene.matches(3, [true, false, false], false));
-        assert!(!scene.matches(3, [false; N_REF_GAMUTS], true));
+        assert!(scene.matches(3, Space3dView::LabRelative, [false; N_REF_GAMUTS], false));
+        assert!(!scene.matches(3, Space3dView::XyYNits, [false; N_REF_GAMUTS], false));
+        assert!(!scene.matches(3, Space3dView::LabRelative, [true, false, false], false));
+        assert!(!scene.matches(3, Space3dView::LabRelative, [false; N_REF_GAMUTS], true));
         assert!(scene.has_data);
 
         let (pts, _) = scene.points.snapshot();
@@ -582,11 +806,66 @@ mod tests {
         assert_eq!(scene.gamut_labels.get(0), Some("sRGB · target"));
     }
 
+    /// Every projection produces finite geometry, and the key contrast holds:
+    /// the relative-Lab view pins the trial's reference white at L*=100 whatever
+    /// its absolute brightness, while the absolute views move it with luminance.
+    /// That is exactly what "absolute nits" buys for an sRGB-vs-BT.2020 read.
+    #[test]
+    fn projections_finite_and_absolute_views_track_luminance() {
+        // World height of a trial whose (single) sample *is* the reference white.
+        let ref_white_height = |view: Space3dView, nits: f64| -> f32 {
+            let w = scaled_white(nits);
+            let trial = AnalyzedTrial {
+                pixel_format: "x".into(),
+                ground_truth: GroundTruth::Known {
+                    space: ColorSpace::BT2020,
+                    transfer: "st2084_pq".into(),
+                    absolute: true,
+                    source: GroundTruthSource::Negotiated,
+                },
+                samples: vec![sample(w, [100.0, 0.0, 0.0], w, [100.0, 0.0, 0.0], 0.0)],
+                summary: None,
+                reference_white_xyz: Some(w),
+            };
+            let scene = Space3dScene::build(&trial, 0, view, [false; N_REF_GAMUTS], None, false);
+            let (pts, _) = scene.points.snapshot();
+            assert_eq!(pts.points.len(), 1);
+            let y = pts.points[0].position.y;
+            assert!(y.is_finite(), "{view:?} produced a non-finite height");
+            y
+        };
+
+        for view in [
+            Space3dView::LabRelative,
+            Space3dView::LabAbsolute,
+            Space3dView::XyYNits,
+            Space3dView::ICtCp,
+        ] {
+            let dim = ref_white_height(view, 200.0);
+            let bright = ref_white_height(view, 1000.0);
+            match view {
+                // Relative: the reference white is L*=100 (world y=100) either way.
+                Space3dView::LabRelative => {
+                    assert!((dim - 100.0).abs() < 1e-3, "relative white ≠ 100: {dim}");
+                    assert!(
+                        (bright - 100.0).abs() < 1e-3,
+                        "relative white ≠ 100: {bright}"
+                    );
+                }
+                // Absolute: a brighter white sits visibly higher.
+                _ => assert!(
+                    bright > dim + 1.0,
+                    "{view:?} should lift a brighter white, dim={dim} bright={bright}"
+                ),
+            }
+        }
+    }
+
     /// Enabling a non-target reference adds a second cage + label; enabling the
     /// reference that *is* the target is deduplicated (no second cage).
     #[test]
     fn reference_overlays_add_and_dedup_cages() {
-        let white_xyz = ColorSpace::SRGB.white_xyz();
+        let white_xyz = scaled_white(200.0);
         let trial = AnalyzedTrial {
             pixel_format: "xrgb8888".into(),
             ground_truth: GroundTruth::Known {
@@ -596,8 +875,9 @@ mod tests {
                 source: GroundTruthSource::Negotiated,
             },
             samples: vec![sample(
-                [0.4, 0.2, 0.02],
+                [80.0, 40.0, 4.0],
                 [51.0, 60.0, 40.0],
+                [88.0, 52.0, 6.0],
                 [54.0, 80.0, 67.0],
                 25.0,
             )],
@@ -606,7 +886,14 @@ mod tests {
         };
 
         // Display P3 overlay on (index 1): target + P3 = two cages, two labels.
-        let p3 = Space3dScene::build(&trial, 0, [false, true, false], None, false);
+        let p3 = Space3dScene::build(
+            &trial,
+            0,
+            Space3dView::LabRelative,
+            [false, true, false],
+            None,
+            false,
+        );
         assert_eq!(
             p3.gamut.snapshot().0.segments.len(),
             2 * 12 * GAMUT_SEGMENTS
@@ -614,7 +901,14 @@ mod tests {
         assert_eq!(p3.gamut_label_geo.snapshot().0.points.len(), 2);
 
         // sRGB overlay on (index 0) == target: deduped to one cage.
-        let srgb = Space3dScene::build(&trial, 0, [true, false, false], None, false);
+        let srgb = Space3dScene::build(
+            &trial,
+            0,
+            Space3dView::LabRelative,
+            [true, false, false],
+            None,
+            false,
+        );
         assert_eq!(srgb.gamut.snapshot().0.segments.len(), 12 * GAMUT_SEGMENTS);
         assert_eq!(srgb.gamut_label_geo.snapshot().0.points.len(), 1);
     }
@@ -624,7 +918,7 @@ mod tests {
     #[test]
     fn measured_shell_overlay_adds_when_enabled() {
         use tristim_capture::{GamutPatch, GamutVertex, MeasuredGamut};
-        let white_xyz = ColorSpace::SRGB.white_xyz();
+        let white_xyz = scaled_white(200.0);
         let trial = AnalyzedTrial {
             pixel_format: "xrgb8888".into(),
             ground_truth: GroundTruth::Known {
@@ -634,8 +928,9 @@ mod tests {
                 source: GroundTruthSource::Negotiated,
             },
             samples: vec![sample(
-                [0.95, 1.0, 1.09],
+                white_xyz,
                 [100.0, 0.0, 0.0],
+                white_xyz,
                 [100.0, 0.0, 0.0],
                 0.0,
             )],
@@ -664,12 +959,26 @@ mod tests {
         };
 
         // Off: the gamut is present but not drawn — target cage + its one label.
-        let off = Space3dScene::build(&trial, 0, [false; N_REF_GAMUTS], Some(&gamut), false);
+        let off = Space3dScene::build(
+            &trial,
+            0,
+            Space3dView::LabRelative,
+            [false; N_REF_GAMUTS],
+            Some(&gamut),
+            false,
+        );
         let off_segs = off.gamut.snapshot().0.segments.len();
         assert_eq!(off.gamut_label_geo.snapshot().0.points.len(), 1);
 
         // On: +4 patch-edge segments and a "measured" label anchor.
-        let on = Space3dScene::build(&trial, 0, [false; N_REF_GAMUTS], Some(&gamut), true);
+        let on = Space3dScene::build(
+            &trial,
+            0,
+            Space3dView::LabRelative,
+            [false; N_REF_GAMUTS],
+            Some(&gamut),
+            true,
+        );
         let (segs, _) = on.gamut.snapshot();
         assert_eq!(segs.segments.len(), off_segs + 4);
         assert_eq!(on.gamut_label_geo.snapshot().0.points.len(), 2);
@@ -678,8 +987,8 @@ mod tests {
         assert!(segs.segments.iter().any(|s| s.color == MEASURED_FOLD_COLOR));
     }
 
-    /// An unscored trial (no reference white / no Lab) yields an empty scene
-    /// that the chart renders as a placeholder rather than panicking.
+    /// An unscored trial (no reference white) yields an empty scene that the
+    /// chart renders as a placeholder rather than panicking.
     #[test]
     fn unscored_trial_is_empty() {
         let trial = AnalyzedTrial {
@@ -702,11 +1011,24 @@ mod tests {
             summary: None,
             reference_white_xyz: None,
         };
-        let scene = Space3dScene::build(&trial, 0, [true, true, true], None, false);
+        let scene = Space3dScene::build(
+            &trial,
+            0,
+            Space3dView::LabRelative,
+            [true, true, true],
+            None,
+            false,
+        );
         assert!(!scene.has_data);
         assert_eq!(scene.points.snapshot().0.points.len(), 0);
-        // No reference white ⇒ no Lab frame ⇒ no cages even with overlays on.
+        // No reference white ⇒ no frame ⇒ no cages even with overlays on.
         assert_eq!(scene.gamut.snapshot().0.segments.len(), 0);
         assert_eq!(scene.gamut_label_geo.snapshot().0.points.len(), 0);
+    }
+
+    /// D65 white at an absolute luminance, as the analyzer's measured-white XYZ.
+    fn scaled_white(nits: f64) -> [f64; 3] {
+        let w = chromaticity_to_xyz(white::D65);
+        [w[0] * nits, nits, w[2] * nits]
     }
 }

@@ -17,6 +17,7 @@ use damascene_core::prelude::*;
 use tristim_gui::PresenterApp;
 use tristim_gui::app::Tab;
 use tristim_gui::plot::Space;
+use tristim_gui::space3d::Space3dView;
 
 /// Window sizes to lay out under (default + a large display), so responsive
 /// plot sizing is exercised and lint-checked at both.
@@ -150,18 +151,29 @@ fn main() -> ExitCode {
             }
         }
 
-        // The 3D sample space. The scene itself can't rasterize headlessly
-        // (the SVG/bundle path degrades 3D to a placeholder), but this still
-        // exercises `Space3dScene::build` on real samples and lints the tab +
-        // legend layout. `set_view` rebuilds the cached scene for the focus.
-        for i in 0..count {
-            app.select(i);
-            app.set_view(Tab::Space3D);
-            match render(&app, &format!("space3d-trial{i}-{}w", vw as u32)) {
-                Ok(n) => total_findings += n,
-                Err(e) => {
-                    eprintln!("dump: {e}");
-                    return ExitCode::FAILURE;
+        // The 3D sample space, in each projection. The scene itself can't
+        // rasterize headlessly (the SVG/bundle path degrades 3D to a
+        // placeholder), but this still exercises `Space3dScene::build` on real
+        // samples and lints the tab + (busy) projection-selector + per-view
+        // legend layout. `set_view` / `set_space3d_view` rebuild the cached
+        // scene for the focus.
+        app.set_view(Tab::Space3D);
+        for (view, tag) in [
+            (Space3dView::LabRelative, "lab"),
+            (Space3dView::LabAbsolute, "lababs"),
+            (Space3dView::XyYNits, "xyy"),
+            (Space3dView::ICtCp, "ictcp"),
+        ] {
+            app.set_space3d_view(view);
+            for i in 0..count {
+                app.select(i);
+                app.set_space3d_view(view); // rebuild for the newly focused trial
+                match render(&app, &format!("space3d-{tag}-trial{i}-{}w", vw as u32)) {
+                    Ok(n) => total_findings += n,
+                    Err(e) => {
+                        eprintln!("dump: {e}");
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
         }

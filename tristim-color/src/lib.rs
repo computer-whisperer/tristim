@@ -8,11 +8,14 @@
 //! - [`transfer`] — encode/decode transfer functions (sRGB, pure gamma, BT.1886,
 //!   PQ). PQ decodes to absolute cd/m²; the others to relative `0..=1` linear.
 //! - [`metrics`] — CIE 1976 u'v', ΔE\*ab, McCamy CCT, xy-plane gamut area.
+//! - [`ictcp`] — ITU-R BT.2100 ICtCp, an absolute-luminance perceptual space
+//!   for SDR-vs-HDR / sRGB-vs-BT.2020 comparison.
 //!
 //! Names match the strings recorded in `tristim-capture` color descriptions
 //! (e.g. `"srgb"`, `"st2084_pq"`, `"bt2020"`) so the presenter can look a
 //! space / transfer function up directly from a capture.
 
+pub mod ictcp;
 pub mod metrics;
 pub mod transfer;
 
