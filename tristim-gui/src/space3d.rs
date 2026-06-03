@@ -379,7 +379,10 @@ impl Space3dScene {
                         position: view.world(green.xyz, white_xyz),
                         color: MEASURED_CAGE_COLOR,
                     });
-                    anchor_txt.push("measured".to_string());
+                    // The shell is the *actual* reproduction, not scaled — its
+                    // peak is the brightest probed vertex (what the display hit).
+                    let peak = g.vertices.iter().map(|v| v.xyz[1]).fold(0.0, f64::max);
+                    anchor_txt.push(format!("measured · {}", nits_label(peak)));
                 }
             }
         }
@@ -490,7 +493,7 @@ pub fn space_legend(view: Space3dView) -> El {
             legend_row("lines", "expected → measured (length = ΔE*ab in Lab)"),
             legend_row(
                 "cages",
-                "gamut bounds — the trial's space (· target) plus any reference gamuts enabled above",
+                "gamut bounds — the trial's space (· target) plus any reference gamuts enabled above; each labelled with its peak white luminance (cd/m²)",
             ),
             legend_row(
                 "measured",
@@ -615,7 +618,16 @@ fn add_cage(
         position: cage_corner(view, &m, cage_white_y, trial_white, [0.0, 1.0, 0.0]),
         color,
     });
-    anchor_txt.push(name);
+    // Tag the cage with its peak (white-corner) luminance — the value it was
+    // scaled to. In the relative-Lab view every cage carries the same trial
+    // white, signalling the normalisation; in the absolute views each reference
+    // shows its own spec white, so a brighter gamut reads as brighter.
+    anchor_txt.push(format!("{name} · {}", nits_label(cage_white_y)));
+}
+
+/// A cage's peak luminance as a compact label suffix (e.g. `203 cd/m²`).
+fn nits_label(nits: f64) -> String {
+    format!("{} cd/m²", nits.round() as i64)
 }
 
 /// The measured gamut shell: each refined leaf patch drawn as a quad outline,
@@ -803,7 +815,8 @@ mod tests {
             assert!(s.start.is_finite() && s.end.is_finite());
         }
         assert_eq!(scene.gamut_label_geo.snapshot().0.points.len(), 1);
-        assert_eq!(scene.gamut_labels.get(0), Some("sRGB · target"));
+        // The target cage is labelled with its peak (measured-white) luminance.
+        assert_eq!(scene.gamut_labels.get(0), Some("sRGB · target · 200 cd/m²"));
     }
 
     /// Every projection produces finite geometry, and the key contrast holds:
@@ -913,6 +926,46 @@ mod tests {
         assert_eq!(srgb.gamut_label_geo.snapshot().0.points.len(), 1);
     }
 
+    /// Cage labels carry the peak white luminance they were scaled to, which is
+    /// exactly what makes "scaled or not" obvious: the relative view normalises
+    /// every cage to the trial white (so the reference shows the *same* nits as
+    /// the target), while an absolute view shows each reference's spec white.
+    #[test]
+    fn cage_labels_show_peak_nits() {
+        let white_xyz = scaled_white(250.0);
+        let trial = AnalyzedTrial {
+            pixel_format: "x".into(),
+            ground_truth: GroundTruth::Known {
+                space: ColorSpace::SRGB, // target = sRGB
+                transfer: "srgb".into(),
+                absolute: false,
+                source: GroundTruthSource::Negotiated,
+            },
+            samples: vec![sample(
+                white_xyz,
+                [100.0, 0.0, 0.0],
+                white_xyz,
+                [100.0, 0.0, 0.0],
+                0.0,
+            )],
+            summary: None,
+            reference_white_xyz: Some(white_xyz),
+        };
+        // Rec.2020 overlay on (REF_GAMUTS index 2, spec white 10000 cd/m²).
+        let refs = [false, false, true];
+
+        // Relative: both cages report the trial white (250) — normalised.
+        let rel = Space3dScene::build(&trial, 0, Space3dView::LabRelative, refs, None, false);
+        assert_eq!(rel.gamut_labels.get(0), Some("sRGB · target · 250 cd/m²"));
+        assert_eq!(rel.gamut_labels.get(1), Some("Rec.2020 · 250 cd/m²"));
+
+        // Absolute: the reference rises to its spec peak; the target stays at the
+        // trial's real measured white.
+        let abs = Space3dScene::build(&trial, 0, Space3dView::XyYNits, refs, None, false);
+        assert_eq!(abs.gamut_labels.get(0), Some("sRGB · target · 250 cd/m²"));
+        assert_eq!(abs.gamut_labels.get(1), Some("Rec.2020 · 10000 cd/m²"));
+    }
+
     /// The measured-shell overlay adds patch-outline segments + a "measured"
     /// label only when enabled, and flags folded patches in the hot colour.
     #[test]
@@ -982,7 +1035,8 @@ mod tests {
         let (segs, _) = on.gamut.snapshot();
         assert_eq!(segs.segments.len(), off_segs + 4);
         assert_eq!(on.gamut_label_geo.snapshot().0.points.len(), 2);
-        assert_eq!(on.gamut_labels.get(1), Some("measured"));
+        // The shell is labelled with its brightest probed vertex (green, Y=70).
+        assert_eq!(on.gamut_labels.get(1), Some("measured · 70 cd/m²"));
         // The folded patch is drawn in the hot fold colour.
         assert!(segs.segments.iter().any(|s| s.color == MEASURED_FOLD_COLOR));
     }
