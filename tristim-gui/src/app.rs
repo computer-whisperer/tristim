@@ -150,9 +150,25 @@ struct Running {
     device: Option<String>,
     countdown: Option<u64>,
     total_formats: usize,
-    per_format: usize,
-    measured: usize,
-    target: usize,
+    /// Known sweep measurements per format: the deterministic sequence plus
+    /// the per-format scatter count.
+    sweep_per_format: usize,
+    /// Whether each format runs a gamut probe before its sweep.
+    probe_gamut: bool,
+    /// Expected probe vertices per format. Starts at the setup preview's
+    /// heuristic and is replaced by the latest actual once a probe completes
+    /// (the adaptive probe's count isn't known up front).
+    probe_est: usize,
+    /// Measurements in finished formats — actuals, from `FormatDone`.
+    done_measured: usize,
+    /// Formats that have finished (`FormatDone` seen).
+    formats_done: usize,
+    /// Probe vertices measured so far in the current format.
+    cur_probe: usize,
+    /// Whether the current format's probe finished (`GamutProbed` seen).
+    cur_probe_done: bool,
+    /// Sweep samples measured so far in the current format.
+    cur_sweep: usize,
     cancelling: bool,
     /// Completed format trials.
     trials: Vec<cap::FormatTrial>,
@@ -163,6 +179,39 @@ struct Running {
 }
 
 impl Running {
+    /// Measurements taken so far: finished formats' actuals plus the
+    /// in-flight format's probe vertices and sweep samples.
+    fn measured(&self) -> usize {
+        self.done_measured + self.cur_probe + self.cur_sweep
+    }
+
+    /// Expected measurements for a format that hasn't started yet.
+    fn per_format_est(&self) -> usize {
+        self.sweep_per_format + if self.probe_gamut { self.probe_est } else { 0 }
+    }
+
+    /// Expected total, refined as the run goes: finished formats count their
+    /// actuals, the in-flight format counts what's observed (floored at the
+    /// estimate while its probe is still running), and pending formats count
+    /// the estimate. The gamut probe's point count is adaptive, so until the
+    /// last probe completes this is an estimate that tracks the probe work
+    /// instead of ignoring it.
+    fn target(&self) -> usize {
+        let pending = self.total_formats.saturating_sub(self.formats_done);
+        if pending == 0 {
+            return self.done_measured;
+        }
+        let probe_part = if !self.probe_gamut {
+            0
+        } else if self.cur_probe_done {
+            self.cur_probe
+        } else {
+            self.cur_probe.max(self.probe_est)
+        };
+        let inflight = probe_part + self.cur_sweep.max(self.sweep_per_format);
+        self.done_measured + inflight + (pending - 1) * self.per_format_est()
+    }
+
     /// Fold a progress event into the live state.
     fn apply(&mut self, ev: GatherEvent) {
         match ev {
@@ -181,6 +230,12 @@ impl Running {
                 if let Some(done) = self.cur.take() {
                     self.trials.push(done.to_trial());
                 }
+                // Per-format counters reset at `FormatDone`; reset here too in
+                // case a format ends without one (defensive, like the fold
+                // above).
+                self.cur_probe = 0;
+                self.cur_probe_done = false;
+                self.cur_sweep = 0;
                 self.cur = Some(LiveTrial {
                     index,
                     token,
@@ -201,27 +256,38 @@ impl Running {
                 if let Some(c) = &mut self.cur {
                     c.samples.push(sample);
                 }
-                self.measured += 1;
+                self.cur_sweep += 1;
                 self.rebuild_live();
             }
             // Gamut-probe vertices: fold into the in-progress trial so they
-            // plot live, but don't count them toward the sweep progress (the
-            // probe runs before the sweep and has its own, unknown, count).
+            // plot live, and count them as probe progress (see `target` for
+            // how the probe's open-ended count is estimated).
             GatherEvent::ProbeSample { sample, .. } => {
                 if let Some(c) = &mut self.cur {
                     c.samples.push(sample);
                 }
+                self.cur_probe += 1;
                 self.rebuild_live();
             }
-            GatherEvent::FormatDone { .. } => {
+            GatherEvent::FormatDone { samples, .. } => {
                 if let Some(done) = self.cur.take() {
                     self.trials.push(done.to_trial());
                 }
+                // Fold the format's actuals (probe + sweep, the event counts
+                // both) into the finished tally and reset the live counters.
+                self.done_measured += samples;
+                self.formats_done += 1;
+                self.cur_probe = 0;
+                self.cur_probe_done = false;
+                self.cur_sweep = 0;
                 self.rebuild_live();
             }
             // The per-vertex `ProbeSample` events already populate the plots;
-            // the summary event needs no separate live handling.
-            GatherEvent::GamutProbed { .. } => {}
+            // the summary refines the probe estimate for the formats to come.
+            GatherEvent::GamutProbed { vertices, .. } => {
+                self.cur_probe_done = true;
+                self.probe_est = vertices;
+            }
         }
     }
 
@@ -372,9 +438,14 @@ impl PresenterApp {
             device: Some("Spyder 2024 · SN 87000216".to_string()),
             countdown: None,
             total_formats: capture.trials.len().max(1),
-            per_format: capture.trials.first().map_or(0, |t| t.samples.len()),
-            measured: total,
-            target: total.max(1),
+            sweep_per_format: capture.trials.first().map_or(0, |t| t.samples.len()),
+            probe_gamut: false,
+            probe_est: 0,
+            done_measured: total,
+            formats_done: capture.trials.len().max(1),
+            cur_probe: 0,
+            cur_probe_done: false,
+            cur_sweep: 0,
             cancelling: false,
             trials: capture.trials.clone(),
             cur: None,
@@ -491,7 +562,8 @@ impl PresenterApp {
     /// flows back over a channel drained in [`Self::before_build`].
     fn launch(&mut self, cfg: CaptureConfig) {
         let total_formats = cfg.formats.len();
-        let per_format = cfg.sequence.len();
+        let sweep_per_format = cfg.sequence.len() + cfg.scatter.as_ref().map_or(0, |s| s.count);
+        let probe_gamut = cfg.gamut.is_some();
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_thread = Arc::clone(&cancel);
@@ -517,9 +589,14 @@ impl PresenterApp {
             device: None,
             countdown: None,
             total_formats,
-            per_format,
-            measured: 0,
-            target: total_formats * per_format,
+            sweep_per_format,
+            probe_gamut,
+            probe_est: crate::setup::GAMUT_PROBE_EST_POINTS,
+            done_measured: 0,
+            formats_done: 0,
+            cur_probe: 0,
+            cur_probe_done: false,
+            cur_sweep: 0,
             cancelling: false,
             trials: Vec::new(),
             cur: None,
@@ -920,10 +997,11 @@ impl PresenterApp {
     /// Compact one-line progress: status/countdown on the left, a progress bar
     /// + measured count + Cancel on the right.
     fn progress_strip(&self, r: &Running) -> El {
-        let frac = if r.target == 0 {
+        let (measured, target) = (r.measured(), r.target());
+        let frac = if target == 0 {
             0.0
         } else {
-            (r.measured as f32 / r.target as f32).clamp(0.0, 1.0)
+            (measured as f32 / target as f32).clamp(0.0, 1.0)
         };
         let title = if r.cancelling {
             "Cancelling…"
@@ -933,14 +1011,21 @@ impl PresenterApp {
         let detail = if let Some(c) = r.countdown {
             format!("place the puck against the output — starting in {c}s")
         } else if let Some(cur) = &r.cur {
+            // The probe runs before the sweep; while it's in flight the patch
+            // counter would lie (the probe's total isn't known), so name the
+            // phase instead.
+            let phase = if r.probe_gamut && !r.cur_probe_done && r.cur_sweep == 0 {
+                format!("gamut probe · {} points", r.cur_probe)
+            } else {
+                format!("patch {}/{}", r.cur_sweep, r.sweep_per_format)
+            };
             format!(
-                "{} · {} ({}/{}) · patch {}/{}",
+                "{} · {} ({}/{}) · {}",
                 r.device.as_deref().unwrap_or("measuring"),
                 cur.token,
                 cur.index + 1,
                 r.total_formats,
-                cur.samples.len(),
-                r.per_format,
+                phase,
             )
         } else {
             r.device
@@ -959,9 +1044,15 @@ impl PresenterApp {
                 progress(frac, tokens::PRIMARY)
                     .width(Size::Fixed(220.0))
                     .height(Size::Fixed(8.0)),
-                mono(format!("{}/{} measurements", r.measured, r.target))
-                    .muted()
-                    .font_size(11.0),
+                // Probing makes the target an estimate until the last format's
+                // probe has run; flag it so the count doesn't overpromise.
+                mono(if r.probe_gamut && r.formats_done < r.total_formats {
+                    format!("{measured}/~{target} measurements")
+                } else {
+                    format!("{measured}/{target} measurements")
+                })
+                .muted()
+                .font_size(11.0),
             ])
             .gap(4.0)
             .align(Align::End),
@@ -1679,9 +1770,14 @@ mod tests {
             device: None,
             countdown: None,
             total_formats: 1,
-            per_format: 3,
-            measured: 0,
-            target: 3,
+            sweep_per_format: 3,
+            probe_gamut: false,
+            probe_est: 0,
+            done_measured: 0,
+            formats_done: 0,
+            cur_probe: 0,
+            cur_probe_done: false,
+            cur_sweep: 0,
             cancelling: false,
             trials: Vec::new(),
             cur: None,
@@ -1727,7 +1823,8 @@ mod tests {
         assert_eq!(live.analyzed.trials.len(), 1);
         assert_eq!(live.capture.trials[0].samples.len(), 3);
         assert_eq!(live.selected, 0);
-        assert_eq!(r.measured, 3);
+        assert_eq!(r.measured(), 3);
+        assert_eq!(r.target(), 3);
 
         // Closing the format keeps it presentable (cur folds into trials).
         r.apply(GatherEvent::FormatDone {
@@ -1737,13 +1834,19 @@ mod tests {
         assert!(r.cur.is_none());
         assert_eq!(r.trials.len(), 1);
         assert_eq!(r.live.as_ref().unwrap().analyzed.trials.len(), 1);
+        // All formats done: the target is exactly what was measured.
+        assert_eq!(r.measured(), 3);
+        assert_eq!(r.target(), 3);
     }
 
-    /// Gamut-probe samples plot live (land in the trial) but don't advance the
-    /// sweep progress counter.
+    /// Gamut-probe samples plot live (land in the trial) and advance the
+    /// progress counter against an estimated probe target that reconciles to
+    /// the actual once the probe finishes.
     #[test]
-    fn probe_samples_plot_but_dont_count_as_sweep_progress() {
+    fn probe_samples_count_against_estimated_target() {
         let mut r = empty_running();
+        r.probe_gamut = true;
+        r.probe_est = 5;
         r.apply(GatherEvent::FormatStart {
             index: 0,
             total: 1,
@@ -1751,24 +1854,90 @@ mod tests {
             pixel_format: "xrgb8888".into(),
             requested: None,
         });
+        // Estimated probe (5) + known sweep (3).
+        assert_eq!(r.target(), 8);
+
         let mut probe = sample(80.0);
         probe.source = cap::SampleSource::GamutProbe;
         probe.repeats = 8;
-        r.apply(GatherEvent::ProbeSample {
-            format_index: 0,
-            sample: probe,
+        for _ in 0..2 {
+            r.apply(GatherEvent::ProbeSample {
+                format_index: 0,
+                sample: probe.clone(),
+            });
+        }
+        // Probe vertices advance the counter; the target holds its estimate.
+        assert_eq!(r.measured(), 2);
+        assert_eq!(r.target(), 8);
+        // Both probe vertices are in the plot data.
+        let live = r.live.as_ref().expect("live snapshot present");
+        assert_eq!(live.capture.trials[0].samples.len(), 2);
+
+        // The probe converges early (2 vertices): the target reconciles.
+        r.apply(GatherEvent::GamutProbed {
+            index: 0,
+            vertices: 2,
+            folds: 0,
         });
+        assert_eq!(r.target(), 5);
+
         r.apply(GatherEvent::Sample {
             format_index: 0,
             index: 0,
             total: 3,
             sample: sample(50.0),
         });
+        assert_eq!(r.measured(), 3);
+        assert_eq!(r.target(), 5);
+    }
 
-        let live = r.live.as_ref().expect("live snapshot present");
-        // Both the probe vertex and the sweep sample are in the plot data.
-        assert_eq!(live.capture.trials[0].samples.len(), 2);
-        // But only the sweep sample advanced the progress counter.
-        assert_eq!(r.measured, 1);
+    /// A finished probe's actual vertex count becomes the estimate for the
+    /// formats still pending, and an in-flight probe that overshoots the
+    /// estimate grows the target rather than overflowing it.
+    #[test]
+    fn probe_actuals_refine_pending_estimates() {
+        let mut r = empty_running();
+        r.total_formats = 2;
+        r.probe_gamut = true;
+        r.probe_est = 5;
+        // Two formats, each estimated probe (5) + sweep (3).
+        assert_eq!(r.target(), 16);
+
+        r.apply(GatherEvent::FormatStart {
+            index: 0,
+            total: 2,
+            token: "srgb".into(),
+            pixel_format: "xrgb8888".into(),
+            requested: None,
+        });
+        let mut probe = sample(80.0);
+        probe.source = cap::SampleSource::GamutProbe;
+        for _ in 0..9 {
+            r.apply(GatherEvent::ProbeSample {
+                format_index: 0,
+                sample: probe.clone(),
+            });
+        }
+        // 9 observed > 5 estimated: the in-flight format grows the target
+        // (9 + 3) while the pending one keeps the old estimate (5 + 3).
+        assert_eq!(r.measured(), 9);
+        assert_eq!(r.target(), 20);
+
+        r.apply(GatherEvent::GamutProbed {
+            index: 0,
+            vertices: 9,
+            folds: 0,
+        });
+        // The actual (9) is now the pending format's estimate too.
+        assert_eq!(r.target(), (9 + 3) + (9 + 3));
+
+        r.apply(GatherEvent::FormatDone {
+            index: 0,
+            samples: 9, // probe vertices only; the sweep was cancelled
+        });
+        // The finished format contributes its actuals (9, no sweep), the
+        // pending one the refined estimate.
+        assert_eq!(r.measured(), 9);
+        assert_eq!(r.target(), 9 + (9 + 3));
     }
 }

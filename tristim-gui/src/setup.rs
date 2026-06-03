@@ -13,6 +13,18 @@ use damascene_core::prelude::*;
 use tristim_display::{self as display, list_outputs};
 use tristim_gather::{self as gather, CaptureConfig, KNOWN_FORMATS};
 
+/// Rough adaptive gamut-probe point count per format. The probe's real count
+/// isn't known up front (it subdivides where the gamut surface curves), so this
+/// seeds both the setup preview's time estimate and the live progress target
+/// until the first probe reports its actual.
+pub(crate) const GAMUT_PROBE_EST_POINTS: usize = 25;
+
+/// Fast-tier integration for the gamut probe's adaptive measurements, in ms.
+/// Bright probe points read ~3× faster at 200 ms and escalate to the
+/// calibration default only when the fast read isn't trustworthy; a device
+/// without an exposure knob falls back to single full-integration bursts.
+const GAMUT_FAST_INTEGRATION_MS: u16 = 200;
+
 /// What a routed form event asks the app to do.
 pub enum FormAction {
     /// Nothing beyond the in-form state change already applied.
@@ -307,7 +319,7 @@ impl CaptureForm {
 
         let gamut = self.probe_gamut.then(|| gather::GamutProbeOpts {
             repeats: self.gamut_repeats,
-            fast_integration_ms: None,
+            fast_integration_ms: Some(GAMUT_FAST_INTEGRATION_MS),
             refine: gather::RefineParams {
                 max_depth: self.gamut_max_depth,
                 ..Default::default()
@@ -351,9 +363,11 @@ impl CaptureForm {
         // Per-patch cost ≈ settle + a fixed measurement overhead.
         let per = self.settle_ms as f64 / 1000.0 + 0.4;
         // Gamut probe: roughly ~25 adaptive points per format, each a burst of
-        // `repeats` reads (~0.7 s) after the settle.
+        // `repeats` fast-tier reads (~0.25 s at the 200 ms adaptive
+        // integration; the occasional dim point escalates) after the settle.
         let gamut_secs = if self.probe_gamut {
-            (fmts * 25) as f64 * (self.settle_ms as f64 / 1000.0 + self.gamut_repeats as f64 * 0.7)
+            (fmts * GAMUT_PROBE_EST_POINTS) as f64
+                * (self.settle_ms as f64 / 1000.0 + self.gamut_repeats as f64 * 0.25)
         } else {
             0.0
         };
