@@ -25,9 +25,7 @@ use crate::chart::{PresenterGamut, chromaticity_chart};
 use crate::luminance::{luminance_chart, luminance_units};
 use crate::plot::Space;
 use crate::setup::{CaptureForm, FormAction};
-use crate::space3d::{
-    N_REF_GAMUTS, REF_GAMUTS, RefSet, Space3dScene, Space3dView, space_chart, space_legend,
-};
+use crate::space3d::{REF_GAMUTS, RefCages, Space3dScene, Space3dView, space_chart, space_legend};
 
 /// Which plot the content panel shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +75,7 @@ impl Presented {
     /// Ensure the cached 3D scene matches the focused trial, enabled reference
     /// gamuts, and measured-shell toggle, rebuilding its handles only when any
     /// moved.
-    fn ensure_space3d(&mut self, view: Space3dView, refs: RefSet, show_measured: bool) {
+    fn ensure_space3d(&mut self, view: Space3dView, refs: RefCages, show_measured: bool) {
         if self.analyzed.trials.is_empty() {
             self.space3d = None;
             return;
@@ -309,8 +307,8 @@ pub struct PresenterApp {
     show_field: bool,
     /// Index of the sample currently hovered in the plot, if any.
     hovered_sample: Option<usize>,
-    /// Which reference-gamut overlays are enabled in the 3D view.
-    space3d_refs: RefSet,
+    /// Which reference-gamut cages are enabled in the 3D view (abs + rel sets).
+    space3d_refs: RefCages,
     /// Whether the measured-gamut shell overlay is enabled in the 3D view.
     space3d_show_measured: bool,
     /// Which colour space the 3D view projects samples into.
@@ -332,7 +330,7 @@ impl PresenterApp {
             space: Space::UvPrime,
             show_field: false,
             hovered_sample: None,
-            space3d_refs: [false; N_REF_GAMUTS],
+            space3d_refs: RefCages::default(),
             space3d_show_measured: false,
             space3d_view: Space3dView::default(),
         }
@@ -355,7 +353,7 @@ impl PresenterApp {
             space: Space::UvPrime,
             show_field: false,
             hovered_sample: None,
-            space3d_refs: [false; N_REF_GAMUTS],
+            space3d_refs: RefCages::default(),
             space3d_show_measured: false,
             space3d_view: Space3dView::default(),
         }
@@ -404,7 +402,7 @@ impl PresenterApp {
             space: Space::UvPrime,
             show_field: false,
             hovered_sample: None,
-            space3d_refs: [false; N_REF_GAMUTS],
+            space3d_refs: RefCages::default(),
             space3d_show_measured: false,
             space3d_view: Space3dView::default(),
         }
@@ -775,11 +773,12 @@ impl PresenterApp {
             Tab::Space3D => {
                 // Which colour space to project samples into.
                 controls.push(space3d_view_selector(self.space3d_view));
-                // Reference-gamut overlay toggles (the trial's own gamut is
-                // always drawn as the target).
-                for (gi, g) in REF_GAMUTS.iter().enumerate() {
-                    controls.push(ref_toggle(g.name, g.key, self.space3d_refs[gi]));
-                }
+                // Reference-gamut cages, in two groups: absolute (each at its
+                // gamut's spec white) and relative (scaled to this trial). The
+                // trial's own gamut is always drawn as the target. Same meaning
+                // in every projection.
+                controls.push(ref_group("abs", "abs", self.space3d_refs.abs));
+                controls.push(ref_group("rel", "rel", self.space3d_refs.rel));
                 // The measured-gamut shell, only when this trial was probed.
                 if p.capture.trials.get(i).is_some_and(|t| t.gamut.is_some()) {
                     controls.push(measured_toggle(self.space3d_show_measured));
@@ -824,9 +823,11 @@ impl PresenterApp {
         // The active view's controls, on their own row so they have the full
         // width to spread into (Luminance has none, so the row is skipped).
         if !controls.is_empty() {
+            // Tight inter-group gap: the 3D view packs a projection selector and
+            // two (abs/rel) gamut groups onto this row, which is snug at 1280px.
             rows.push(
                 row(controls)
-                    .gap(tokens::SPACE_2)
+                    .gap(tokens::SPACE_1)
                     .align(Align::Center)
                     .width(Size::Fill(1.0)),
             );
@@ -1001,12 +1002,16 @@ impl PresenterApp {
                         self.hovered_sample = None;
                     }
                 }
+                // `ref:<abs|rel>:<gamut-key>` — toggle one cage in one anchor set.
                 Some(k) if k.starts_with("ref:") => {
-                    if let Some(i) = REF_GAMUTS
-                        .iter()
-                        .position(|g| k == format!("ref:{}", g.key))
+                    if let Some((kind, gkey)) = k["ref:".len()..].split_once(':')
+                        && let Some(i) = REF_GAMUTS.iter().position(|g| g.key == gkey)
                     {
-                        self.space3d_refs[i] = !self.space3d_refs[i];
+                        match kind {
+                            "abs" => self.space3d_refs.abs[i] = !self.space3d_refs.abs[i],
+                            "rel" => self.space3d_refs.rel[i] = !self.space3d_refs.rel[i],
+                            _ => {}
+                        }
                     }
                 }
                 Some("new-capture") => {
@@ -1251,10 +1256,15 @@ fn space_toggle(space: Space) -> El {
     button(space.label()).key("space-toggle").secondary()
 }
 
-/// A reference-gamut overlay toggle for the 3D view; primary when enabled.
-fn ref_toggle(name: &str, key: &str, on: bool) -> El {
-    let b = button(name).key(format!("ref:{key}"));
-    if on { b.primary() } else { b.secondary() }
+/// One anchor group ("abs" / "rel") of reference-gamut cage toggles: a caption
+/// followed by a button per gamut, routed `ref:<kind>:<gamut-key>`.
+fn ref_group(caption: &str, kind: &str, set: [bool; crate::space3d::N_REF_GAMUTS]) -> El {
+    let mut items = vec![text(format!("{caption}:")).muted().font_size(12.0)];
+    for (gi, g) in REF_GAMUTS.iter().enumerate() {
+        let b = button(g.name).key(format!("ref:{kind}:{}", g.key));
+        items.push(if set[gi] { b.primary() } else { b.secondary() });
+    }
+    row(items).gap(tokens::SPACE_1).align(Align::Center)
 }
 
 /// Toggle for the measured-gamut shell overlay in the 3D view; primary when on.

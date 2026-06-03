@@ -27,10 +27,12 @@
 //! - **error vectors** (lines) — `expected → measured` per scorable sample.
 //! - **gamut cages** (lines) — the ideal RGB cube of a colour space, mapped
 //!   corner-by-corner and subdivided (cube edges curve). The trial's negotiated
-//!   space is always drawn (the *target*, anchored at the measured white); the
-//!   standard reference gamuts in [`REF_GAMUTS`] can be overlaid, each anchored
-//!   in the absolute views at its own reference white luminance so a wider /
-//!   brighter gamut visibly reaches further.
+//!   space is always drawn (the *target*, at the measured white). The standard
+//!   reference gamuts in [`REF_GAMUTS`] can be overlaid in two flavours
+//!   ([`RefCages`]), independent of the projection: *absolute* (each at its spec
+//!   reference white) and *relative* (scaled to this trial's white). Enabling
+//!   both of a gamut shows the absolute-vs-relative volume difference directly;
+//!   each cage's label carries the peak white luminance it was scaled to.
 //!
 //! Geometry handles are built once per trial + view + reference set and cached
 //! on the presenter (see [`Space3dScene`]); `build` clones them into a fresh
@@ -107,18 +109,6 @@ impl Space3dView {
                     (cp * ICTCP_CHROMA_SCALE) as f32,
                 )
             }
-        }
-    }
-
-    /// The white luminance (cd/m²) a *reference-overlay* cage is anchored at.
-    /// The relative-Lab view keeps every cage at the trial's measured white (so
-    /// they all normalise to L\*=100, the established behaviour); the absolute
-    /// views use the gamut's own reference white, so a brighter gamut reaches
-    /// higher.
-    fn ref_cage_white_y(self, trial_white_y: f64, ref_nits: f64) -> f64 {
-        match self {
-            Space3dView::LabRelative => trial_white_y,
-            _ => ref_nits,
         }
     }
 
@@ -246,8 +236,17 @@ pub const REF_GAMUTS: [RefGamut; N_REF_GAMUTS] = [
     },
 ];
 
-/// Which reference overlays are enabled, parallel to [`REF_GAMUTS`].
-pub type RefSet = [bool; N_REF_GAMUTS];
+/// Which reference-gamut cages are enabled, split by anchor kind — independent
+/// of the active projection, so a toggle means the same thing in every view.
+/// Both arrays are parallel to [`REF_GAMUTS`].
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct RefCages {
+    /// Absolute-anchored: each cage at its gamut's spec reference white
+    /// ([`RefGamut::ref_white_nits`]).
+    pub abs: [bool; N_REF_GAMUTS],
+    /// Relative-anchored: each cage scaled to the trial's measured white.
+    pub rel: [bool; N_REF_GAMUTS],
+}
 
 /// Cached scene geometry for one analyzed trial. Cheap to clone into a
 /// [`SceneSpec`] each frame (the handles are `Arc`s); rebuilt only when the
@@ -258,7 +257,7 @@ pub struct Space3dScene {
     /// The projection these handles were built for — part of the cache key.
     view: Space3dView,
     /// Reference overlays these handles were built for — part of the cache key.
-    refs: RefSet,
+    refs: RefCages,
     /// Measured samples, each at its projected position, coloured by measured colour.
     points: PointsHandle,
     /// Per-point hover labels (ΔE / lightness or nits), aligned with `points`.
@@ -284,7 +283,7 @@ impl Space3dScene {
         &self,
         trial: usize,
         view: Space3dView,
-        refs: RefSet,
+        refs: RefCages,
         show_measured: bool,
     ) -> bool {
         self.trial == trial
@@ -300,7 +299,7 @@ impl Space3dScene {
         trial: &AnalyzedTrial,
         idx: usize,
         view: Space3dView,
-        refs: RefSet,
+        refs: RefCages,
         measured: Option<&MeasuredGamut>,
         show_measured: bool,
     ) -> Self {
@@ -352,8 +351,30 @@ impl Space3dScene {
                     format!("{} · target", space_name(space)),
                 );
             }
-            for (on, g) in refs.iter().zip(REF_GAMUTS.iter()) {
-                // Skip a reference that coincides with the target (already drawn).
+            // Absolute-anchored references: each at its gamut's spec reference
+            // white. Drawn even when the gamut matches the target — at a
+            // different white it's a distinct (spec vs measured) volume, which
+            // is exactly the absolute-vs-relative comparison.
+            for (on, g) in refs.abs.iter().zip(REF_GAMUTS.iter()) {
+                if *on {
+                    add_cage(
+                        &mut cage,
+                        &mut anchor_pts,
+                        &mut anchor_txt,
+                        view,
+                        &g.space,
+                        g.ref_white_nits,
+                        white_xyz,
+                        g.color,
+                        g.name.to_string(),
+                    );
+                }
+            }
+            // Relative-anchored references: scaled to the trial's measured white.
+            // The target *is* its gamut at that white, so a relative cage of the
+            // target's gamut would duplicate it — skip. Dimmed so it reads as
+            // secondary to the absolute cage of the same hue.
+            for (on, g) in refs.rel.iter().zip(REF_GAMUTS.iter()) {
                 let dup = target.is_some_and(|t| t == g.space);
                 if *on && !dup {
                     add_cage(
@@ -362,9 +383,9 @@ impl Space3dScene {
                         &mut anchor_txt,
                         view,
                         &g.space,
-                        view.ref_cage_white_y(white_y, g.ref_white_nits),
+                        white_y,
                         white_xyz,
-                        g.color,
+                        rel_color(g.color),
                         g.name.to_string(),
                     );
                 }
@@ -493,7 +514,7 @@ pub fn space_legend(view: Space3dView) -> El {
             legend_row("lines", "expected → measured (length = ΔE*ab in Lab)"),
             legend_row(
                 "cages",
-                "gamut bounds — the trial's space (· target) plus any reference gamuts enabled above; each labelled with its peak white luminance (cd/m²)",
+                "gamut bounds — the trial's space (· target) plus reference gamuts (abs = spec white, rel = scaled to this trial), each labelled with its peak white luminance (cd/m²)",
             ),
             legend_row(
                 "measured",
@@ -628,6 +649,13 @@ fn add_cage(
 /// A cage's peak luminance as a compact label suffix (e.g. `203 cd/m²`).
 fn nits_label(nits: f64) -> String {
     format!("{} cd/m²", nits.round() as i64)
+}
+
+/// Dim a reference cage's colour for its *relative*-anchored variant, so the two
+/// same-hue cages (spec vs trial-white) read apart. The nits in each label is
+/// the definitive distinguisher; the alpha is just a visual hint.
+fn rel_color(c: [f32; 4]) -> [f32; 4] {
+    [c[0], c[1], c[2], c[3] * 0.6]
 }
 
 /// The measured gamut shell: each refined leaf patch drawn as a quad outline,
@@ -777,15 +805,19 @@ mod tests {
             &trial,
             3,
             Space3dView::LabRelative,
-            [false; N_REF_GAMUTS],
+            RefCages::default(),
             None,
             false,
         );
         assert_eq!(scene.trial, 3);
-        assert!(scene.matches(3, Space3dView::LabRelative, [false; N_REF_GAMUTS], false));
-        assert!(!scene.matches(3, Space3dView::XyYNits, [false; N_REF_GAMUTS], false));
-        assert!(!scene.matches(3, Space3dView::LabRelative, [true, false, false], false));
-        assert!(!scene.matches(3, Space3dView::LabRelative, [false; N_REF_GAMUTS], true));
+        let one_abs = RefCages {
+            abs: [true, false, false],
+            rel: [false; N_REF_GAMUTS],
+        };
+        assert!(scene.matches(3, Space3dView::LabRelative, RefCages::default(), false));
+        assert!(!scene.matches(3, Space3dView::XyYNits, RefCages::default(), false));
+        assert!(!scene.matches(3, Space3dView::LabRelative, one_abs, false));
+        assert!(!scene.matches(3, Space3dView::LabRelative, RefCages::default(), true));
         assert!(scene.has_data);
 
         let (pts, _) = scene.points.snapshot();
@@ -840,7 +872,7 @@ mod tests {
                 summary: None,
                 reference_white_xyz: Some(w),
             };
-            let scene = Space3dScene::build(&trial, 0, view, [false; N_REF_GAMUTS], None, false);
+            let scene = Space3dScene::build(&trial, 0, view, RefCages::default(), None, false);
             let (pts, _) = scene.points.snapshot();
             assert_eq!(pts.points.len(), 1);
             let y = pts.points[0].position.y;
@@ -874,69 +906,13 @@ mod tests {
         }
     }
 
-    /// Enabling a non-target reference adds a second cage + label; enabling the
-    /// reference that *is* the target is deduplicated (no second cage).
-    #[test]
-    fn reference_overlays_add_and_dedup_cages() {
-        let white_xyz = scaled_white(200.0);
-        let trial = AnalyzedTrial {
-            pixel_format: "xrgb8888".into(),
-            ground_truth: GroundTruth::Known {
-                space: ColorSpace::SRGB, // target = sRGB (REF_GAMUTS[0])
-                transfer: "srgb".into(),
-                absolute: false,
-                source: GroundTruthSource::Negotiated,
-            },
-            samples: vec![sample(
-                [80.0, 40.0, 4.0],
-                [51.0, 60.0, 40.0],
-                [88.0, 52.0, 6.0],
-                [54.0, 80.0, 67.0],
-                25.0,
-            )],
-            summary: None,
-            reference_white_xyz: Some(white_xyz),
-        };
-
-        // Display P3 overlay on (index 1): target + P3 = two cages, two labels.
-        let p3 = Space3dScene::build(
-            &trial,
-            0,
-            Space3dView::LabRelative,
-            [false, true, false],
-            None,
-            false,
-        );
-        assert_eq!(
-            p3.gamut.snapshot().0.segments.len(),
-            2 * 12 * GAMUT_SEGMENTS
-        );
-        assert_eq!(p3.gamut_label_geo.snapshot().0.points.len(), 2);
-
-        // sRGB overlay on (index 0) == target: deduped to one cage.
-        let srgb = Space3dScene::build(
-            &trial,
-            0,
-            Space3dView::LabRelative,
-            [true, false, false],
-            None,
-            false,
-        );
-        assert_eq!(srgb.gamut.snapshot().0.segments.len(), 12 * GAMUT_SEGMENTS);
-        assert_eq!(srgb.gamut_label_geo.snapshot().0.points.len(), 1);
-    }
-
-    /// Cage labels carry the peak white luminance they were scaled to, which is
-    /// exactly what makes "scaled or not" obvious: the relative view normalises
-    /// every cage to the trial white (so the reference shows the *same* nits as
-    /// the target), while an absolute view shows each reference's spec white.
-    #[test]
-    fn cage_labels_show_peak_nits() {
-        let white_xyz = scaled_white(250.0);
-        let trial = AnalyzedTrial {
+    /// An sRGB-target trial used to exercise the abs/rel cage sets.
+    fn srgb_target_trial(white_nits: f64) -> AnalyzedTrial {
+        let white_xyz = scaled_white(white_nits);
+        AnalyzedTrial {
             pixel_format: "x".into(),
             ground_truth: GroundTruth::Known {
-                space: ColorSpace::SRGB, // target = sRGB
+                space: ColorSpace::SRGB, // target = sRGB (REF_GAMUTS[0])
                 transfer: "srgb".into(),
                 absolute: false,
                 source: GroundTruthSource::Negotiated,
@@ -950,20 +926,102 @@ mod tests {
             )],
             summary: None,
             reference_white_xyz: Some(white_xyz),
+        }
+    }
+
+    /// An enabled reference adds a cage + label. The *relative* cage of the
+    /// target's own gamut is deduplicated (it would coincide with the target);
+    /// the *absolute* cage of that gamut is not — at its spec white it's a
+    /// distinct volume, which is the whole point.
+    #[test]
+    fn reference_overlays_add_and_dedup_cages() {
+        let trial = srgb_target_trial(200.0);
+        let segs = |s: &Space3dScene| s.gamut.snapshot().0.segments.len();
+        let labels = |s: &Space3dScene| s.gamut_label_geo.snapshot().0.points.len();
+
+        // Display P3 absolute (index 1): target + P3 = two cages, two labels.
+        let p3 = Space3dScene::build(
+            &trial,
+            0,
+            Space3dView::LabRelative,
+            RefCages {
+                abs: [false, true, false],
+                rel: [false; N_REF_GAMUTS],
+            },
+            None,
+            false,
+        );
+        assert_eq!(segs(&p3), 2 * 12 * GAMUT_SEGMENTS);
+        assert_eq!(labels(&p3), 2);
+
+        // sRGB *relative* == the target: deduped to one cage.
+        let srgb_rel = Space3dScene::build(
+            &trial,
+            0,
+            Space3dView::LabRelative,
+            RefCages {
+                abs: [false; N_REF_GAMUTS],
+                rel: [true, false, false],
+            },
+            None,
+            false,
+        );
+        assert_eq!(segs(&srgb_rel), 12 * GAMUT_SEGMENTS);
+        assert_eq!(labels(&srgb_rel), 1);
+
+        // sRGB *absolute* (spec 80 vs the trial's 200) is a distinct volume —
+        // not deduped, so target + abs sRGB = two cages.
+        let srgb_abs = Space3dScene::build(
+            &trial,
+            0,
+            Space3dView::LabRelative,
+            RefCages {
+                abs: [true, false, false],
+                rel: [false; N_REF_GAMUTS],
+            },
+            None,
+            false,
+        );
+        assert_eq!(segs(&srgb_abs), 2 * 12 * GAMUT_SEGMENTS);
+        assert_eq!(labels(&srgb_abs), 2);
+    }
+
+    /// Cage labels carry the peak white luminance they were scaled to, and the
+    /// anchoring is now decoupled from the projection: with both an absolute and
+    /// a relative Rec.2020 enabled, the abs cage shows its spec white (10000) and
+    /// the rel cage shows the trial white (250) — identically in *every* view.
+    #[test]
+    fn cage_labels_show_peak_nits_independent_of_view() {
+        let trial = srgb_target_trial(250.0);
+        // Rec.2020 (index 2) in both anchor sets.
+        let refs = RefCages {
+            abs: [false, false, true],
+            rel: [false, false, true],
         };
-        // Rec.2020 overlay on (REF_GAMUTS index 2, spec white 10000 cd/m²).
-        let refs = [false, false, true];
-
-        // Relative: both cages report the trial white (250) — normalised.
-        let rel = Space3dScene::build(&trial, 0, Space3dView::LabRelative, refs, None, false);
-        assert_eq!(rel.gamut_labels.get(0), Some("sRGB · target · 250 cd/m²"));
-        assert_eq!(rel.gamut_labels.get(1), Some("Rec.2020 · 250 cd/m²"));
-
-        // Absolute: the reference rises to its spec peak; the target stays at the
-        // trial's real measured white.
-        let abs = Space3dScene::build(&trial, 0, Space3dView::XyYNits, refs, None, false);
-        assert_eq!(abs.gamut_labels.get(0), Some("sRGB · target · 250 cd/m²"));
-        assert_eq!(abs.gamut_labels.get(1), Some("Rec.2020 · 10000 cd/m²"));
+        for view in [
+            Space3dView::LabRelative,
+            Space3dView::LabAbsolute,
+            Space3dView::XyYNits,
+            Space3dView::ICtCp,
+        ] {
+            let scene = Space3dScene::build(&trial, 0, view, refs, None, false);
+            // Order: target, then the abs set, then the rel set.
+            assert_eq!(
+                scene.gamut_labels.get(0),
+                Some("sRGB · target · 250 cd/m²"),
+                "{view:?}"
+            );
+            assert_eq!(
+                scene.gamut_labels.get(1),
+                Some("Rec.2020 · 10000 cd/m²"),
+                "{view:?} abs"
+            );
+            assert_eq!(
+                scene.gamut_labels.get(2),
+                Some("Rec.2020 · 250 cd/m²"),
+                "{view:?} rel"
+            );
+        }
     }
 
     /// The measured-shell overlay adds patch-outline segments + a "measured"
@@ -1016,7 +1074,7 @@ mod tests {
             &trial,
             0,
             Space3dView::LabRelative,
-            [false; N_REF_GAMUTS],
+            RefCages::default(),
             Some(&gamut),
             false,
         );
@@ -1028,7 +1086,7 @@ mod tests {
             &trial,
             0,
             Space3dView::LabRelative,
-            [false; N_REF_GAMUTS],
+            RefCages::default(),
             Some(&gamut),
             true,
         );
@@ -1069,7 +1127,10 @@ mod tests {
             &trial,
             0,
             Space3dView::LabRelative,
-            [true, true, true],
+            RefCages {
+                abs: [true; N_REF_GAMUTS],
+                rel: [true; N_REF_GAMUTS],
+            },
             None,
             false,
         );
