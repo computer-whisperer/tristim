@@ -137,7 +137,9 @@ fn print_usage() {
     );
     eprintln!("          --gamut-repeats N  repeats per gamut probe point (default: 4)");
     eprintln!("          --gamut-max-depth N  gamut refinement depth (default: 3)");
-    eprintln!("          --gamut-fast-integration MS  adaptive integration on the gamut probe");
+    eprintln!("          --fast-integration MS  adaptive integration for every measurement");
+    eprintln!("                             (probe + sweep): bright points read at MS, escalate");
+    eprintln!("                             on untrust (default: 200, 0 disables)");
     eprintln!();
     eprintln!("        --format SPEC (name[:k=v,...]):");
     eprintln!("          unmanaged                      plain 8-bit buffer, no description");
@@ -981,15 +983,17 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
         seed: gather::SCATTER_SEED,
     });
 
+    // Adaptive fast-tier integration for the whole run (probe + sweep):
+    // default 200 ms (the ~3× tier), 0 disables it.
+    let fast_integration_ms: Option<u16> = match parse_opt::<u16>(args, "--fast-integration", 200) {
+        0 => None,
+        ms => Some(ms),
+    };
+
     // Optional per-format gamut-probe prerequisite.
     let gamut = if args.iter().any(|a| a == "--probe-gamut") {
-        let fast_ms: Option<u16> = arg_value(args, "--gamut-fast-integration")
-            .map(|s| s.parse())
-            .transpose()
-            .map_err(|_| "--gamut-fast-integration: expected integer ms")?;
         Some(gather::GamutProbeOpts {
             repeats: parse_opt(args, "--gamut-repeats", 4),
-            fast_integration_ms: fast_ms,
             refine: gather::RefineParams {
                 max_depth: parse_opt(args, "--gamut-max-depth", 3),
                 ..Default::default()
@@ -1003,6 +1007,7 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
         output: output.clone(),
         cal_index,
         settle: Duration::from_millis(settle_ms),
+        fast_integration_ms,
         prep: Duration::from_secs(prep_secs),
         window_fraction,
         border,
@@ -1013,8 +1018,12 @@ fn cmd_capture(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
 
     let per_format = config.sequence.len() + config.scatter.as_ref().map_or(0, |s| s.count);
+    let adapt_note = match fast_integration_ms {
+        Some(ms) => format!(", adaptive fast={ms}ms"),
+        None => String::new(),
+    };
     eprintln!(
-        "capture: output={output}, {} formats, ~{per_format} samples/format, window={window_fraction}{}, -> {out_path}",
+        "capture: output={output}, {} formats, ~{per_format} samples/format, window={window_fraction}{}{adapt_note}, -> {out_path}",
         config.formats.len(),
         if config.gamut.is_some() {
             ", gamut probe"

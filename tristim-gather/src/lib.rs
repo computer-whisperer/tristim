@@ -66,6 +66,13 @@ pub struct CaptureConfig {
     pub cal_index: u8,
     /// How long to wait after committing a patch before measuring.
     pub settle: Duration,
+    /// Optional adaptive fast-tier integration in milliseconds, applied to
+    /// every measurement of the run — gamut-probe vertices and sweep patches
+    /// alike. Each point first reads at this shorter integration and only
+    /// re-measures at the calibration default if the fast result isn't
+    /// trustworthy (see [`GamutConfig::fast_integration_ms`]). `None` measures
+    /// everything at the default integration.
+    pub fast_integration_ms: Option<u16>,
     /// Countdown given for puck placement before the first measurement.
     pub prep: Duration,
     /// Centered-window area fraction: `1.0` = fullscreen patch.
@@ -102,9 +109,6 @@ pub struct ScatterRequest {
 pub struct GamutProbeOpts {
     /// Repeated measurements per probe point (burst within a point).
     pub repeats: usize,
-    /// Optional adaptive fast-tier integration in milliseconds (see
-    /// [`GamutConfig::fast_integration_ms`](crate::gamut::GamutConfig::fast_integration_ms)).
-    pub fast_integration_ms: Option<u16>,
     /// Adaptive-refinement thresholds.
     pub refine: RefineParams,
 }
@@ -270,7 +274,7 @@ pub fn run_capture(
                         surface.set_code_values(cv)?;
                         sleep(config.settle);
                         let result =
-                            device.measure_adaptive(opts.repeats, opts.fast_integration_ms)?;
+                            device.measure_adaptive(opts.repeats, config.fast_integration_ms)?;
                         let conf = MeasurementConfidence::from_sample(&result.sample);
                         let rs = conf
                             .raw
@@ -340,7 +344,13 @@ pub fn run_capture(
                 }
                 surface.set_code_values(*cv)?;
                 sleep(config.settle);
-                let measured = device.measure(1)?;
+                // Adaptive like the probe: a single repeat still carries the
+                // quantization/floor trust analysis (it needs counts, not
+                // repeat scatter), so a dim patch read at the fast tier
+                // escalates to the calibration default instead of being kept.
+                let measured = device
+                    .measure_adaptive(1, config.fast_integration_ms)?
+                    .sample;
                 let xyz = measured.xyz[0];
                 let raw = raw_counts(&measured);
                 let xy = xyz.chromaticity().map(|(x, y)| [x, y]);

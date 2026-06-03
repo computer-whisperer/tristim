@@ -19,11 +19,12 @@ use tristim_gather::{self as gather, CaptureConfig, KNOWN_FORMATS};
 /// until the first probe reports its actual.
 pub(crate) const GAMUT_PROBE_EST_POINTS: usize = 25;
 
-/// Fast-tier integration for the gamut probe's adaptive measurements, in ms.
-/// Bright probe points read ~3× faster at 200 ms and escalate to the
-/// calibration default only when the fast read isn't trustworthy; a device
-/// without an exposure knob falls back to single full-integration bursts.
-const GAMUT_FAST_INTEGRATION_MS: u16 = 200;
+/// Fast-tier integration for the run's adaptive measurements (gamut-probe
+/// vertices and sweep patches alike), in ms. Bright points read ~3× faster at
+/// 200 ms and escalate to the calibration default only when the fast read
+/// isn't trustworthy; a device without an exposure knob falls back to
+/// full-integration reads.
+const FAST_INTEGRATION_MS: u16 = 200;
 
 /// What a routed form event asks the app to do.
 pub enum FormAction {
@@ -319,7 +320,6 @@ impl CaptureForm {
 
         let gamut = self.probe_gamut.then(|| gather::GamutProbeOpts {
             repeats: self.gamut_repeats,
-            fast_integration_ms: Some(GAMUT_FAST_INTEGRATION_MS),
             refine: gather::RefineParams {
                 max_depth: self.gamut_max_depth,
                 ..Default::default()
@@ -330,6 +330,7 @@ impl CaptureForm {
             output,
             cal_index: self.cal_index,
             settle: Duration::from_millis(self.settle_ms),
+            fast_integration_ms: Some(FAST_INTEGRATION_MS),
             prep: Duration::from_secs(self.prep_secs),
             window_fraction: self.window_pct as f64 / 100.0,
             border: None,
@@ -360,8 +361,9 @@ impl CaptureForm {
             })
             .sum();
         let count = fmts * seq_len;
-        // Per-patch cost ≈ settle + a fixed measurement overhead.
-        let per = self.settle_ms as f64 / 1000.0 + 0.4;
+        // Per-patch cost ≈ settle + one adaptive fast-tier read (~0.25 s at
+        // the 200 ms integration; the occasional dim patch escalates).
+        let per = self.settle_ms as f64 / 1000.0 + 0.25;
         // Gamut probe: roughly ~25 adaptive points per format, each a burst of
         // `repeats` fast-tier reads (~0.25 s at the 200 ms adaptive
         // integration; the occasional dim point escalates) after the settle.
