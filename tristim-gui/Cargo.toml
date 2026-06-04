@@ -6,6 +6,7 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/computer-whisperer/tristim"
 description = "Damascene-based presenter for tristim captures: load a capture, analyze it, and visualize where a compositor reproduces color faithfully vs. where it drifts."
+default-run = "tristim-gui"
 # Excluded from the tristim workspace (see ../Cargo.toml) to keep the heavy
 # damascene + GPU/winit stack out of the lockfile CI resolves; this crate carries
 # its own Cargo.lock and is built independently with `cargo run` from this directory.
