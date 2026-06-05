@@ -43,6 +43,22 @@ enum Mode {
     Presenting,
 }
 
+/// Which moment of a live run [`PresenterApp::debug_running`] freezes. Each is
+/// a distinct progress-strip + body layout; the headless dump lints them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebugRunPhase {
+    /// Puck-placement countdown: nothing measured, waiting-for-samples body.
+    Countdown,
+    /// The first format's gamut probe in flight (open-ended progress estimate).
+    Probing,
+    /// Mid-sweep through a format, with earlier formats finished.
+    Sweeping,
+    /// Cancel requested mid-sweep, waiting for the loop to wind down.
+    Cancelling,
+    /// Every format measured, the run about to deliver its capture.
+    Done,
+}
+
 /// A capture being presented: the loaded record, its analysis, and which trial
 /// is in focus.
 struct Presented {
@@ -138,6 +154,24 @@ impl LiveTrial {
             gamut: None,
             samples: self.samples.clone(),
         }
+    }
+}
+
+/// A [`LiveTrial`] frozen partway through recorded trial `t`, with its first
+/// `k` samples already measured. The gather token isn't recorded in captures,
+/// so it's reconstructed from the request — close enough for layout.
+fn debug_live_trial(t: &cap::FormatTrial, index: usize, k: usize) -> LiveTrial {
+    let token = match &t.requested {
+        Some(d) => format!("{}-{}", d.transfer_function, d.primaries),
+        None => "unmanaged".to_string(),
+    };
+    LiveTrial {
+        index,
+        token,
+        requested: t.requested.clone(),
+        pixel_format: t.pixel_format.clone(),
+        outcome: Some(t.outcome.clone()),
+        samples: t.samples[..k.min(t.samples.len())].to_vec(),
     }
 }
 
@@ -425,14 +459,13 @@ impl PresenterApp {
         }
     }
 
-    /// Build the app in Running mode over an already-measured `capture`, with
-    /// no live thread — for the headless dump to lint the running layout (which
-    /// it otherwise can't construct, since `Running` owns a channel receiver).
-    pub fn debug_running(capture: Capture) -> Self {
-        let analyzed = analyze(&capture);
-        let total: usize = capture.trials.iter().map(|t| t.samples.len()).sum();
+    /// Build the app in Running mode, frozen at `phase` of a run over
+    /// `capture`'s trials, with no live thread — for the headless dump to lint
+    /// each running layout (which it otherwise can't construct, since `Running`
+    /// owns a channel receiver).
+    pub fn debug_running(capture: Capture, phase: DebugRunPhase) -> Self {
         let (_tx, rx) = channel();
-        let running = Running {
+        let mut running = Running {
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
             device: Some("Spyder 2024 · SN 87000216".to_string()),
@@ -440,22 +473,51 @@ impl PresenterApp {
             total_formats: capture.trials.len().max(1),
             sweep_per_format: capture.trials.first().map_or(0, |t| t.samples.len()),
             probe_gamut: false,
-            probe_est: 0,
-            done_measured: total,
-            formats_done: capture.trials.len().max(1),
+            probe_est: crate::setup::GAMUT_PROBE_EST_POINTS,
+            done_measured: 0,
+            formats_done: 0,
             cur_probe: 0,
             cur_probe_done: false,
             cur_sweep: 0,
             cancelling: false,
-            trials: capture.trials.clone(),
+            trials: Vec::new(),
             cur: None,
-            live: Some(Presented {
-                capture,
-                analyzed,
-                selected: 0,
-                space3d: None,
-            }),
+            live: None,
         };
+        match phase {
+            DebugRunPhase::Countdown => running.countdown = Some(5),
+            DebugRunPhase::Probing => {
+                // The first format's adaptive probe, frozen partway: its
+                // vertices plot live and the strip names the probe phase with
+                // an open-ended (~) total.
+                if let Some(t) = capture.trials.first() {
+                    let k = (t.samples.len() / 3).max(1);
+                    running.probe_gamut = true;
+                    running.cur_probe = k;
+                    running.cur = Some(debug_live_trial(t, 0, k));
+                }
+            }
+            DebugRunPhase::Sweeping | DebugRunPhase::Cancelling => {
+                // Earlier formats finished, the in-flight one frozen mid-sweep
+                // (so the strip shows the patch counter over finished actuals).
+                let cur_index = capture.trials.len().saturating_sub(1).min(1);
+                running.trials = capture.trials[..cur_index].to_vec();
+                running.done_measured = running.trials.iter().map(|t| t.samples.len()).sum();
+                running.formats_done = cur_index;
+                if let Some(t) = capture.trials.get(cur_index) {
+                    let k = (t.samples.len() / 2).max(1);
+                    running.cur_sweep = k;
+                    running.cur = Some(debug_live_trial(t, cur_index, k));
+                }
+                running.cancelling = matches!(phase, DebugRunPhase::Cancelling);
+            }
+            DebugRunPhase::Done => {
+                running.done_measured = capture.trials.iter().map(|t| t.samples.len()).sum();
+                running.formats_done = capture.trials.len().max(1);
+                running.trials = capture.trials;
+            }
+        }
+        running.rebuild_live();
         Self {
             mode: Mode::Running,
             presented: None,
@@ -556,6 +618,32 @@ impl PresenterApp {
     /// lint the grayed-out unreachable-format rows without a live compositor.
     pub fn set_setup_capabilities(&mut self, caps: tristim_display::DisplayCapabilities) {
         self.form.set_capabilities(caps);
+    }
+
+    /// Set the 3D overlays (reference cages + measured shell). Used by the
+    /// headless dump to build the overlay geometry on real samples and lint
+    /// the toggled controls. Rebuilds the cached scene like [`Self::set_view`].
+    pub fn set_space3d_overlays(&mut self, refs: RefCages, show_measured: bool) {
+        self.space3d_refs = refs;
+        self.space3d_show_measured = show_measured;
+        if self.view == Tab::Space3D {
+            let view = self.space3d_view;
+            if let Some(p) = self.presented.as_mut() {
+                p.ensure_space3d(view, refs, show_measured);
+            }
+        }
+    }
+
+    /// Set (or clear) the open-file error. Used by the headless dump to lint
+    /// the banner in both the setup and presenting layouts.
+    pub fn set_open_error(&mut self, msg: Option<String>) {
+        self.open_error = msg;
+    }
+
+    /// Record a validation error beneath the setup form. Used by the headless
+    /// dump to lint the form's error row.
+    pub fn set_setup_error(&mut self, msg: String) {
+        self.form.set_error(msg);
     }
 
     /// Spawn the capture on a background thread and switch to Running. Progress
