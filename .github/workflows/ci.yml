@@ -76,3 +76,19 @@ jobs:
         run: cargo build --manifest-path tristim-gui/Cargo.toml --all-targets --locked
       - name: Run tristim-gui tests
         run: cargo test --manifest-path tristim-gui/Cargo.toml --locked
+      # Headless layout lint: build every presenter state over the reference
+      # capture and fail on any damascene lint finding (overflow, clipped
+      # text, spacing smells, raw colors). No compositor in CI: the setup
+      # form's output/capability queries fall back to their empty/error rows,
+      # which are themselves lint-checked states. The dump binary was already
+      # compiled by the --all-targets build above.
+      - name: Bundle-dump layout lint
+        run: cargo run --manifest-path tristim-gui/Cargo.toml --bin dump --locked -- tristim-gui/fixtures/reference-capture.json tristim-gui/out
+      # On lint failure, keep the SVG / tree / draw-ops artifacts so the
+      # offending layout can be inspected without reproducing locally.
+      - name: Upload bundle-dump artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-dump
+          path: tristim-gui/out/
