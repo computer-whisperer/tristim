@@ -1,35 +1,46 @@
 //! Wayland layer-shell client for showing solid-color test patches on a
 //! chosen output.
 //!
-//! A [`PatchSurface`] is opened with a [`BufferFormat`] (8-bit or fp16)
-//! and an optional [`DescriptionRequest`] — a parametric
-//! `wp_color_management_v1` image description to negotiate. With no
-//! description the surface is *unmanaged*: the compositor interprets the
-//! buffer by its own default. Patch content is set as raw code values
-//! (`0..=1`) via [`PatchSurface::set_code_values`] and written to the
-//! buffer verbatim — what those code values *mean* is the negotiated
-//! description's job, recorded for the analysis tool to interpret.
+//! A [`PatchSurface`] is opened with a [`BufferFormat`] (any RGB-family
+//! `wl_shm` format — 8-bit through 10-bit, 16-bit unorm, and fp16; see
+//! [`format`]) and an optional [`DescriptionRequest`] — a
+//! `wp_color_management_v1` image description to negotiate: parametric
+//! (named or power-law TF, named or custom primaries, luminances,
+//! mastering metadata, render intent) or the Windows-scRGB shortcut.
+//! With no description the surface is *unmanaged*: the compositor
+//! interprets the buffer by its own default. Patch content is set as
+//! raw code values via [`PatchSurface::set_code_values`] and written to
+//! the buffer verbatim — what those code values *mean* is the
+//! negotiated description's job, recorded for the analysis tool to
+//! interpret.
+//!
+//! Everything optional is gated on what the compositor actually
+//! advertised — buffer formats via
+//! [`DisplayCapabilities::supports_buffer_format`], color-management
+//! features/TFs/primaries/intents inside
+//! [`PatchSurface::open`] (an unadvertised request would be a fatal
+//! protocol error, so it's refused client-side as
+//! [`Error::BadDescription`] instead).
 //!
 //! Usage:
 //!
 //! ```no_run
-//! use tristim_display::{PatchSurface, BufferFormat, DescriptionRequest, Mastering};
+//! use tristim_display::{
+//!     PatchSurface, BufferFormat, DescriptionRequest, Mastering, ParametricDescription,
+//! };
 //! // Unmanaged 8-bit SDR.
 //! let mut patch = PatchSurface::open_sdr("DP-1")?;
 //! patch.set_code_values([1.0, 1.0, 1.0])?;
 //!
-//! // fp16 surface declaring PQ + BT.2020.
-//! let desc = DescriptionRequest {
-//!     transfer_function: "st2084_pq".into(),
-//!     primaries: "bt2020".into(),
-//!     luminances: None,
-//!     mastering: Some(Mastering {
-//!         min_nits: 0.0005,
-//!         max_nits: 400.0,
-//!         max_cll_nits: 400.0,
-//!         max_fall_nits: 200.0,
-//!     }),
-//! };
+//! // fp16 surface declaring PQ + BT.2020 with mastering metadata.
+//! let mut params = ParametricDescription::named("st2084_pq", "bt2020");
+//! params.mastering = Some(Mastering {
+//!     luminance_nits: Some((0.0005, 400.0)),
+//!     max_cll_nits: Some(400.0),
+//!     max_fall_nits: Some(200.0),
+//!     ..Default::default()
+//! });
+//! let desc = DescriptionRequest::parametric(params);
 //! let mut hdr = PatchSurface::open("DP-4", BufferFormat::Xbgr16161616f, Some(desc))?;
 //! hdr.set_code_values([0.5081, 0.5081, 0.5081])?;  // PQ code value ≈ 100 cd/m²
 //! # Ok::<(), tristim_display::Error>(())
@@ -52,11 +63,14 @@
 //! ratings).
 
 pub mod color_mgmt;
+pub mod format;
 pub mod pq;
 
 pub use color_mgmt::{
-    AttachError, ColorCapabilities, DescriptionRequest, DescriptionState, Luminances, Mastering,
+    AttachError, ColorCapabilities, DescriptionKind, DescriptionRequest, DescriptionState,
+    Luminances, Mastering, ParametricDescription, PrimariesChoice, PrimaryCoords, TransferChoice,
 };
+pub use format::{BufferFormat, EncodedPixel};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -151,30 +165,6 @@ pub struct PatchSurface {
     compositor_process: Option<String>,
 }
 
-/// Buffer pixel format for the patch surface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BufferFormat {
-    /// 8-bit `XRGB8888`. Code values are quantized to `0..=255`.
-    Xrgb8888,
-    /// Half-float `XBGR16161616F`. Code values are written directly as
-    /// `f16` — needed for HDR / wide encodings that exceed 8-bit range.
-    Xbgr16161616f,
-}
-
-/// Build the [`PatchContent`] for `rgb` (code values `0..=1`) matching
-/// the format of `current`. Shared by `set_code_values` / `set_border`.
-fn make_content(current: PatchContent, rgb: [f64; 3]) -> PatchContent {
-    match current {
-        PatchContent::Sdr(_) => {
-            let r = (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u32;
-            let g = (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u32;
-            let b = (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u32;
-            PatchContent::Sdr(0xFF_00_00_00 | (r << 16) | (g << 8) | b)
-        }
-        PatchContent::Fp16(_) => PatchContent::Fp16([rgb[0], rgb[1], rgb[2]]),
-    }
-}
-
 impl PatchSurface {
     /// Convenience: open an unmanaged 8-bit SDR patch — no color
     /// description negotiated, so the compositor interprets the buffer
@@ -185,17 +175,21 @@ impl PatchSurface {
 
     /// Open a patch surface on `output_name`.
     ///
-    /// `format` selects the buffer bit depth. `description`, when
-    /// `Some`, negotiates a `wp_color_management_v1` parametric image
-    /// description for the surface — recording how the compositor
-    /// responds is part of what the validator measures; `None` leaves
-    /// the surface unmanaged.
+    /// `format` selects the buffer pixel format (see [`BufferFormat`] —
+    /// only `Xrgb8888`/`Argb8888` are mandatory; check
+    /// [`DisplayCapabilities::supports_buffer_format`] first for the
+    /// rest). `description`, when `Some`, negotiates a
+    /// `wp_color_management_v1` image description for the surface —
+    /// recording how the compositor responds is part of what the
+    /// validator measures; `None` leaves the surface unmanaged.
     ///
     /// Errors: [`Error::NoColorManager`] if a description was requested
     /// but the compositor doesn't advertise the protocol;
-    /// [`Error::BadDescription`] if the request named a transfer
-    /// function / primaries this build can't map; [`Error::DescriptionFailed`]
-    /// if the compositor rejected the description.
+    /// [`Error::BadDescription`] if the request names something this
+    /// build can't map, or uses a feature/TF/primaries/intent the
+    /// compositor didn't advertise (sending those anyway would be a
+    /// fatal protocol error); [`Error::DescriptionFailed`] if the
+    /// compositor rejected the description.
     pub fn open(
         output_name: &str,
         format: BufferFormat,
@@ -231,11 +225,6 @@ impl PatchSurface {
             return Err(Error::NoColorManager);
         }
 
-        let initial_content = match format {
-            BufferFormat::Xrgb8888 => PatchContent::Sdr(0xFF_00_00_00),
-            BufferFormat::Xbgr16161616f => PatchContent::Fp16([0.0, 0.0, 0.0]),
-        };
-
         let mut state = AppState {
             registry_state,
             output_state,
@@ -244,7 +233,8 @@ impl PatchSurface {
             shm,
             pool: None,
             surface_state: SurfaceState::WaitingForOutputs,
-            current_content: initial_content,
+            format,
+            current_rgb: [0.0; 3],
             current_width: PATCH_WIDTH,
             current_height: PATCH_HEIGHT,
             redraw_pending: true,
@@ -253,7 +243,7 @@ impl PatchSurface {
             capabilities: ColorCapabilities::default(),
             description,
             window_fraction: 1.0,
-            border_content: None,
+            border_rgb: None,
         };
 
         // Pump events until OutputState has enumerated all outputs, so we
@@ -265,13 +255,8 @@ impl PatchSurface {
         // Pick the matching output.
         let wl_output = pick_output(&state.output_state, output_name)?;
 
-        // Pool size depends on bytes-per-pixel. fp16 buffers are 2×
-        // the 8-bit size.
-        let bpp = match format {
-            BufferFormat::Xrgb8888 => 4,
-            BufferFormat::Xbgr16161616f => 8,
-        };
-        let pool_size = (PATCH_WIDTH * PATCH_HEIGHT * bpp) as usize * 2; // double-buffer
+        // Pool size depends on the format's bytes-per-pixel.
+        let pool_size = (PATCH_WIDTH * PATCH_HEIGHT) as usize * format.bytes_per_pixel() * 2; // double-buffer
         let pool = SlotPool::new(pool_size, &state.shm)?;
         state.pool = Some(pool);
 
@@ -315,7 +300,8 @@ impl PatchSurface {
                 unreachable!("just waited for Configured above")
             };
             let wl_surface = layer_surface.wl_surface().clone();
-            let cm = ColorManagedSurface::attach(manager, &qh, &wl_surface, &req)?;
+            let cm =
+                ColorManagedSurface::attach(manager, &qh, &wl_surface, &req, &state.capabilities)?;
             // Keep a handle to the negotiation state before `cm` moves into
             // `state` — the dispatch loop below needs `&mut state`.
             let desc_state = cm.state.clone();
@@ -378,16 +364,18 @@ impl PatchSurface {
         self.state.color_managed.as_ref().map(|cm| cm.state())
     }
 
-    /// Write the per-channel code values (`0..=1`) to the patch.
+    /// Write the per-channel code values to the patch.
     ///
     /// These are *exactly* the values handed to the compositor — no
-    /// encoding or interpretation. For an `Xrgb8888` surface each
-    /// channel is quantized to `0..=255`; for `Xbgr16161616f` it is
-    /// written directly as a half-float. What those code values *mean*
-    /// (e.g. PQ-encoded luminance) is determined by the negotiated
-    /// color description and is the analysis tool's concern, not ours.
+    /// encoding or interpretation. Unorm formats quantize `0..=1` to
+    /// the channel depth (out-of-range clamps); float formats carry the
+    /// value bit-exactly, including extended-range values outside
+    /// `0..=1` (scRGB). What those code values *mean* (e.g. PQ-encoded
+    /// luminance) is determined by the negotiated color description
+    /// and is the analysis tool's concern, not ours. See
+    /// [`BufferFormat::encode`] for the exact packing.
     pub fn set_code_values(&mut self, rgb: [f64; 3]) -> Result<(), Error> {
-        self.state.current_content = make_content(self.state.current_content, rgb);
+        self.state.current_rgb = rgb;
         self.state.redraw_pending = true;
         self.redraw_and_settle(Duration::from_millis(50))
     }
@@ -431,14 +419,14 @@ impl PatchSurface {
     /// Persists across subsequent `set_code_values` calls until cleared
     /// (`clear_border`) or overwritten.
     pub fn set_border(&mut self, rgb: [f64; 3]) -> Result<(), Error> {
-        self.state.border_content = Some(make_content(self.state.current_content, rgb));
+        self.state.border_rgb = Some(rgb);
         self.state.redraw_pending = true;
         self.redraw_and_settle(Duration::from_millis(50))
     }
 
     /// Revert the surround to the black default.
     pub fn clear_border(&mut self) -> Result<(), Error> {
-        self.state.border_content = None;
+        self.state.border_rgb = None;
         self.state.redraw_pending = true;
         self.redraw_and_settle(Duration::from_millis(50))
     }
@@ -486,7 +474,8 @@ pub fn list_outputs() -> Result<Vec<OutputDescription>, Error> {
         shm: Shm::bind(&globals, &qh).map_err(Error::Bind)?,
         pool: None,
         surface_state: SurfaceState::WaitingForOutputs,
-        current_content: PatchContent::Sdr(0),
+        format: BufferFormat::Xrgb8888,
+        current_rgb: [0.0; 3],
         current_width: PATCH_WIDTH,
         current_height: PATCH_HEIGHT,
         redraw_pending: false,
@@ -495,7 +484,7 @@ pub fn list_outputs() -> Result<Vec<OutputDescription>, Error> {
         capabilities: ColorCapabilities::default(),
         description: None,
         window_fraction: 1.0,
-        border_content: None,
+        border_rgb: None,
     };
     event_queue.roundtrip(&mut state)?;
     event_queue.roundtrip(&mut state)?;
@@ -542,11 +531,19 @@ pub struct DisplayCapabilities {
 
 impl DisplayCapabilities {
     /// Build a capability set advertising the named transfer functions and
-    /// primaries (same names as [`DescriptionRequest`]) plus optional fp16
-    /// buffer support. The live equivalent comes from [`query_capabilities`];
-    /// this is for callers (and tests) holding the facts another way. Names
-    /// this build doesn't map are dropped; `done` is set iff any TF is known.
-    pub fn advertising(transfer_functions: &[&str], primaries: &[&str], fp16: bool) -> Self {
+    /// primaries (same names as [`DescriptionRequest`]) plus the given
+    /// buffer formats. The live equivalent comes from
+    /// [`query_capabilities`]; this is for callers (and tests) holding the
+    /// facts another way. Names this build doesn't map are dropped; `done`
+    /// is set iff any TF is known. The advertised features are filled with
+    /// the full parametric set (this constructor's callers care about
+    /// format reachability, not feature gating).
+    pub fn advertising(
+        transfer_functions: &[&str],
+        primaries: &[&str],
+        formats: &[BufferFormat],
+    ) -> Self {
+        use wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::Feature;
         let tf: Vec<String> = transfer_functions
             .iter()
             .filter_map(|n| color_mgmt::tf_named(n).map(|t| format!("{t:?}")))
@@ -556,15 +553,23 @@ impl DisplayCapabilities {
             .filter_map(|n| color_mgmt::primaries_named(n).map(|p| format!("{p:?}")))
             .collect();
         let done = !tf.is_empty();
-        let mut shm_formats = vec![wl_shm::Format::Xrgb8888];
-        if fp16 {
-            shm_formats.push(wl_shm::Format::Xbgr16161616f);
-        }
+        let mut shm_formats = vec![wl_shm::Format::Xrgb8888, wl_shm::Format::Argb8888];
+        shm_formats.extend(formats.iter().map(|f| f.wl_format()));
         Self {
             color: ColorCapabilities {
                 transfer_functions: tf,
                 primaries: prim,
-                features: Vec::new(),
+                features: [
+                    Feature::Parametric,
+                    Feature::SetPrimaries,
+                    Feature::SetTfPower,
+                    Feature::SetLuminances,
+                    Feature::SetMasteringDisplayPrimaries,
+                    Feature::WindowsScrgb,
+                ]
+                .iter()
+                .map(|f| format!("{f:?}"))
+                .collect(),
                 render_intents: Vec::new(),
                 done,
             },
@@ -572,16 +577,33 @@ impl DisplayCapabilities {
         }
     }
 
-    /// Whether the compositor can present this buffer format. `Xrgb8888` is
-    /// mandatory per the `wl_shm` spec, so it's always available; `fp16` must
-    /// be explicitly advertised.
+    /// Whether the compositor can present this buffer format.
+    /// `Xrgb8888` and `Argb8888` are mandatory per the `wl_shm` spec, so
+    /// they're always available; everything else must be explicitly
+    /// advertised.
     pub fn supports_buffer_format(&self, f: BufferFormat) -> bool {
-        match f {
-            BufferFormat::Xrgb8888 => true,
-            BufferFormat::Xbgr16161616f => {
-                self.shm_formats.contains(&wl_shm::Format::Xbgr16161616f)
-            }
-        }
+        matches!(f, BufferFormat::Xrgb8888 | BufferFormat::Argb8888)
+            || self.shm_formats.contains(&f.wl_format())
+    }
+
+    /// Every advertised `wl_shm` format this crate can write (plus the
+    /// spec-mandatory 8-bit pair), in [`BufferFormat::ALL`] table order.
+    pub fn supported_buffer_formats(&self) -> Vec<BufferFormat> {
+        BufferFormat::ALL
+            .iter()
+            .copied()
+            .filter(|&f| self.supports_buffer_format(f))
+            .collect()
+    }
+
+    /// The first format in `preference` order the compositor supports —
+    /// e.g. `first_supported(&[Xbgr16161616f, Abgr16161616f, Xbgr16161616,
+    /// Xrgb2101010])` for "fp16 preferred, deep unorm acceptable".
+    pub fn first_supported(&self, preference: &[BufferFormat]) -> Option<BufferFormat> {
+        preference
+            .iter()
+            .copied()
+            .find(|&f| self.supports_buffer_format(f))
     }
 
     /// Whether the compositor exposes color management at all (the
@@ -610,6 +632,29 @@ impl DisplayCapabilities {
             None => false,
         }
     }
+
+    /// Whether the named optional feature (e.g. `"set_luminances"`,
+    /// `"windows_scrgb"`) is advertised. Names match the protocol's
+    /// `feature` enum entries.
+    pub fn supports_feature(&self, name: &str) -> bool {
+        match color_mgmt::feature_named(name) {
+            Some(f) => self.color.has_feature(f),
+            None => false,
+        }
+    }
+
+    /// Whether the named render intent is advertised. `"perceptual"` is
+    /// the protocol baseline and always reports `true` when the
+    /// compositor has color management at all.
+    pub fn supports_render_intent(&self, name: &str) -> bool {
+        if name == "perceptual" {
+            return self.has_color_management();
+        }
+        match color_mgmt::intent_named(name) {
+            Some(i) => self.color.has_intent(i),
+            None => false,
+        }
+    }
 }
 
 /// Query what the compositor can do — color management + buffer formats —
@@ -634,7 +679,8 @@ pub fn query_capabilities() -> Result<DisplayCapabilities, Error> {
         shm: Shm::bind(&globals, &qh).map_err(Error::Bind)?,
         pool: None,
         surface_state: SurfaceState::WaitingForOutputs,
-        current_content: PatchContent::Sdr(0),
+        format: BufferFormat::Xrgb8888,
+        current_rgb: [0.0; 3],
         current_width: PATCH_WIDTH,
         current_height: PATCH_HEIGHT,
         redraw_pending: false,
@@ -643,7 +689,7 @@ pub fn query_capabilities() -> Result<DisplayCapabilities, Error> {
         capabilities: ColorCapabilities::default(),
         description: None,
         window_fraction: 1.0,
-        border_content: None,
+        border_rgb: None,
     };
     // Two roundtrips: the first delivers the `wl_shm` formats, the second the
     // manager's `supported_*` + `done` enumeration.
@@ -720,21 +766,6 @@ enum SurfaceState {
     Configured(LayerSurface),
 }
 
-/// What the patch holds — raw buffer code values in one of the two
-/// supported pixel formats. No encoding happens here: the values are
-/// written to the buffer verbatim (quantized for 8-bit).
-#[derive(Clone, Copy, Debug)]
-enum PatchContent {
-    /// 8-bit XRGB packed little-endian; AppState.draw writes one
-    /// u32 per pixel.
-    Sdr(u32),
-    /// Per-channel code values in `0..=1`. AppState.draw writes them as
-    /// IEEE 754 binary16 (4 channels: R, G, B, alpha=1.0 — the buffer
-    /// format is alpha-undefined but writing 1.0 gives a sane value if
-    /// the compositor ever samples it).
-    Fp16([f64; 3]),
-}
-
 struct AppState {
     registry_state: RegistryState,
     output_state: OutputState,
@@ -743,7 +774,12 @@ struct AppState {
     shm: Shm,
     pool: Option<SlotPool>,
     surface_state: SurfaceState,
-    current_content: PatchContent,
+    /// The surface's buffer pixel format, fixed at open time. Patch and
+    /// border code values are packed into it at draw time by
+    /// [`BufferFormat::encode`].
+    format: BufferFormat,
+    /// The patch's per-channel code values, written verbatim.
+    current_rgb: [f64; 3],
     current_width: u32,
     current_height: u32,
     redraw_pending: bool,
@@ -766,13 +802,13 @@ struct AppState {
     /// unset) + centered window of the patch color, sized so the
     /// window covers `sqrt(f)` of each axis.
     window_fraction: f64,
-    /// Surround colour when `window_fraction < 1.0`. `None` = legacy
-    /// black surround (`#000000` SDR / 0 nits HDR). `Some(...)` paints
-    /// the chosen colour everywhere outside the centered window —
-    /// useful when the panel does content-adaptive backlight dimming
-    /// and would otherwise gate the backlight off during low-intensity
+    /// Surround code values when `window_fraction < 1.0`. `None` = the
+    /// black default (all channels 0). `Some(...)` paints the chosen
+    /// values everywhere outside the centered window — useful when the
+    /// panel does content-adaptive backlight dimming and would
+    /// otherwise gate the backlight off during low-intensity
     /// measurements, killing dim patch measurements.
-    border_content: Option<PatchContent>,
+    border_rgb: Option<[f64; 3]>,
 }
 
 /// A pixel rectangle (origin + size) on the surface, used for
@@ -809,61 +845,29 @@ fn window_rect(width: i32, height: i32, fraction: f64) -> Rect {
 }
 
 /// Fill the canvas with `bg` everywhere except the `win` rectangle,
-/// which gets `fg`. 4 bytes per pixel.
-fn fill_window_4bpp(canvas: &mut [u8], width: i32, bg: &[u8; 4], fg: &[u8; 4], win: &Rect) {
-    for px in canvas.chunks_exact_mut(4) {
+/// which gets `fg`. Pixel size is `bg.len()` (== `fg.len()`), any
+/// format's bytes-per-pixel.
+fn fill_window(canvas: &mut [u8], width: i32, bg: &[u8], fg: &[u8], win: &Rect) {
+    let bpp = bg.len();
+    debug_assert_eq!(fg.len(), bpp);
+    for px in canvas.chunks_exact_mut(bpp) {
         px.copy_from_slice(bg);
     }
-    if win.w == width && win.x == 0 {
-        // Fast path: window spans the full width — overwrite whole rows.
-        let row_bytes = (width as usize) * 4;
-        let fg_row: Vec<u8> = fg.iter().copied().cycle().take(row_bytes).collect();
-        for row in win.y..win.y + win.h {
-            let off = (row as usize) * row_bytes;
-            canvas[off..off + row_bytes].copy_from_slice(&fg_row);
-        }
-    } else {
-        let row_bytes = (width as usize) * 4;
-        let span_bytes = (win.w as usize) * 4;
-        let fg_span: Vec<u8> = fg.iter().copied().cycle().take(span_bytes).collect();
-        for row in win.y..win.y + win.h {
-            let off = (row as usize) * row_bytes + (win.x as usize) * 4;
-            canvas[off..off + span_bytes].copy_from_slice(&fg_span);
-        }
-    }
-}
-
-/// Same as [`fill_window_4bpp`] but for 8-byte fp16 pixels.
-fn fill_window_8bpp(canvas: &mut [u8], width: i32, bg: &[u8; 8], fg: &[u8; 8], win: &Rect) {
-    for px in canvas.chunks_exact_mut(8) {
-        px.copy_from_slice(bg);
-    }
-    let row_bytes = (width as usize) * 8;
-    let span_bytes = (win.w as usize) * 8;
+    let row_bytes = (width as usize) * bpp;
+    let span_bytes = (win.w as usize) * bpp;
     let fg_span: Vec<u8> = fg.iter().copied().cycle().take(span_bytes).collect();
     if win.w == width && win.x == 0 {
+        // Fast path: window spans the full width — overwrite whole rows.
         for row in win.y..win.y + win.h {
             let off = (row as usize) * row_bytes;
             canvas[off..off + row_bytes].copy_from_slice(&fg_span);
         }
     } else {
         for row in win.y..win.y + win.h {
-            let off = (row as usize) * row_bytes + (win.x as usize) * 8;
+            let off = (row as usize) * row_bytes + (win.x as usize) * bpp;
             canvas[off..off + span_bytes].copy_from_slice(&fg_span);
         }
     }
-}
-
-/// Half-float pack one RGB code-value triple into Xbgr16161616f bytes.
-/// Values are written verbatim — no PQ/encoding (that meaning lives in
-/// the negotiated color description, not here).
-fn fp16_pixel(rgb: [f64; 3]) -> [u8; 8] {
-    let r = half::f16::from_f64(rgb[0]).to_le_bytes();
-    let g = half::f16::from_f64(rgb[1]).to_le_bytes();
-    let b = half::f16::from_f64(rgb[2]).to_le_bytes();
-    // Alpha undefined for Xbgr; write 1.0 so a stray sampler isn't noise.
-    let a = half::f16::from_f64(1.0).to_le_bytes();
-    [r[0], r[1], g[0], g[1], b[0], b[1], a[0], a[1]]
 }
 
 impl AppState {
@@ -882,37 +886,14 @@ impl AppState {
         // preserving the surface's aspect ratio inside the window.
         let win = window_rect(width, height, self.window_fraction);
 
-        let (buffer, _) = match self.current_content {
-            PatchContent::Sdr(argb) => {
-                let stride = width * 4;
-                let (buffer, canvas) =
-                    pool.create_buffer(width, height, stride, wl_shm::Format::Xrgb8888)?;
-                // Background = configured border colour, falling back to
-                // opaque black for the legacy unset case.
-                let bg: [u8; 4] = match self.border_content {
-                    Some(PatchContent::Sdr(b)) => b.to_le_bytes(),
-                    _ => 0xFF_00_00_00u32.to_le_bytes(),
-                };
-                let fg: [u8; 4] = argb.to_le_bytes();
-                fill_window_4bpp(canvas, width, &bg, &fg, &win);
-                (buffer, ())
-            }
-            PatchContent::Fp16(rgb) => {
-                let stride = width * 8;
-                let (buffer, canvas) =
-                    pool.create_buffer(width, height, stride, wl_shm::Format::Xbgr16161616f)?;
-                // Xbgr16161616f memory layout is [R, G, B, X] half-floats
-                // little-endian. Background = configured border code
-                // values, falling back to 0 for the unset case.
-                let bg = match self.border_content {
-                    Some(PatchContent::Fp16(border)) => fp16_pixel(border),
-                    _ => fp16_pixel([0.0, 0.0, 0.0]),
-                };
-                let fg = fp16_pixel(rgb);
-                fill_window_8bpp(canvas, width, &bg, &fg, &win);
-                (buffer, ())
-            }
-        };
+        // One generic path for every format: pack the patch and border
+        // code values into the surface's pixel format, then fill.
+        let stride = width * self.format.bytes_per_pixel() as i32;
+        let (buffer, canvas) =
+            pool.create_buffer(width, height, stride, self.format.wl_format())?;
+        let fg = self.format.encode(self.current_rgb);
+        let bg = self.format.encode(self.border_rgb.unwrap_or([0.0; 3]));
+        fill_window(canvas, width, &bg, &fg, &win);
 
         let wl_surface = layer_surface.wl_surface();
         wl_surface.set_buffer_scale(1);

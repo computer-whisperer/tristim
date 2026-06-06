@@ -9,7 +9,9 @@
 //!   cargo run -p tristim-display --example show_hdr_patch -- --output DP-4 --nits 400 --window 0.04
 
 use std::time::Duration;
-use tristim_display::{BufferFormat, DescriptionRequest, Mastering, PatchSurface, pq};
+use tristim_display::{
+    BufferFormat, DescriptionRequest, Mastering, ParametricDescription, PatchSurface, pq,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -26,17 +28,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_deref()
         .and_then(|s| s.parse().ok());
 
-    let desc = DescriptionRequest {
-        transfer_function: "st2084_pq".into(),
-        primaries: "bt2020".into(),
-        luminances: None,
-        mastering: Some(Mastering {
-            min_nits: 0.0005,
-            max_nits: nits.max(400.0),
-            max_cll_nits: nits.max(400.0),
-            max_fall_nits: nits.max(400.0) / 2.0,
-        }),
-    };
+    let peak = nits.max(400.0);
+    let mut params = ParametricDescription::named("st2084_pq", "bt2020");
+    params.mastering = Some(Mastering {
+        luminance_nits: Some((0.0005, peak)),
+        max_cll_nits: Some(peak),
+        max_fall_nits: Some(peak / 2.0),
+        ..Default::default()
+    });
+    let desc = DescriptionRequest::parametric(params);
 
     let code = pq::nits_to_pq(nits);
     println!(

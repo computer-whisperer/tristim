@@ -7,24 +7,23 @@ compositor's normal client path (a layer-shell surface with an ordinary
 compositor *actually does* with a client's pixels, not a bypassed scanout.
 
 ```rust,no_run
-use tristim_display::{PatchSurface, BufferFormat, DescriptionRequest, Mastering};
+use tristim_display::{
+    PatchSurface, BufferFormat, DescriptionRequest, Mastering, ParametricDescription,
+};
 
 // Unmanaged 8-bit SDR: the compositor interprets the buffer by its default.
 let mut patch = PatchSurface::open_sdr("DP-1")?;
 patch.set_code_values([1.0, 1.0, 1.0])?;
 
 // fp16 surface declaring PQ + BT.2020 via wp_color_management_v1.
-let desc = DescriptionRequest {
-    transfer_function: "st2084_pq".into(),
-    primaries: "bt2020".into(),
-    luminances: None,
-    mastering: Some(Mastering {
-        min_nits: 0.0005,
-        max_nits: 400.0,
-        max_cll_nits: 400.0,
-        max_fall_nits: 200.0,
-    }),
-};
+let mut params = ParametricDescription::named("st2084_pq", "bt2020");
+params.mastering = Some(Mastering {
+    luminance_nits: Some((0.0005, 400.0)),
+    max_cll_nits: Some(400.0),
+    max_fall_nits: Some(200.0),
+    ..Default::default()
+});
+let desc = DescriptionRequest::parametric(params);
 let mut hdr = PatchSurface::open("DP-4", BufferFormat::Xbgr16161616f, Some(desc))?;
 hdr.set_code_values([0.5081, 0.5081, 0.5081])?; // PQ code ≈ 100 cd/m²
 # Ok::<(), tristim_display::Error>(())
@@ -39,12 +38,28 @@ compositor's advertised capabilities so the caller can record the facts.
 
 - **Patch surface** — fullscreen layer-shell surface in the `Overlay` layer
   on a named output, `exclusive_zone = -1` (doesn't reflow the desktop), no
-  keyboard grab. 8-bit (`Xrgb8888`) or fp16 (`Xbgr16161616f`) buffers.
-- **Color management** — parametric `wp_color_management_v1` image
-  descriptions: named transfer function + primaries, optional luminances and
-  mastering metadata. Negotiation outcome is exposed as
-  `Pending / Ready / Failed`, and `query_capabilities()` /
-  `color_capabilities()` report what the compositor supports.
+  keyboard grab.
+- **Every RGB `wl_shm` buffer format** — 48 formats from `rgb332` through
+  the 4444/1555/565 families, 8-bit, 10-bit packed, 16-bit unorm, and fp16,
+  all driven by one table-based encoder (`BufferFormat::encode`). Float
+  formats carry extended-range values (negative / >1.0) verbatim, as scRGB
+  requires. YUV is deliberately excluded: writing it would mean color
+  conversion, i.e. interpreting the code values, which this crate refuses
+  to do.
+- **The full parametric `wp_color_management_v1` surface** — all 14 named
+  transfer functions (incl. `ext_linear` and v2's `compound_power_2_4`) and
+  all 10 named primaries, power-law TFs (`set_tf_power`), custom CIE-xy
+  primaries (`set_primaries`), luminances, ST 2086 mastering metadata
+  (luminance, display primaries, max CLL/FALL), render-intent selection,
+  and the `windows_scrgb` description shortcut. Negotiation outcome is
+  exposed as `Pending / Ready / Failed`.
+- **Capability gating everywhere** — optional protocol requests are fatal
+  protocol errors when the compositor didn't advertise the feature, so
+  `open()` checks the advertised features/TFs/primaries/intents first and
+  returns a typed `AttachError` instead of dying. `query_capabilities()`
+  reports advertised buffer formats and color capabilities up front;
+  `first_supported(&[...])` picks the best advertised buffer format from a
+  preference list.
 - **Windowed patches** — `set_window_fraction(0.04)` paints a centered
   bright window on black, for OLED/ABL-limited peak measurement at
   industry-spec window sizes (the surface stays fullscreen so the desktop
@@ -57,21 +72,19 @@ compositor's advertised capabilities so the caller can record the facts.
 
 ### Supported description parameters
 
-| Transfer functions | Primaries |
+| | Named values |
 |---|---|
-| `bt1886`, `gamma22`, `gamma28`, `srgb`, `ext_srgb`, `st2084_pq`, `hlg` | `srgb`, `pal`, `ntsc`, `bt2020`, `dci_p3`, `display_p3`, `adobe_rgb` |
+| Transfer functions | `bt1886`, `gamma22`, `gamma28`, `st240`, `ext_linear`, `log_100`, `log_316`, `xvycc`, `srgb`, `ext_srgb`, `st2084_pq`, `st428`, `hlg`, `compound_power_2_4` — or a power-law exponent (1.0–10.0) |
+| Primaries | `srgb`, `pal_m`, `pal`, `ntsc`, `generic_film`, `bt2020`, `cie1931_xyz`, `dci_p3`, `display_p3`, `adobe_rgb` — or custom CIE-xy coordinates |
+| Render intents | `perceptual` (baseline), `relative`, `saturation`, `absolute`, `relative_bpc`, `absolute_no_adaptation` |
 
 Names are the protocol's own enum entries. The `pq` module provides
 `nits_to_pq` for computing PQ code values from target luminance.
 
 ## Current limitations (roadmap)
 
-- **Parametric descriptions only** — ICC file/blob descriptions
-  (`icc_file` / `icc_blob`) are not yet supported.
-- **Render intent is fixed to `perceptual`** — intent selection
-  (photo/movie/graphic) is planned as a `DescriptionRequest` field.
-- Custom (non-named) primaries/transfer characteristics are not yet
-  exposed.
+- **ICC descriptions** — file/blob descriptions (`icc_file` / `icc_blob`)
+  are not yet supported; the parametric path and `windows_scrgb` are.
 
 ## Requirements
 

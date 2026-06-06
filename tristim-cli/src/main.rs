@@ -147,6 +147,9 @@ fn print_usage() {
     eprintln!("          srgb-p3                        8-bit, sRGB TF + Display-P3 primaries");
     eprintln!("          pq-bt2020[:peak=,maxcll=,maxfall=,min=]   fp16, PQ + BT.2020");
     eprintln!("          pq-p3[:...]                    fp16, PQ + Display-P3");
+    eprintln!("          scrgb                          fp16, Windows-scRGB (1.0 = 80 cd/m²)");
+    eprintln!("        every spec also takes buf=<wl_shm name> to override the buffer");
+    eprintln!("        format (e.g. srgb:buf=xrgb2101010, pq-bt2020:buf=xbgr16161616).");
     eprintln!("        mastering params are in cd/m² (peak default 400).");
     eprintln!();
     eprintln!("        --seq SPEC:");
