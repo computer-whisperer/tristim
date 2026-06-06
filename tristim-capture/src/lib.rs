@@ -28,10 +28,14 @@ use thiserror::Error;
 ///
 /// v2 added the optional [`Capture::compositor`] section. v3 added the optional
 /// per-trial [`FormatTrial::gamut`] section. v4 added [`Sample::source`] /
-/// [`Sample::repeats`] (gamut-probe vertices folded in as samples). All are
+/// [`Sample::repeats`] (gamut-probe vertices folded in as samples). v5 made
+/// [`Measured::raw`] variable-length (omitted when the device exposes no raw
+/// counts, instead of fabricating zeros) and added [`DeviceInfo::calibration`],
+/// [`ColorDescription::render_intent`], [`Sample::adaptive_tier`] /
+/// [`Sample::elapsed_ms`], and the [`Capture::run`] block. All are
 /// `#[serde(default)]`, so older captures still load (with the section/field
 /// absent or at its default) and `load` does no version gate.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -60,6 +64,11 @@ pub struct Capture {
     /// (best-effort; added in schema v2). Empty for v1 captures.
     #[serde(default)]
     pub compositor: CompositorInfo,
+    /// How the run was conducted (added in schema v5): the run-level
+    /// configuration facts not already recorded per sample — enough to
+    /// reproduce the run exactly. `None` in pre-v5 captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunInfo>,
     /// One entry per color format / description we put under test.
     pub trials: Vec<FormatTrial>,
 }
@@ -85,6 +94,32 @@ pub struct DeviceInfo {
     pub hw_version: (u32, u32),
     /// Calibration index downloaded from the device and used for raw→XYZ.
     pub cal_index: u8,
+    /// The conversion behind `cal_index` (added in schema v5): with
+    /// [`Measured::raw`], lets every XYZ value be recomputed and audited
+    /// offline. `None` in pre-v5 captures or when the device doesn't expose
+    /// its conversion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<CalibrationInfo>,
+}
+
+/// How the device mapped raw channel readings to CIE XYZ during this capture:
+/// `xyz = matrix · max(raw − black_floor, 0)`, then `xyz[i] = xyz[i] ·
+/// gain[i] + offset[i]`. The channel count `N` (= `black_floor.len()` = each
+/// matrix row's length) and the channel units are device-specific: 6 sensor
+/// counts on the Spyder X2/2024, 3 on the original SpyderX (IR excluded), 3
+/// internal frequencies in Hz on the i1d3 family (which exposes no raw
+/// counts — there the block documents the conversion without making samples
+/// recomputable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationInfo {
+    /// Per-channel floor subtracted from raw readings before the matrix.
+    pub black_floor: Vec<f64>,
+    /// 3×N matrix taking floor-subtracted channels to (pre-gain) XYZ.
+    pub matrix: [Vec<f64>; 3],
+    /// Per-row gain applied after the matrix (`[1, 1, 1]` when none).
+    pub gain: [f64; 3],
+    /// Per-row offset added last (`[0, 0, 0]` when none).
+    pub offset: [f64; 3],
 }
 
 /// The output (display) the patches were shown on.
@@ -153,6 +188,53 @@ pub struct CompositorInfo {
 pub struct GlobalInfo {
     pub interface: String,
     pub version: u32,
+}
+
+/// Run-level configuration facts (added in schema v5). Together with the
+/// per-sample [`SampleContext`] (settle / window / border) and the trials'
+/// formats, this is the full recipe to reproduce the run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunInfo {
+    /// Puck-placement countdown before the first measurement, in ms.
+    pub prep_ms: u64,
+    /// Adaptive fast-tier integration time (ms) applied to every measurement
+    /// of the run, or `None` when everything was measured at the calibration
+    /// default. Which tier actually produced each sample is recorded on
+    /// [`Sample::adaptive_tier`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_integration_ms: Option<u16>,
+    /// Scatter-sample generation parameters, when scatter was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scatter: Option<ScatterInfo>,
+    /// Gamut-probe parameters, when each format's gamut was probed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gamut_probe: Option<GamutProbeInfo>,
+}
+
+/// How a run's scatter samples were drawn: `count` uniform points from the
+/// deterministic stream seeded with `seed` (constrained to the measured gamut
+/// when one was probed).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScatterInfo {
+    pub count: u32,
+    pub seed: u64,
+}
+
+/// The measurement depth and refinement thresholds of a run's gamut probes
+/// (the probes' results live on each trial's [`FormatTrial::gamut`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GamutProbeInfo {
+    /// Repeated measurements per probe point.
+    pub repeats: u32,
+    /// Maximum subdivision depth per cube face.
+    pub max_depth: u32,
+    /// Stop subdividing once the patch center is within this ΔE of the
+    /// bilinear average of its corners.
+    pub flat_eps: f64,
+    /// Corner spread (ΔE) below which a patch counts as collapsed/clamped…
+    pub fold_eps: f64,
+    /// …provided it still spans at least this much code-value side length.
+    pub fold_min_side: f64,
 }
 
 /// One color format put under test: the description we asked for, whether the
@@ -227,6 +309,11 @@ pub struct GamutPatch {
 pub struct ColorDescription {
     /// Transfer function name, e.g. `"srgb"`, `"st2084_pq"`, `"gamma22"`.
     pub transfer_function: String,
+    /// Render intent the description was attached with, by the protocol's
+    /// `render_intent` enum name (added in schema v5; omitted — and assumed —
+    /// when `"perceptual"`, the protocol's mandatory baseline).
+    #[serde(default = "perceptual", skip_serializing_if = "is_perceptual")]
+    pub render_intent: String,
     /// Primaries name, e.g. `"srgb"`, `"bt2020"`, `"dci_p3"`.
     pub primaries: String,
     /// Reference white luminance in cd/m², if set.
@@ -292,6 +379,14 @@ fn is_one(n: &u32) -> bool {
     *n == 1
 }
 
+fn perceptual() -> String {
+    "perceptual".to_string()
+}
+
+fn is_perceptual(s: &str) -> bool {
+    s == "perceptual"
+}
+
 /// One measured patch: what we sent, what came back, under what conditions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
@@ -313,13 +408,46 @@ pub struct Sample {
     /// samples (whose `measured.raw` is the rounded per-channel mean).
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub repeats: u32,
+    /// Which adaptive tier produced this sample, recorded only when the run
+    /// used adaptive integration ([`RunInfo::fast_integration_ms`]). Added in
+    /// schema v5; `None` in older captures or non-adaptive runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_tier: Option<AdaptiveTier>,
+    /// Milliseconds elapsed since the run's measurement phase began — the
+    /// prep countdown excluded (added in schema v5; `None` in older
+    /// captures). Lets warm-up / ABL drift over a long run be correlated
+    /// with measurement order and wall time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+/// Which tier of the driver's adaptive measurement produced a sample (see
+/// [`RunInfo::fast_integration_ms`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveTier {
+    /// The fast short-integration reading passed the trust check and is what
+    /// the sample records.
+    Fast,
+    /// The fast reading was untrustworthy; the sample records the
+    /// default-integration re-measurement that followed.
+    EscalatedFull,
+    /// The fast tier was unavailable (device has no integration override);
+    /// a single default-integration reading.
+    SingleFull,
 }
 
 /// A colorimeter reading.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Measured {
-    /// The 6 raw sensor channel counts, before raw→XYZ conversion.
-    pub raw: [u16; 6],
+    /// Raw sensor channel counts before raw→XYZ conversion, when the device
+    /// exposes them. Channel count is device-specific (6 on the Spyder
+    /// X2/2024, 3 on the original SpyderX); empty for XYZ-only devices like
+    /// the i1d3 family. Until schema v5 this was a fixed 6-wide array with
+    /// zeros standing in for missing channels — pre-v5 captures from
+    /// raw-less devices read as 6 zeros, not as absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw: Vec<u16>,
     /// CIE 1931 XYZ. `Y` is luminance in cd/m².
     pub xyz: [f64; 3],
     /// CIE 1931 xy chromaticity. `None` for pure black (undefined).
@@ -383,6 +511,16 @@ mod tests {
                 serial: "87000216".to_string(),
                 hw_version: (6, 0),
                 cal_index: 0,
+                calibration: Some(CalibrationInfo {
+                    black_floor: vec![6.0; 6],
+                    matrix: [
+                        vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                        vec![0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+                        vec![0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+                    ],
+                    gain: [1.0, 1.0, 1.0],
+                    offset: [0.0, 0.0, 0.0],
+                }),
             },
             output: OutputInfo {
                 name: "DP-4".to_string(),
@@ -415,9 +553,25 @@ mod tests {
                     },
                 ],
             },
+            run: Some(RunInfo {
+                prep_ms: 6000,
+                fast_integration_ms: Some(100),
+                scatter: Some(ScatterInfo {
+                    count: 24,
+                    seed: 0xC0FFEE,
+                }),
+                gamut_probe: Some(GamutProbeInfo {
+                    repeats: 4,
+                    max_depth: 3,
+                    flat_eps: 2.0,
+                    fold_eps: 1.0,
+                    fold_min_side: 0.125,
+                }),
+            }),
             trials: vec![FormatTrial {
                 requested: Some(ColorDescription {
                     transfer_function: "st2084_pq".to_string(),
+                    render_intent: "perceptual".to_string(),
                     primaries: "bt2020".to_string(),
                     reference_white_nits: Some(203.0),
                     mastering: Some(Mastering {
@@ -433,7 +587,7 @@ mod tests {
                 samples: vec![Sample {
                     requested: [0.5081, 0.0, 0.0],
                     measured: Measured {
-                        raw: [100, 2, 3, 4, 5, 6],
+                        raw: vec![100, 2, 3, 4, 5, 6],
                         xyz: [41.2, 21.3, 1.9],
                         xy: Some([0.64, 0.33]),
                     },
@@ -444,6 +598,8 @@ mod tests {
                     },
                     source: SampleSource::Sweep,
                     repeats: 1,
+                    adaptive_tier: Some(AdaptiveTier::Fast),
+                    elapsed_ms: Some(12_345),
                 }],
             }],
         }
@@ -464,6 +620,7 @@ mod tests {
         capture.trials.push(FormatTrial {
             requested: Some(ColorDescription {
                 transfer_function: "srgb".to_string(),
+                render_intent: "perceptual".to_string(),
                 primaries: "dci_p3".to_string(),
                 reference_white_nits: None,
                 mastering: None,
@@ -544,6 +701,9 @@ mod tests {
     #[test]
     fn sample_source_round_trips_and_omits_default() {
         let mut capture = sample_capture();
+        // Drop the run block: its `gamut_probe.repeats` field would trip the
+        // sample-level "repeats absent" assertion below.
+        capture.run = None;
         // The fixture sample is a sweep sample: both fields should be absent.
         let json = capture.to_json_pretty().expect("serialize");
         assert!(!json.contains("\"source\""));
@@ -553,7 +713,7 @@ mod tests {
         capture.trials[0].samples.push(Sample {
             requested: [1.0, 0.0, 0.0],
             measured: Measured {
-                raw: [120, 4, 5, 6, 7, 8],
+                raw: vec![120, 4, 5, 6, 7, 8],
                 xyz: [44.0, 22.0, 2.0],
                 xy: Some([0.64, 0.33]),
             },
@@ -564,6 +724,8 @@ mod tests {
             },
             source: SampleSource::GamutProbe,
             repeats: 8,
+            adaptive_tier: None,
+            elapsed_ms: None,
         });
         let json = capture.to_json_pretty().expect("serialize");
         assert!(json.contains("\"gamut_probe\""));
@@ -585,6 +747,39 @@ mod tests {
         let s = back.trials[0].samples.last().unwrap();
         assert_eq!(s.source, SampleSource::Sweep);
         assert_eq!(s.repeats, 1);
+    }
+
+    /// A pre-v5 capture loads with every v5 addition at its default: fixed
+    /// 6-wide `raw` arrays parse into the variable-length field, and the new
+    /// sections/fields come back absent.
+    #[test]
+    fn v4_capture_loads_with_v5_defaults() {
+        let mut capture = sample_capture();
+        capture.schema_version = 4;
+        capture.run = None;
+        capture.device.calibration = None;
+        capture.trials[0].samples[0].adaptive_tier = None;
+        capture.trials[0].samples[0].elapsed_ms = None;
+        let mut v: serde_json::Value =
+            serde_json::from_str(&capture.to_json_pretty().unwrap()).unwrap();
+        // v4 writers always emitted a 6-wide raw array and never the v5 keys.
+        v["trials"][0]["samples"][0]["measured"]["raw"] = serde_json::json!([100, 2, 3, 4, 5, 6]);
+        v["trials"][0]["requested"]
+            .as_object_mut()
+            .unwrap()
+            .remove("render_intent");
+        let back = Capture::from_json(&v.to_string()).expect("v4 capture loads");
+        assert_eq!(back.schema_version, 4);
+        assert!(back.run.is_none());
+        assert!(back.device.calibration.is_none());
+        let s = &back.trials[0].samples[0];
+        assert_eq!(s.measured.raw, vec![100, 2, 3, 4, 5, 6]);
+        assert!(s.adaptive_tier.is_none());
+        assert!(s.elapsed_ms.is_none());
+        assert_eq!(
+            back.trials[0].requested.as_ref().unwrap().render_intent,
+            "perceptual"
+        );
     }
 
     /// A v1 capture (no `compositor` section) still loads — the field is

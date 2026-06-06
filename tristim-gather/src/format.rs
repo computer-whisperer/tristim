@@ -65,6 +65,7 @@ impl FormatSpec {
         Some(match &d.kind {
             DescriptionKind::Parametric(p) => cap::ColorDescription {
                 transfer_function: p.transfer_function.label(),
+                render_intent: d.render_intent.clone(),
                 primaries: p.primaries.label().to_string(),
                 reference_white_nits: p.luminances.map(|l| l.reference_nits),
                 // The capture's mastering record wants the full ST 2086
@@ -84,6 +85,7 @@ impl FormatSpec {
             // linear TF, R=G=B=1.0 ≡ 80 cd/m² (BT.2100/PQ system).
             DescriptionKind::WindowsScrgb => cap::ColorDescription {
                 transfer_function: "ext_linear".to_string(),
+                render_intent: d.render_intent.clone(),
                 primaries: "srgb".to_string(),
                 reference_white_nits: Some(80.0),
                 mastering: None,

@@ -96,6 +96,29 @@ pub struct DeviceInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CalibrationId(pub u8);
 
+/// How a device maps raw channel readings to CIE XYZ at its active
+/// calibration: `xyz = matrix · max(raw − black_floor, 0)`, then
+/// `xyz[i] = xyz[i] · gain[i] + offset[i]`.
+///
+/// The channel count `N` (= `black_floor.len()` = each matrix row's length)
+/// and the channel units are device-specific: 6 sensor counts on the Spyder
+/// X2/2024, 3 on the original SpyderX (IR excluded, matching
+/// [`RawRepeats`](crate::sample::RawRepeats)), 3 internal frequencies in Hz
+/// on the i1d3 family (which exposes no raw counts — its conversion is
+/// reported for provenance, not recomputation). Capture tooling records this
+/// so stored raw counts can be re-converted and audited offline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawConversion {
+    /// Per-channel floor subtracted from raw readings before the matrix.
+    pub black_floor: Vec<f64>,
+    /// 3×N matrix taking floor-subtracted channels to (pre-gain) XYZ.
+    pub matrix: [Vec<f64>; 3],
+    /// Per-row gain applied after the matrix (`[1, 1, 1]` when none).
+    pub gain: [f64; 3],
+    /// Per-row offset added last (`[0, 0, 0]` when none).
+    pub offset: [f64; 3],
+}
+
 /// Which adaptive tier produced an [`AdaptiveMeasurement`] — for telemetry and
 /// event reporting.
 ///
@@ -174,6 +197,12 @@ pub trait Colorimeter {
     /// Raw-counts diagnostics, when supported. `None` for devices that only
     /// expose XYZ. See [`RawDiagnostics`].
     fn raw_diagnostics(&mut self) -> Option<&mut dyn RawDiagnostics> {
+        None
+    }
+
+    /// The raw→XYZ conversion behind the active calibration, when the device
+    /// exposes it. See [`RawConversion`]; the default reports nothing.
+    fn raw_conversion(&self) -> Option<RawConversion> {
         None
     }
 }

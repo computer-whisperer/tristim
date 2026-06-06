@@ -37,7 +37,7 @@ pub mod eeprom;
 pub mod observer;
 pub mod unlock;
 
-use crate::colorimeter::{CalibrationId, Colorimeter, DeviceInfo, Error, Result};
+use crate::colorimeter::{CalibrationId, Colorimeter, DeviceInfo, Error, RawConversion, Result};
 use crate::sample::{Sample, Xyz};
 use rusb::{Context, DeviceHandle, UsbContext};
 use std::time::Duration;
@@ -635,6 +635,20 @@ impl Colorimeter for I1d3 {
     // internally adaptive (frequency/period selection per channel); the
     // X2-style fixed-fast-exposure tier doesn't map onto this engine.
     // raw_diagnostics: None — no fixed-exposure integer-count mode.
+
+    fn raw_conversion(&self) -> Option<RawConversion> {
+        // Provenance, not recomputation: this instrument reports no raw
+        // counts (`Sample::raw` is `None`), but the EEPROM-derived conversion
+        // is still worth recording. Channels are the three internal sensor
+        // frequencies in Hz; `black_hz` is subtracted before the matrix
+        // (mirroring `finish_rgb` + `take_xyz`).
+        Some(RawConversion {
+            black_floor: self.black_hz.to_vec(),
+            matrix: std::array::from_fn(|i| self.matrix[i].to_vec()),
+            gain: [1.0; 3],
+            offset: [0.0; 3],
+        })
+    }
 }
 
 /// Parse `(major, minor)` out of a firmware string like `"v1.3"` — best

@@ -24,7 +24,7 @@ pub mod spyder;
 
 pub use colorimeter::{
     AdaptiveMeasurement, AdaptiveTier, CalibrationId, Colorimeter, DeviceInfo, Error,
-    RawDiagnostics, ResetDiscipline, Result, open_any,
+    RawConversion, RawDiagnostics, ResetDiscipline, Result, open_any,
 };
 pub use confidence::{MeasurementConfidence, RawStats, TrustFlag};
 pub use i1d3::I1d3;

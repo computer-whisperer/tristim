@@ -369,6 +369,7 @@ fn live_capture(trials: Vec<cap::FormatTrial>) -> Capture {
             serial: String::new(),
             hw_version: (0, 0),
             cal_index: 0,
+            calibration: None,
         },
         output: cap::OutputInfo {
             name: String::new(),
@@ -379,6 +380,7 @@ fn live_capture(trials: Vec<cap::FormatTrial>) -> Capture {
         },
         capabilities: cap::Capabilities::default(),
         compositor: cap::CompositorInfo::default(),
+        run: None,
         trials,
     }
 }
@@ -2004,7 +2006,7 @@ mod tests {
         cap::Sample {
             requested: [0.5, 0.5, 0.5],
             measured: cap::Measured {
-                raw: [0u16; 6],
+                raw: Vec::new(),
                 xyz: [0.31 * y, y, 0.34 * y],
                 xy: Some([0.31, 0.33]),
             },
@@ -2015,6 +2017,8 @@ mod tests {
             },
             source: cap::SampleSource::Sweep,
             repeats: 1,
+            adaptive_tier: None,
+            elapsed_ms: None,
         }
     }
 
@@ -2060,6 +2064,7 @@ mod tests {
             pixel_format: "xrgb8888".into(),
             requested: Some(cap::ColorDescription {
                 transfer_function: "srgb".into(),
+                render_intent: "perceptual".into(),
                 primaries: "srgb".into(),
                 reference_white_nits: None,
                 mastering: None,

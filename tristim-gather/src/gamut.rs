@@ -773,6 +773,7 @@ mod tests {
     fn desc(transfer: &str, primaries: &str) -> cap::ColorDescription {
         cap::ColorDescription {
             transfer_function: transfer.into(),
+            render_intent: "perceptual".into(),
             primaries: primaries.into(),
             reference_white_nits: None,
             mastering: None,

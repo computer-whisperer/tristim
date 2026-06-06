@@ -37,20 +37,43 @@ use tristim_capture as cap;
 use tristim_display::{self as display, DescriptionState, PatchSurface, list_outputs};
 use tristim_driver::{CalibrationId, MeasurementConfidence};
 
-/// First-repeat raw sensor counts as the capture file's fixed 6-channel array,
-/// or zeros when the device exposes no raw counts. The capture contract records
-/// 6-channel Spyder counts; a future XYZ-only device stores zeros here (a known
-/// limitation of the current capture format, not of the driver layer).
-fn raw_counts(sample: &tristim_driver::Sample) -> [u16; 6] {
+/// First-repeat raw sensor counts for the capture file: exactly the channels
+/// the device reported, or empty when it exposes none (schema v5 records
+/// absence as absence — no zero-padding).
+fn raw_counts(sample: &tristim_driver::Sample) -> Vec<u16> {
     match &sample.raw {
-        Some(rr) if !rr.counts.is_empty() => std::array::from_fn(|ch| {
-            rr.counts[0]
-                .get(ch)
-                .copied()
-                .unwrap_or(0)
-                .min(u16::MAX as u32) as u16
-        }),
-        _ => [0; 6],
+        Some(rr) if !rr.counts.is_empty() => rr.counts[0]
+            .iter()
+            .map(|&c| c.min(u16::MAX as u32) as u16)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The capture-schema tag for the adaptive tier that produced a measurement.
+/// `None` (omitted from the file) when the run didn't use adaptive
+/// integration — the tier is only meaningful relative to
+/// [`RunInfo::fast_integration_ms`](cap::RunInfo::fast_integration_ms).
+fn tier_tag(tier: tristim_driver::AdaptiveTier, adaptive: bool) -> Option<cap::AdaptiveTier> {
+    if !adaptive {
+        return None;
+    }
+    Some(match tier {
+        tristim_driver::AdaptiveTier::Fast => cap::AdaptiveTier::Fast,
+        tristim_driver::AdaptiveTier::EscalatedFull => cap::AdaptiveTier::EscalatedFull,
+        // `AdaptiveTier` is non-exhaustive; unknown future tiers read as a
+        // plain full measurement.
+        _ => cap::AdaptiveTier::SingleFull,
+    })
+}
+
+/// The capture-schema record of a device's raw→XYZ conversion.
+fn to_cap_calibration(c: tristim_driver::RawConversion) -> cap::CalibrationInfo {
+    cap::CalibrationInfo {
+        black_floor: c.black_floor,
+        matrix: c.matrix,
+        gain: c.gain,
+        offset: c.offset,
     }
 }
 
@@ -189,6 +212,9 @@ pub fn run_capture(
     let mut device = tristim_driver::open_any()?;
     device.select_calibration(CalibrationId(config.cal_index))?;
     let info = device.info().clone();
+    // The conversion behind the selected calibration, recorded so stored raw
+    // counts can be re-converted and audited offline.
+    let calibration = device.raw_conversion().map(to_cap_calibration);
     on_event(GatherEvent::DeviceReady {
         product: info.model.clone(),
         serial: info.serial.clone(),
@@ -237,6 +263,9 @@ pub fn run_capture(
     let settle_ms = config.settle.as_millis() as u64;
     let format_count = config.formats.len();
     let mut trials = Vec::new();
+    // Sample timestamps (`elapsed_ms`) count from here — the start of the
+    // measurement phase, prep countdown excluded.
+    let run_start = std::time::Instant::now();
 
     for (fi, fs) in config.formats.iter().enumerate() {
         if should_cancel() {
@@ -338,16 +367,18 @@ pub fn run_capture(
                         let result =
                             device.measure_adaptive(opts.repeats, config.fast_integration_ms)?;
                         let conf = MeasurementConfidence::from_sample(&result.sample);
-                        let rs = conf
-                            .raw
-                            .as_ref()
-                            .expect("raw stats present on the Spyder path");
                         let xyz = conf.mean;
                         let sample = cap::Sample {
                             requested: cv,
                             measured: cap::Measured {
-                                raw: std::array::from_fn(|ch| {
-                                    rs.raw_mean[ch].round().clamp(0.0, u16::MAX as f64) as u16
+                                // Repeat-averaged per-channel means when the
+                                // device reports raw counts; empty for
+                                // XYZ-only devices (e.g. the i1d3).
+                                raw: conf.raw.as_ref().map_or_else(Vec::new, |rs| {
+                                    rs.raw_mean
+                                        .iter()
+                                        .map(|m| m.round().clamp(0.0, u16::MAX as f64) as u16)
+                                        .collect()
                                 }),
                                 xyz: [xyz.x, xyz.y, xyz.z],
                                 xy: xyz.chromaticity().map(|(x, y)| [x, y]),
@@ -359,6 +390,11 @@ pub fn run_capture(
                             },
                             source: cap::SampleSource::GamutProbe,
                             repeats: conf.n as u32,
+                            adaptive_tier: tier_tag(
+                                result.tier,
+                                config.fast_integration_ms.is_some(),
+                            ),
+                            elapsed_ms: Some(run_start.elapsed().as_millis() as u64),
                         };
                         // Stream it for the live view, then keep it for the file.
                         on_event(GatherEvent::ProbeSample {
@@ -410,9 +446,8 @@ pub fn run_capture(
                 // quantization/floor trust analysis (it needs counts, not
                 // repeat scatter), so a dim patch read at the fast tier
                 // escalates to the calibration default instead of being kept.
-                let measured = device
-                    .measure_adaptive(1, config.fast_integration_ms)?
-                    .sample;
+                let result = device.measure_adaptive(1, config.fast_integration_ms)?;
+                let measured = result.sample;
                 let xyz = measured.xyz[0];
                 let raw = raw_counts(&measured);
                 let xy = xyz.chromaticity().map(|(x, y)| [x, y]);
@@ -430,6 +465,8 @@ pub fn run_capture(
                     },
                     source: cap::SampleSource::Sweep,
                     repeats: 1,
+                    adaptive_tier: tier_tag(result.tier, config.fast_integration_ms.is_some()),
+                    elapsed_ms: Some(run_start.elapsed().as_millis() as u64),
                 };
                 on_event(GatherEvent::Sample {
                     format_index: fi,
@@ -471,6 +508,7 @@ pub fn run_capture(
             serial: info.serial,
             hw_version: info.firmware,
             cal_index: config.cal_index,
+            calibration,
         },
         output: cap::OutputInfo {
             name: config.output.clone(),
@@ -497,6 +535,21 @@ pub fn run_capture(
         },
         capabilities,
         compositor,
+        run: Some(cap::RunInfo {
+            prep_ms: config.prep.as_millis() as u64,
+            fast_integration_ms: config.fast_integration_ms,
+            scatter: config.scatter.as_ref().map(|s| cap::ScatterInfo {
+                count: s.count as u32,
+                seed: s.seed,
+            }),
+            gamut_probe: config.gamut.as_ref().map(|g| cap::GamutProbeInfo {
+                repeats: g.repeats as u32,
+                max_depth: g.refine.max_depth,
+                flat_eps: g.refine.flat_eps,
+                fold_eps: g.refine.fold_eps,
+                fold_min_side: g.refine.fold_min_side,
+            }),
+        }),
         trials,
     })
 }

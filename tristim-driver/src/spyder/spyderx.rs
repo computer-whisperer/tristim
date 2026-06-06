@@ -30,7 +30,7 @@
 //! a small uncorrected residual; bright-patch accuracy is unaffected.
 
 use super::transport::{self, pid};
-use crate::colorimeter::{CalibrationId, Colorimeter, DeviceInfo, Error, Result};
+use crate::colorimeter::{CalibrationId, Colorimeter, DeviceInfo, Error, RawConversion, Result};
 use crate::sample::{RawRepeats, Sample, Xyz};
 use rusb::{Context, DeviceHandle};
 use std::time::Duration;
@@ -486,6 +486,20 @@ impl Colorimeter for SpyderX {
     // rides on a hardware-characterized integration override; the SpyderX
     // equivalent (scaling the matrix by v2 ratio) is plausible but unverified,
     // so this port doesn't offer it. Same reasoning for raw_diagnostics.
+
+    fn raw_conversion(&self) -> Option<RawConversion> {
+        // Mirrors `raw_to_xyz` over the 3 XYZ channels (IR excluded, matching
+        // the raw counts this driver reports): subtract the `s3` black plus
+        // the session dark offset, then apply the 3×3 matrix.
+        Some(RawConversion {
+            black_floor: (0..3)
+                .map(|i| self.setup.s3[i] as f64 + self.dark[i])
+                .collect(),
+            matrix: std::array::from_fn(|i| self.cal.matrix[i].to_vec()),
+            gain: [1.0; 3],
+            offset: [0.0; 3],
+        })
+    }
 }
 
 fn ascii_digits(bytes: &[u8]) -> Option<u32> {

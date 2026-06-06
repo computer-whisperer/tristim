@@ -20,7 +20,7 @@ pub mod transport;
 
 use crate::colorimeter::{
     AdaptiveMeasurement, AdaptiveTier, CalibrationId, Colorimeter, DeviceInfo, Error,
-    RawDiagnostics, ResetDiscipline, Result,
+    RawConversion, RawDiagnostics, ResetDiscipline, Result,
 };
 use crate::confidence::MeasurementConfidence;
 use crate::sample::{RawRepeats, Sample};
@@ -388,6 +388,18 @@ impl Colorimeter for Spyder {
 
     fn raw_diagnostics(&mut self) -> Option<&mut dyn RawDiagnostics> {
         Some(self)
+    }
+
+    fn raw_conversion(&self) -> Option<RawConversion> {
+        // Mirrors `measurement::raw_to_xyz`: subtract the `s5` floor from the
+        // 6 sensor counts, apply the active cal's 3×6 matrix, then the
+        // per-row gain and offset.
+        Some(RawConversion {
+            black_floor: self.setup.s5.iter().map(|&v| v as f64).collect(),
+            matrix: std::array::from_fn(|i| self.cal.matrix[i].to_vec()),
+            gain: self.cal.gain,
+            offset: self.cal.offset,
+        })
     }
 }
 

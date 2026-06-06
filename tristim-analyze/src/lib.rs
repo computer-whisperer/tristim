@@ -363,6 +363,7 @@ mod tests {
                 serial: "x".into(),
                 hw_version: (0, 0),
                 cal_index: 0,
+                calibration: None,
             },
             output: tristim_capture::OutputInfo {
                 name: "x".into(),
@@ -373,6 +374,7 @@ mod tests {
             },
             capabilities: Default::default(),
             compositor: Default::default(),
+            run: None,
             trials: vec![trial],
         }
     }
@@ -382,7 +384,7 @@ mod tests {
         Sample {
             requested,
             measured: Measured {
-                raw: [0; 6],
+                raw: Vec::new(),
                 xyz,
                 xy,
             },
@@ -393,6 +395,8 @@ mod tests {
             },
             source: SampleSource::Sweep,
             repeats: 1,
+            adaptive_tier: None,
+            elapsed_ms: None,
         }
     }
 
@@ -456,6 +460,7 @@ mod tests {
         let trial = FormatTrial {
             requested: Some(ColorDescription {
                 transfer_function: "srgb".into(),
+                render_intent: "perceptual".into(),
                 primaries: "srgb".into(),
                 reference_white_nits: None,
                 mastering: None,
@@ -478,6 +483,7 @@ mod tests {
         let trial = FormatTrial {
             requested: Some(ColorDescription {
                 transfer_function: "st2084_pq".into(),
+                render_intent: "perceptual".into(),
                 primaries: "bt2020".into(),
                 reference_white_nits: None,
                 mastering: None,
@@ -508,6 +514,7 @@ mod tests {
         let trial = FormatTrial {
             requested: Some(ColorDescription {
                 transfer_function: "st2084_pq".into(),
+                render_intent: "perceptual".into(),
                 primaries: "bt2020".into(),
                 reference_white_nits: None,
                 mastering: None,
