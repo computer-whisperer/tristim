@@ -490,11 +490,7 @@ impl CaptureForm {
         let mut iter = buttons.into_iter();
         while let Some(a) = iter.next() {
             let second = iter.next().unwrap_or_else(spacer);
-            items.push(
-                row([a, second])
-                    .gap(tokens::SPACE_2)
-                    .width(Size::Fill(1.0)),
-            );
+            items.push(row([a, second]).gap(tokens::SPACE_2).width(Size::Fill(1.0)));
         }
         if self.outputs.is_empty() {
             items.push(text("(no outputs found)").muted().font_size(12.0));

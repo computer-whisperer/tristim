@@ -1345,11 +1345,8 @@ fn content_layout(cx: &BuildCx, extra_chrome: f32, extra_control_rows: usize) ->
     let content_w = vw - 2.0 * ROOT_PAD - SIDEBAR_W - COL_GAP;
     // The header wraps its facts onto a second row on a narrow window.
     let header_wrap = if vw < HEADER_BREAK { 34.0 } else { 0.0 };
-    let v_budget = vh
-        - extra_chrome
-        - V_CHROME
-        - header_wrap
-        - extra_control_rows as f32 * CONTROL_ROW_H;
+    let v_budget =
+        vh - extra_chrome - V_CHROME - header_wrap - extra_control_rows as f32 * CONTROL_ROW_H;
     if content_w < PLOT_MIN + ROW_GAP + RIGHT_MIN {
         let plot = (v_budget - STACKED_STATS).min(content_w);
         ContentLayout {
