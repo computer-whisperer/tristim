@@ -2,9 +2,9 @@
 //!
 //! [`Colorimeter`] is the capability surface the rest of tristim talks to —
 //! capture orchestration never names a concrete device. The drivers
-//! ([`Spyder`](crate::spyder::Spyder), [`SpyderX`](crate::spyder::spyderx::SpyderX))
-//! implement it; [`open_any`] probes the bus and hands back a
-//! `Box<dyn Colorimeter>`.
+//! ([`Spyder`](crate::spyder::Spyder), [`SpyderX`](crate::spyder::spyderx::SpyderX),
+//! [`I1d3`](crate::i1d3::I1d3)) implement it; [`open_any`] probes the bus
+//! and hands back a `Box<dyn Colorimeter>`.
 //!
 //! The currency is [`Sample`] (absolute XYZ + optional raw counts) — see
 //! [`crate::sample`]. Device-specific calibration mechanics (matrices, channel
@@ -54,6 +54,21 @@ pub enum Error {
 
     #[error("calibration index {got} out of range (max {max})")]
     CalIndexOutOfRange { got: u8, max: u8 },
+
+    #[error("reply does not echo the command: sent 0x{sent:02x}, got 0x{got:02x}")]
+    CommandEchoMismatch { sent: u8, got: u8 },
+
+    #[error("instrument refused every known unlock key")]
+    UnlockFailed,
+
+    #[error("sensor saturated — light source too bright for this instrument")]
+    Saturated,
+
+    #[error("ambient diffuser is over the sensor — swing it aside for display measurement")]
+    DiffuserInPath,
+
+    #[error("per-unit calibration data is unusable (degenerate sensor spectra)")]
+    BadCalibration,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -198,6 +213,11 @@ pub fn open_any() -> Result<Box<dyn Colorimeter>> {
         Err(Error::NotFound(_)) => {}
         Err(e) => return Err(e),
     }
-    let spyderx = crate::spyder::spyderx::SpyderX::open_any()?;
-    Ok(Box::new(spyderx))
+    match crate::spyder::spyderx::SpyderX::open_any() {
+        Ok(spyderx) => return Ok(Box::new(spyderx)),
+        Err(Error::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    let i1d3 = crate::i1d3::I1d3::open_any()?;
+    Ok(Box::new(i1d3))
 }

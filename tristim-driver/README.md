@@ -1,9 +1,9 @@
 # tristim-driver
 
-A clean-room Rust driver for Datacolor Spyder-family colorimeters, behind a
-device-generic `Colorimeter` trait. No Wayland or display dependency — this
-crate talks USB and returns absolute CIE XYZ; what you point the puck at is
-your business.
+Clean-room Rust drivers for display colorimeters (Datacolor Spyder family,
+X-Rite i1Display Pro family), behind a device-generic `Colorimeter` trait.
+No Wayland or display dependency — this crate talks USB and returns absolute
+CIE XYZ; what you point the puck at is your business.
 
 ```rust,no_run
 use tristim_driver::{MeasurementConfidence, open_any};
@@ -26,24 +26,37 @@ fn main() -> tristim_driver::Result<()> {
 
 ## Hardware support
 
-| Product line     | USB ID      | Protocol | Status |
-|------------------|-------------|----------|--------|
-| Spyder 2024      | `085c:0a0b` | spydX2   | tested |
-| SpyderX2         | `085c:0a0a` | spydX2   | should work, untested |
-| Original SpyderX | `085c:0a00` | spydX    | **untested port** — same framing as spydX2, different opcodes; validation reports welcome |
+| Product line | USB ID | Protocol | Status |
+|---|---|---|---|
+| Spyder 2024 | `085c:0a0b` | spydX2 | tested |
+| SpyderX2 | `085c:0a0a` | spydX2 | should work, untested |
+| Original SpyderX | `085c:0a00` | spydX | **untested port** — same framing as spydX2, different opcodes |
+| i1Display Pro / ColorMunki Display | `0765:5020` | i1d3 | **untested port** — covers the OEM rebadges too (NEC SpectraSensor Pro, HP DreamColor, …) |
 
-Earlier Spyders (1–5) are not supported: the Spyder 2 needs a vendor
-firmware blob and the Spyder 4/5 need vendor spectral calibration data,
-neither of which this crate could redistribute.
+Untested ports were written from the documented wire formats without
+hardware on hand; validation reports are very welcome. `open_any()` prefers
+hardware-validated drivers over untested ports when several devices are
+plugged in.
+
+Not supported: earlier Spyders (1–5; the Spyder 2 needs a vendor firmware
+blob and the Spyder 4/5 need vendor spectral calibration data, neither
+redistributable) and spectrometers (a different instrument class).
 
 The wire protocols were reverse-engineered by Graeme Gill for ArgyllCMS
-(`spectro/spydX2.c`, `spectro/spydX.c`). This crate is a clean-room Rust
-re-implementation working from the documented wire format, not a code
-translation, and does not link ArgyllCMS.
+(`spectro/spydX2.c`, `spectro/spydX.c`, `spectro/i1d3.c`). This crate is a
+clean-room Rust re-implementation working from the documented wire formats,
+not a code translation, and does not link ArgyllCMS.
 
-The original SpyderX additionally supports a user-side dark calibration
-(lens cap on): `SpyderX::dark_calibrate()`. It is optional — without it,
-only readings very close to black carry a small uncorrected residual.
+Driver-specific notes:
+
+- **Original SpyderX** — supports an optional user-side dark calibration
+  (lens cap on): `SpyderX::dark_calibrate()`. Without it, only readings
+  very close to black carry a small uncorrected residual.
+- **i1d3 family** — XYZ comes from a 3×3 matrix computed from the per-unit
+  sensor spectral sensitivities in the instrument's EEPROM against the
+  CIE 1931 2° observer (ArgyllCMS's own default calibration). Display-type
+  spectral corrections (CCSS), ambient mode, refresh-synchronized
+  integration, and the Rev-B AIO mode are not ported yet.
 
 **Unofficial.** Not affiliated with, endorsed by, or sponsored by Datacolor.
 "Spyder", "SpyderX", "SpyderX2", and "Spyder 2024" are Datacolor's
@@ -76,8 +89,8 @@ trademarks, referenced only to identify supported hardware.
 
 ## Setup — udev rule
 
-Spyders are vendor-class USB devices that need explicit access for non-root
-users. Install a udev rule tagging them `uaccess` (see
+These instruments need explicit USB access for non-root users. Install a
+udev rule tagging them `uaccess` (see
 [`50-tristim.rules`](https://github.com/computer-whisperer/tristim/blob/main/50-tristim.rules)
 in the repository):
 

@@ -299,7 +299,7 @@ impl SpyderX {
     }
 
     /// Execute one command against the device. See
-    /// [`transport`](super::transport) for the wire format.
+    /// [`transport`] — see that module for the wire format.
     pub fn command(
         &mut self,
         opcode: Opcode,

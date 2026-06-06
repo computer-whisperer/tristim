@@ -1,6 +1,6 @@
 //! Device-agnostic measurement types.
 //!
-//! These are the currency between a [`Colorimeter`](crate::device::Colorimeter)
+//! These are the currency between a [`Colorimeter`](crate::colorimeter::Colorimeter)
 //! and everything above it (capture orchestration, confidence, analysis). They
 //! carry no device-specific calibration form — a [`Sample`] is *already* in
 //! absolute CIE XYZ, optionally accompanied by the raw sensor counts that
