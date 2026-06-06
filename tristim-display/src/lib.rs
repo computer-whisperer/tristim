@@ -316,13 +316,16 @@ impl PatchSurface {
             };
             let wl_surface = layer_surface.wl_surface().clone();
             let cm = ColorManagedSurface::attach(manager, &qh, &wl_surface, &req)?;
+            // Keep a handle to the negotiation state before `cm` moves into
+            // `state` — the dispatch loop below needs `&mut state`.
+            let desc_state = cm.state.clone();
             state.color_managed = Some(cm);
             // Flush + roundtrip to send create + set requests and
             // pick up ready/failed.
             event_queue.roundtrip(&mut state)?;
             let ready_deadline = Instant::now() + Duration::from_secs(1);
             loop {
-                let snapshot = state.color_managed.as_ref().unwrap().state();
+                let snapshot = desc_state.lock().unwrap().clone();
                 match snapshot {
                     DescriptionState::Ready { .. } => break,
                     DescriptionState::Failed { cause, message } => {

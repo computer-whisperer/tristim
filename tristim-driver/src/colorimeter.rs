@@ -79,7 +79,11 @@ pub struct CalibrationId(pub u8);
 
 /// Which adaptive tier produced an [`AdaptiveMeasurement`] — for telemetry and
 /// event reporting.
+///
+/// Non-exhaustive: future drivers may add tiers (treat unknown tiers as
+/// "measurement is valid, provenance unfamiliar").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AdaptiveTier {
     /// Adaptive disabled (or the requested fast exposure was unavailable): a
     /// single default-exposure burst was taken.
@@ -103,7 +107,10 @@ pub struct AdaptiveMeasurement {
 /// generalized). [`AutoZeroEach`](ResetDiscipline::AutoZeroEach) re-zeros the
 /// dark baseline before every reading; [`BurstOnce`](ResetDiscipline::BurstOnce)
 /// zeros once and reads back-to-back.
+///
+/// Non-exhaustive: future devices may expose other zeroing disciplines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResetDiscipline {
     AutoZeroEach,
     BurstOnce,

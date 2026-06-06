@@ -42,7 +42,11 @@ pub const DUV_PERCEPTIBLE: f64 = 0.003;
 
 /// A reason a reading is less than fully trustworthy. Thresholds are the
 /// `*_MIN` / `*_REL` / `*_PERCEPTIBLE` consts in this module.
+///
+/// Non-exhaustive: new confidence checks may add flags; treat unknown flags
+/// as "less trustworthy for a reason this build doesn't classify".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TrustFlag {
     /// A signal channel is near (or at) its black-cal floor — clamp bias.
     Floor,

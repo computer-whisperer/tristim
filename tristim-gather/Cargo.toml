@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Internal workspace crate: builds into the tristim-cli / tristim-gui apps,
+# not published to crates.io (only tristim-driver and tristim-display are).
+publish = false
 description = "Capture orchestration for tristim: drive a colorimeter + Wayland patch surface through a set of color formats and sequences, producing a tristim-capture Capture. Shared by the CLI gatherer and the GUI."
 
 [dependencies]

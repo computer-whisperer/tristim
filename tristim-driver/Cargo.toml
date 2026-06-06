@@ -5,7 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Rust driver for Datacolor Spyder colorimeters (SpyderX family, including SpyderExpress / 0x0A0B)"
+description = "Clean-room Rust driver for Datacolor Spyder colorimeters (Spyder 2024 / SpyderX2), with a device-generic Colorimeter trait"
+readme = "README.md"
+keywords = ["colorimeter", "spyder", "datacolor", "color", "calibration"]
+categories = ["hardware-support", "science"]
 
 [dependencies]
 rusb.workspace = true

@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Internal workspace crate: builds into the tristim-cli / tristim-gui apps,
+# not published to crates.io (only tristim-driver and tristim-display are).
+publish = false
 description = "Interpret tristim captures: derive the expected output per sample from the negotiated color description and score how far the measurement landed from it."
 
 [dependencies]

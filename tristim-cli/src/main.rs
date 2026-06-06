@@ -348,10 +348,15 @@ fn fmt_flags(flags: &[TrustFlag]) -> String {
     }
     flags
         .iter()
-        .map(|f| match f {
-            TrustFlag::Floor => "FLOOR",
-            TrustFlag::Noisy => "NOISY",
-            TrustFlag::Chroma => "DUV",
+        .map(|f| {
+            match f {
+                TrustFlag::Floor => "FLOOR",
+                TrustFlag::Noisy => "NOISY",
+                TrustFlag::Chroma => "DUV",
+                // TrustFlag is #[non_exhaustive]; surface unfamiliar flags verbatim.
+                other => return format!("{other:?}").to_uppercase(),
+            }
+            .to_string()
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -707,6 +712,8 @@ fn fmt_tier(t: AdaptiveTier) -> &'static str {
         AdaptiveTier::SingleFull => "",
         AdaptiveTier::Fast => " [fast]",
         AdaptiveTier::EscalatedFull => " [esc]",
+        // AdaptiveTier is #[non_exhaustive] — unfamiliar tier, valid measurement.
+        _ => " [?]",
     }
 }
 

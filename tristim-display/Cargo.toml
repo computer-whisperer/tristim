@@ -5,7 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Wayland layer-shell client for displaying known RGB test patches on a chosen output, paired with tristim-driver for colorimeter measurement."
+description = "Wayland layer-shell client for displaying known RGB test patches on a chosen output, with wp_color_management_v1 (HDR/PQ) support."
+readme = "README.md"
+keywords = ["wayland", "color-management", "hdr", "layer-shell", "calibration"]
+categories = ["graphics", "os::linux-apis"]
 
 [lib]
 path = "src/lib.rs"

@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Internal workspace crate: builds into the tristim-cli / tristim-gui apps,
+# not published to crates.io (only tristim-driver and tristim-display are).
+publish = false
 description = "Serde schema for tristim color-validation captures: the on-disk contract between the data gatherer and the analysis/presentation tools."
 
 [dependencies]
