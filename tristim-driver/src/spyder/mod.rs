@@ -1,13 +1,22 @@
-//! Datacolor Spyder-family driver (SpyderX2 / Spyder 2024).
+//! Datacolor Spyder-family drivers.
 //!
-//! Implements the device-generic [`Colorimeter`] trait. The wire protocol and
-//! per-unit calibration mechanics live in the [`protocol`] and [`measurement`]
-//! submodules; they're `pub` for device-aware tooling (the crate examples) but
-//! are not part of the generic driver surface — capture orchestration sees only
-//! the trait and [`Sample`].
+//! Two protocol variants share one USB [`transport`]:
+//!
+//! * [`Spyder`] (this module) — SpyderX2 / Spyder 2024, the `spydX2.c`
+//!   protocol. Hardware-validated.
+//! * [`SpyderX`](spyderx::SpyderX) — the original SpyderX, the `spydX.c`
+//!   protocol. **Untested port** — see its module docs.
+//!
+//! Both implement the device-generic [`Colorimeter`] trait. The wire protocol
+//! and per-unit calibration mechanics live in the [`protocol`] and
+//! [`measurement`] submodules; they're `pub` for device-aware tooling (the
+//! crate examples) but are not part of the generic driver surface — capture
+//! orchestration sees only the trait and [`Sample`].
 
 pub mod measurement;
 pub mod protocol;
+pub mod spyderx;
+pub mod transport;
 
 use crate::colorimeter::{
     AdaptiveMeasurement, AdaptiveTier, CalibrationId, Colorimeter, DeviceInfo, Error,
@@ -19,13 +28,12 @@ use measurement::{
     Calibration, IntegrationError, RawMeasurement, Setup, encode_measure_request,
     override_integration, parse_calibration, parse_raw_measurement, parse_setup, raw_to_xyz,
 };
-use protocol::{DATACOLOR_VID, EP_IN, EP_OUT, HEADER_LEN, Opcode, pid};
-use rusb::{Context, DeviceHandle, UsbContext};
-use std::thread;
+use protocol::Opcode;
+use rusb::{Context, DeviceHandle};
 use std::time::{Duration, Instant};
+use transport::pid;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-const INTERFACE: u8 = 0;
 
 /// Spyder-specific capability detail, not part of the generic [`DeviceInfo`].
 /// Reachable on the concrete [`Spyder`] via [`Spyder::caps`] for device-aware
@@ -63,63 +71,38 @@ impl Spyder {
     /// spydX2 protocol implemented here. The original `SPYDERX` (0x0A00) is not
     /// handled (different opcode set).
     pub fn open_any() -> Result<Self> {
-        let ctx = Context::new()?;
-        let devices = ctx.devices()?;
+        let (handle, pid) = transport::open_first(&[pid::SPYDER_2024, pid::SPYDERX2])?;
 
-        let candidates = [pid::SPYDER_2024, pid::SPYDERX2];
+        // Provisional self with placeholder calibration so we can issue
+        // commands; real info + cal are filled in below before returning.
+        let mut dev = Self {
+            handle,
+            pid,
+            info: DeviceInfo {
+                vendor: "Datacolor".into(),
+                model: model_name(pid).into(),
+                serial: String::new(),
+                firmware: (0, 0),
+                usb_pid: pid,
+            },
+            caps: SpyderCaps {
+                high_level_commands: false,
+                max_display_type: None,
+                display_type_mask: None,
+            },
+            cal: Calibration::placeholder(),
+            setup: Setup::placeholder(),
+        };
 
-        for device in devices.iter() {
-            let desc = device.device_descriptor()?;
-            if desc.vendor_id() != DATACOLOR_VID {
-                continue;
-            }
-            if !candidates.contains(&desc.product_id()) {
-                continue;
-            }
-            let handle = device.open()?;
-            if handle.kernel_driver_active(INTERFACE).unwrap_or(false) {
-                handle.detach_kernel_driver(INTERFACE)?;
-            }
-            // Some libusb backends require a configuration be active before
-            // claim_interface; idempotent so safe regardless.
-            let _ = handle.set_active_configuration(1);
-            handle.claim_interface(INTERFACE)?;
-            let _ = handle.set_alternate_setting(INTERFACE, 0);
-            let pid = desc.product_id();
-
-            // Provisional self with placeholder calibration so we can issue
-            // commands; real info + cal are filled in below before returning.
-            let mut dev = Self {
-                handle,
-                pid,
-                info: DeviceInfo {
-                    vendor: "Datacolor".into(),
-                    model: model_name(pid).into(),
-                    serial: String::new(),
-                    firmware: (0, 0),
-                    usb_pid: pid,
-                },
-                caps: SpyderCaps {
-                    high_level_commands: false,
-                    max_display_type: None,
-                    display_type_mask: None,
-                },
-                cal: Calibration::placeholder(),
-                setup: Setup::placeholder(),
-            };
-
-            // Vendor-class reset; without it the device receives bulk writes but
-            // never replies. See `send_reset()` for details.
-            dev.send_reset()?;
-            let (firmware, serial, caps) = dev.read_info()?;
-            dev.info.firmware = firmware;
-            dev.info.serial = serial;
-            dev.caps = caps;
-            dev.select_calibration(CalibrationId(0))?;
-            return Ok(dev);
-        }
-
-        Err(Error::NotFound(DATACOLOR_VID))
+        // Vendor-class reset; without it the device receives bulk writes but
+        // never replies. See `send_reset()` for details.
+        dev.send_reset()?;
+        let (firmware, serial, caps) = dev.read_info()?;
+        dev.info.firmware = firmware;
+        dev.info.serial = serial;
+        dev.caps = caps;
+        dev.select_calibration(CalibrationId(0))?;
+        Ok(dev)
     }
 
     /// USB product ID of the device we opened.
@@ -141,26 +124,11 @@ impl Spyder {
     /// respond to bulk commands. Mirrors `spydX2_reset()` in ArgyllCMS.
     /// Identical request for SpyderX, X2, and 2024.
     pub fn send_reset(&self) -> Result<()> {
-        const BM_REQUEST_TYPE: u8 = 0x41;
-        const B_REQUEST: u8 = 0x02;
-        const W_VALUE: u16 = 2;
-        const W_INDEX: u16 = 0;
-        self.handle.write_control(
-            BM_REQUEST_TYPE,
-            B_REQUEST,
-            W_VALUE,
-            W_INDEX,
-            &[],
-            DEFAULT_TIMEOUT,
-        )?;
-        // Required — anything less and the device hasn't finished resetting when
-        // we hit it with the next command.
-        thread::sleep(Duration::from_millis(500));
-        Ok(())
+        transport::send_reset(&self.handle)
     }
 
-    /// Execute one command against the device. See [`protocol`] module docs for
-    /// the wire format.
+    /// Execute one command against the device. See [`transport`] module docs
+    /// for the wire format.
     pub fn command(
         &mut self,
         opcode: Opcode,
@@ -169,69 +137,14 @@ impl Spyder {
         verify_checksum: bool,
         timeout: Duration,
     ) -> Result<Vec<u8>> {
-        let mut send_buf = Vec::with_capacity(HEADER_LEN + send_payload.len());
-        let nonce: u16 = rand::random();
-        send_buf.push(opcode as u8);
-        send_buf.extend_from_slice(&nonce.to_be_bytes());
-        send_buf.extend_from_slice(&(send_payload.len() as u16).to_be_bytes());
-        send_buf.extend_from_slice(send_payload);
-
-        let written = self.handle.write_bulk(EP_OUT, &send_buf, timeout)?;
-        if written != send_buf.len() {
-            return Err(Error::ShortWrite {
-                sent: written,
-                expected: send_buf.len(),
-            });
-        }
-
-        let mut recv_buf = vec![0u8; HEADER_LEN + reply_size];
-        let read = self.handle.read_bulk(EP_IN, &mut recv_buf, timeout)?;
-        if read != recv_buf.len() {
-            return Err(Error::ShortRead {
-                got: read,
-                expected: recv_buf.len(),
-            });
-        }
-
-        let echoed_nonce = u16::from_be_bytes([recv_buf[0], recv_buf[1]]);
-        if echoed_nonce != nonce {
-            return Err(Error::NonceMismatch {
-                sent: nonce,
-                got: echoed_nonce,
-            });
-        }
-
-        let iec = recv_buf[2];
-        if iec != 0 {
-            return Err(Error::InstrumentError(iec));
-        }
-
-        let reported_len = u16::from_be_bytes([recv_buf[3], recv_buf[4]]) as usize;
-        if reported_len != reply_size {
-            return Err(Error::PayloadLenMismatch {
-                reported: reported_len,
-                expected: reply_size,
-            });
-        }
-
-        let payload = recv_buf[HEADER_LEN..].to_vec();
-
-        if verify_checksum && !payload.is_empty() {
-            let n = payload.len();
-            let computed: u8 = payload[..n - 1]
-                .iter()
-                .copied()
-                .fold(0u8, |a, b| a.wrapping_add(b));
-            let advertised = payload[n - 1];
-            if computed != advertised {
-                return Err(Error::ChecksumMismatch {
-                    computed,
-                    advertised,
-                });
-            }
-        }
-
-        Ok(payload)
+        transport::command(
+            &self.handle,
+            opcode as u8,
+            send_payload,
+            reply_size,
+            verify_checksum,
+            timeout,
+        )
     }
 
     /// Read hardware version + serial + extended capabilities (opcode `0xC2`).

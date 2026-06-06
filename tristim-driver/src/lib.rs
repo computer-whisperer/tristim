@@ -5,10 +5,12 @@
 //! device with [`open_any`]; everything above this crate talks to the trait and
 //! never names a concrete instrument.
 //!
-//! The only driver implemented today is the Datacolor [`spyder`] family
-//! (SpyderX2 / Spyder 2024), reverse-engineered by Graeme Gill for ArgyllCMS
-//! (`spectro/spydX2.c`) and re-implemented clean-room here from the documented
-//! wire format. Its calibration mechanics live behind the trait in
+//! The implemented drivers are the Datacolor [`spyder`] family: SpyderX2 /
+//! Spyder 2024 ([`Spyder`], hardware-validated) and the original SpyderX
+//! ([`SpyderX`], an untested port). Both wire protocols were
+//! reverse-engineered by Graeme Gill for ArgyllCMS (`spectro/spydX2.c` /
+//! `spectro/spydX.c`) and are re-implemented clean-room here from the
+//! documented wire format. Calibration mechanics live behind the trait in
 //! [`spyder`]; device-aware tooling (the examples) can reach them directly.
 
 pub mod colorimeter;
@@ -23,3 +25,4 @@ pub use colorimeter::{
 pub use confidence::{MeasurementConfidence, RawStats, TrustFlag};
 pub use sample::{RawRepeats, Sample, Xyz};
 pub use spyder::Spyder;
+pub use spyder::spyderx::SpyderX;

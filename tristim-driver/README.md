@@ -26,16 +26,24 @@ fn main() -> tristim_driver::Result<()> {
 
 ## Hardware support
 
-| Product line     | USB ID      | Protocol            | Status |
-|------------------|-------------|---------------------|--------|
-| Spyder 2024      | `085c:0a0b` | spydX2 (V3.4+)      | tested |
-| SpyderX2         | `085c:0a0a` | spydX2 (V3.4+)      | should work, untested |
-| Original SpyderX | `085c:0a00` | spydX (older opset) | not handled (different opcode set) |
+| Product line     | USB ID      | Protocol | Status |
+|------------------|-------------|----------|--------|
+| Spyder 2024      | `085c:0a0b` | spydX2   | tested |
+| SpyderX2         | `085c:0a0a` | spydX2   | should work, untested |
+| Original SpyderX | `085c:0a00` | spydX    | **untested port** — same framing as spydX2, different opcodes; validation reports welcome |
 
-The wire protocol was reverse-engineered by Graeme Gill for ArgyllCMS
-(`spectro/spydX2.c`). This crate is a clean-room Rust re-implementation
-working from the documented wire format, not a code translation, and does
-not link ArgyllCMS.
+Earlier Spyders (1–5) are not supported: the Spyder 2 needs a vendor
+firmware blob and the Spyder 4/5 need vendor spectral calibration data,
+neither of which this crate could redistribute.
+
+The wire protocols were reverse-engineered by Graeme Gill for ArgyllCMS
+(`spectro/spydX2.c`, `spectro/spydX.c`). This crate is a clean-room Rust
+re-implementation working from the documented wire format, not a code
+translation, and does not link ArgyllCMS.
+
+The original SpyderX additionally supports a user-side dark calibration
+(lens cap on): `SpyderX::dark_calibrate()`. It is optional — without it,
+only readings very close to black carry a small uncorrected residual.
 
 **Unofficial.** Not affiliated with, endorsed by, or sponsored by Datacolor.
 "Spyder", "SpyderX", "SpyderX2", and "Spyder 2024" are Datacolor's

@@ -1,57 +1,14 @@
-//! Wire-protocol constants for the SpyderX2 / Spyder 2024 family.
+//! Wire-protocol opcodes for the SpyderX2 / Spyder 2024 variant.
 //!
-//! The original SpyderX (PID `0x0A00`) has its own opcode set documented
-//! separately in ArgyllCMS `spectro/spydX.c`. **Our device — the SpyderExpress
-//! 2024, PID `0x0A0B` — speaks the *X2/2024* protocol** documented in
-//! `spectro/spydX2.c` (added in ArgyllCMS V3.4.0, fixes in V3.5.0).
-//!
-//! The wire framing is identical between SpyderX and SpyderX2/2024; only the
-//! opcode set and reply structures differ.
-//!
-//! ## Packet layout (both directions)
-//!
-//! ```text
-//! Send (to bulk OUT endpoint 0x01):
-//!   [0]    opcode
-//!   [1..3] nonce              (u16 BE, host-generated, random)
-//!   [3..5] payload length     (u16 BE)
-//!   [5..]  payload bytes
-//!
-//! Receive (from bulk IN endpoint 0x81):
-//!   [0..2] echoed nonce       (u16 BE, must match what we sent)
-//!   [2]    instrument error   (0 = OK, non-zero = device-reported failure)
-//!   [3..5] payload length     (u16 BE, must match expected r_size)
-//!   [5..]  payload bytes
-//!
-//! When checksum-protected, the final payload byte is
-//! `(sum of preceding payload bytes) & 0xFF`.
-//! ```
-//!
-//! ## Vendor-class reset (mandatory before first bulk command)
-//!
-//! `bmRequestType=0x41` (Host→Device, vendor, recipient=interface),
-//! `bRequest=0x02`, `wValue=2`, `wIndex=0`, no data, then **500 ms sleep**.
+//! The framing, reset, and endpoint facts shared with the original SpyderX
+//! live in [`transport`](super::transport); this module holds what is
+//! specific to the *X2/2024* protocol documented in ArgyllCMS
+//! `spectro/spydX2.c` (added V3.4.0, fixes in V3.5.0). The original SpyderX
+//! opcode set is in [`spyderx`](super::spyderx).
 
-/// Datacolor / ColorVision USB vendor ID.
-pub const DATACOLOR_VID: u16 = 0x085c;
-
-/// Known SpyderX-family product IDs.
-pub mod pid {
-    /// Original SpyderX (2019). Uses the `spydX.c` protocol — older opcodes.
-    pub const SPYDERX: u16 = 0x0a00;
-    /// SpyderX2 (2023). Uses the new X2/2024 protocol.
-    pub const SPYDERX2: u16 = 0x0a0a;
-    /// Spyder 2024 lineup (SpyderExpress / SpyderPro / Spyder). Same protocol
-    /// as X2 with an `is2024` flag enabling extended high-level commands.
-    pub const SPYDER_2024: u16 = 0x0a0b;
-}
-
-/// USB endpoint addresses (same for SpyderX, X2, and 2024).
-pub const EP_OUT: u8 = 0x01;
-pub const EP_IN: u8 = 0x81;
-
-/// Header bytes on every packet (both directions).
-pub const HEADER_LEN: usize = 5;
+// Re-exported here because this is where they historically lived; the
+// canonical home is the family-shared transport module.
+pub use super::transport::{DATACOLOR_VID, EP_IN, EP_OUT, HEADER_LEN, pid};
 
 /// Command opcodes for the SpyderX2 / Spyder 2024 protocol.
 ///

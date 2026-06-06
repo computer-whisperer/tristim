@@ -1,9 +1,10 @@
 //! Device-generic colorimeter abstraction.
 //!
 //! [`Colorimeter`] is the capability surface the rest of tristim talks to —
-//! capture orchestration never names a concrete device. A driver (currently
-//! only [`Spyder`](crate::spyder::Spyder)) implements it; [`open_any`] probes
-//! the bus and hands back a `Box<dyn Colorimeter>`.
+//! capture orchestration never names a concrete device. The drivers
+//! ([`Spyder`](crate::spyder::Spyder), [`SpyderX`](crate::spyder::spyderx::SpyderX))
+//! implement it; [`open_any`] probes the bus and hands back a
+//! `Box<dyn Colorimeter>`.
 //!
 //! The currency is [`Sample`] (absolute XYZ + optional raw counts) — see
 //! [`crate::sample`]. Device-specific calibration mechanics (matrices, channel
@@ -50,6 +51,9 @@ pub enum Error {
 
     #[error("integration time {got} ms out of range [{min}, {max}]")]
     IntegrationOutOfRange { got: u16, min: u16, max: u16 },
+
+    #[error("calibration index {got} out of range (max {max})")]
+    CalIndexOutOfRange { got: u8, max: u8 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -186,8 +190,14 @@ pub trait RawDiagnostics {
 }
 
 /// Probe the bus and open the first supported colorimeter, with a sensible
-/// default calibration already selected.
+/// default calibration already selected. Hardware-validated devices are tried
+/// before untested ports.
 pub fn open_any() -> Result<Box<dyn Colorimeter>> {
-    let spyder = crate::spyder::Spyder::open_any()?;
-    Ok(Box::new(spyder))
+    match crate::spyder::Spyder::open_any() {
+        Ok(spyder) => return Ok(Box::new(spyder)),
+        Err(Error::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    let spyderx = crate::spyder::spyderx::SpyderX::open_any()?;
+    Ok(Box::new(spyderx))
 }
