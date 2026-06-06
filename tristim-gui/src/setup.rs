@@ -143,6 +143,17 @@ impl CaptureForm {
         self.apply_capabilities(caps);
     }
 
+    /// Inject an output list directly (the headless dump uses this to lint the
+    /// two-column output grid without a live compositor — CI has none, so
+    /// enumeration always comes back empty there).
+    pub fn set_outputs(&mut self, outputs: impl IntoIterator<Item = (String, String)>) {
+        self.outputs = outputs
+            .into_iter()
+            .map(|(name, label)| OutputItem { name, label })
+            .collect();
+        self.selected_output = (!self.outputs.is_empty()).then_some(0);
+    }
+
     /// Re-query what the compositor can fulfil (a quick Wayland roundtrip, like
     /// [`Self::refresh_outputs`]). Formats the compositor can't reach are then
     /// shown disabled; any already-selected unreachable format is turned off.
@@ -403,22 +414,33 @@ impl CaptureForm {
             field("Formats", self.formats_view()),
             field("Sequences", self.seqs_view()),
             divider(),
-            field(
-                "Settle",
-                stepper(format!("{} ms", self.settle_ms), "settle:dec", "settle:inc"),
-            ),
-            field(
-                "Prep",
-                stepper(format!("{} s", self.prep_secs), "prep:dec", "prep:inc"),
-            ),
-            field(
-                "Window",
-                stepper(format!("{} %", self.window_pct), "window:dec", "window:inc"),
-            ),
-            field(
-                "Cal index",
-                stepper(format!("{}", self.cal_index), "cal:dec", "cal:inc"),
-            ),
+            // The four numeric settings pair up into a 2×2 grid — each cell is
+            // a `field` filling half the row, so the second column's labels
+            // align down the card's midline.
+            row([
+                field(
+                    "Settle",
+                    stepper(format!("{} ms", self.settle_ms), "settle:dec", "settle:inc"),
+                ),
+                field(
+                    "Prep",
+                    stepper(format!("{} s", self.prep_secs), "prep:dec", "prep:inc"),
+                ),
+            ])
+            .gap(tokens::SPACE_3)
+            .width(Size::Fill(1.0)),
+            row([
+                field(
+                    "Window",
+                    stepper(format!("{} %", self.window_pct), "window:dec", "window:inc"),
+                ),
+                field(
+                    "Cal index",
+                    stepper(format!("{}", self.cal_index), "cal:dec", "cal:inc"),
+                ),
+            ])
+            .gap(tokens::SPACE_3)
+            .width(Size::Fill(1.0)),
             field("Gamut probe", self.gamut_view()),
             divider(),
             row([
@@ -444,15 +466,18 @@ impl CaptureForm {
     }
 
     fn outputs_view(&self) -> El {
-        // A vertical list (not a row): output count and label length are
-        // unbounded, so stacking full-width buttons can't overflow horizontally.
-        let mut items: Vec<El> = self
+        // A two-column grid: output labels are short enough (`name · model
+        // W×H`) to pair up, and the output list is usually the tallest section
+        // of the form. Labels stay honest because each cell still fills half
+        // the field width.
+        let buttons: Vec<El> = self
             .outputs
             .iter()
             .enumerate()
             .map(|(i, o)| {
                 let b = button(o.label.clone())
                     .key(format!("out:{i}"))
+                    .ellipsis() // model names are unbounded; the cell is not
                     .width(Size::Fill(1.0));
                 if Some(i) == self.selected_output {
                     b.primary()
@@ -461,6 +486,16 @@ impl CaptureForm {
                 }
             })
             .collect();
+        let mut items: Vec<El> = Vec::new();
+        let mut iter = buttons.into_iter();
+        while let Some(a) = iter.next() {
+            let second = iter.next().unwrap_or_else(spacer);
+            items.push(
+                row([a, second])
+                    .gap(tokens::SPACE_2)
+                    .width(Size::Fill(1.0)),
+            );
+        }
         if self.outputs.is_empty() {
             items.push(text("(no outputs found)").muted().font_size(12.0));
         }
@@ -472,62 +507,68 @@ impl CaptureForm {
     }
 
     fn formats_view(&self) -> El {
-        // A vertical list: an unreachable format carries a reason chip that's
-        // too long to share a horizontal row of toggles without overflowing.
-        let rows: Vec<El> = self
-            .formats
-            .iter()
-            .map(|f| match self.unreachable(f.token) {
-                Some(reason) => row([
-                    mono(f.token)
-                        .font_size(13.0)
-                        .muted()
-                        .width(Size::Fixed(120.0)),
-                    text(reason.reason())
-                        .font_size(12.0)
-                        .muted()
-                        .wrap_text()
-                        .width(Size::Fill(1.0)),
-                ])
-                .gap(tokens::SPACE_2)
-                .align(Align::Center)
-                .width(Size::Fill(1.0)),
+        // Reachable formats share one row of natural-width toggles (five short
+        // tokens fit comfortably). Unreachable formats drop below it, each with
+        // its reason chip — too long to share the toggle row.
+        let mut toggles: Vec<El> = Vec::new();
+        let mut blocked: Vec<El> = Vec::new();
+        for f in &self.formats {
+            match self.unreachable(f.token) {
                 None => {
-                    let b = button(f.token)
-                        .key(format!("fmt:{}", f.token))
-                        .width(Size::Fixed(120.0));
-                    let b = if f.on { b.primary() } else { b.secondary() };
-                    row([b]).width(Size::Fill(1.0))
+                    let b = button(f.token).key(format!("fmt:{}", f.token));
+                    toggles.push(if f.on { b.primary() } else { b.secondary() });
                 }
-            })
-            .collect();
+                Some(reason) => blocked.push(
+                    row([
+                        mono(f.token)
+                            .font_size(13.0)
+                            .muted()
+                            .width(Size::Fixed(120.0)),
+                        text(reason.reason())
+                            .font_size(12.0)
+                            .muted()
+                            .wrap_text()
+                            .width(Size::Fill(1.0)),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
+                    .width(Size::Fill(1.0)),
+                ),
+            }
+        }
+        let mut rows: Vec<El> = Vec::new();
+        if !toggles.is_empty() {
+            rows.push(row(toggles).gap(tokens::SPACE_2).align(Align::Center));
+        }
+        rows.extend(blocked);
         column(rows).gap(tokens::SPACE_2).width(Size::Fill(1.0))
     }
 
     fn seqs_view(&self) -> El {
-        let rows: Vec<El> = self
+        // All three `toggle − N +` groups share one row; natural-width toggles
+        // keep each group compact enough for the field width.
+        let groups: Vec<El> = self
             .seqs
             .iter()
             .map(|s| {
                 let toggle = {
-                    let b = button(s.name)
-                        .key(format!("seq:{}", s.name))
-                        .width(Size::Fixed(100.0));
+                    let b = button(s.name).key(format!("seq:{}", s.name));
                     if s.on { b.primary() } else { b.secondary() }
                 };
                 row([
                     toggle,
                     button("−").key(format!("seqdec:{}", s.name)).secondary(),
-                    mono(format!("N={}", s.count))
+                    mono(format!("{}", s.count))
                         .font_size(13.0)
-                        .width(Size::Fixed(64.0)),
+                        .center_text()
+                        .width(Size::Fixed(34.0)),
                     button("+").key(format!("seqinc:{}", s.name)).secondary(),
                 ])
                 .gap(tokens::SPACE_2)
                 .align(Align::Center)
             })
             .collect();
-        column(rows).gap(tokens::SPACE_2)
+        row(groups).gap(tokens::SPACE_4).align(Align::Center)
     }
 
     /// The gamut-probe controls: an on/off toggle, and — when on — the repeats
@@ -597,11 +638,15 @@ fn field(label: &str, body: El) -> El {
     .width(Size::Fill(1.0))
 }
 
-/// A `−  value  +` stepper bound to two routes.
+/// A `−  value  +` stepper bound to two routes. The value centers in its fixed
+/// box so it sits midway between the buttons instead of hugging `−`.
 fn stepper(value: String, dec: &str, inc: &str) -> El {
     row([
         button("−").key(dec.to_string()).secondary(),
-        mono(value).font_size(13.0).width(Size::Fixed(72.0)),
+        mono(value)
+            .font_size(13.0)
+            .center_text()
+            .width(Size::Fixed(72.0)),
         button("+").key(inc.to_string()).secondary(),
     ])
     .gap(tokens::SPACE_2)

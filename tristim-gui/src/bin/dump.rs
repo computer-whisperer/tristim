@@ -29,9 +29,16 @@ use tristim_gui::app::{DebugRunPhase, Tab};
 use tristim_gui::plot::Space;
 use tristim_gui::space3d::{N_REF_GAMUTS, RefCages, Space3dView};
 
-/// Window sizes to lay out under (default + a large display), so responsive
-/// plot sizing is exercised and lint-checked at both.
-const VIEWPORTS: [(f32, f32); 2] = [(1280.0, 800.0), (2560.0, 1440.0)];
+/// Window sizes to lay out under, so responsive plot sizing, the stacked
+/// narrow-window arrangement, and the wrapped header are all lint-checked:
+/// half of a 1080p display (the stacked layout), the default window, 1080p
+/// fullscreen, and a large display.
+const VIEWPORTS: [(f32, f32); 4] = [
+    (960.0, 1080.0),
+    (1280.0, 800.0),
+    (1920.0, 1080.0),
+    (2560.0, 1440.0),
+];
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -96,22 +103,36 @@ fn run(path: &str, out_dir: &str) -> Result<usize, String> {
     };
 
     let count = app.trial_count().max(1);
-    // The capture-setup form. It enumerates outputs (a Wayland roundtrip);
-    // without a compositor the list is just empty, which still exercises the
-    // form layout.
-    let setup_app = PresenterApp::setup();
+    // A fixed output list injected into every setup state: live enumeration is
+    // machine-dependent (and empty on CI, which has no compositor), so the
+    // two-column output grid would otherwise go unlinted. Odd count on purpose
+    // — the grid's last row pairs a button with a spacer.
+    let demo_outputs = || {
+        [
+            ("DP-1", "DP-1 · PG27UCDM 3840×2160"),
+            ("DP-3", "DP-3 · LU28R55 3840×2160"),
+            ("eDP-1", "eDP-1 · Sharp LQ134N1JW48 3840×2400"),
+        ]
+        .map(|(n, l)| (n.to_string(), l.to_string()))
+    };
+    // The capture-setup form.
+    let mut setup_app = PresenterApp::setup();
+    setup_app.set_setup_outputs(demo_outputs());
     // The same form with the gamut-probe controls expanded (the repeats/depth
     // steppers row only renders when probing is on).
     let mut setup_gamut_app = PresenterApp::setup();
+    setup_gamut_app.set_setup_outputs(demo_outputs());
     setup_gamut_app.set_setup_probe_gamut(true);
     // The form gated to a minimal (niri-like) compositor: no color management,
     // no fp16, so every managed format renders disabled with its reason chip —
     // the grayed-row layout we want to lint.
     let mut setup_capgated_app = PresenterApp::setup();
+    setup_capgated_app.set_setup_outputs(demo_outputs());
     setup_capgated_app.set_setup_capabilities(tristim_display::DisplayCapabilities::default());
     // The form's two error rows at once: the open-file banner above it and the
     // validation error beneath it (both deliberately long).
     let mut setup_error_app = PresenterApp::setup();
+    setup_error_app.set_setup_outputs(demo_outputs());
     setup_error_app.set_open_error(Some(format!(
         "failed to load {path}: invalid capture: missing field `trials` at line 1 column 2048"
     )));

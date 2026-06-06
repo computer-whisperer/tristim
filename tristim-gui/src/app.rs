@@ -614,6 +614,13 @@ impl PresenterApp {
         self.form.set_probe_gamut(on);
     }
 
+    /// Inject an output list into the setup form as `(name, label)` pairs. Used
+    /// by the headless dump to lint the two-column output grid (CI has no
+    /// compositor, so live enumeration comes back empty there).
+    pub fn set_setup_outputs(&mut self, outputs: impl IntoIterator<Item = (String, String)>) {
+        self.form.set_outputs(outputs);
+    }
+
     /// Inject a capability set into the setup form. Used by the headless dump to
     /// lint the grayed-out unreachable-format rows without a live compositor.
     pub fn set_setup_capabilities(&mut self, caps: tristim_display::DisplayCapabilities) {
@@ -706,7 +713,10 @@ impl PresenterApp {
                     Err(e) => format!("save failed: {e}"),
                 });
                 self.presented = Some(Presented::new(capture));
-                self.view = Tab::Chromaticity;
+                // Land on the 3D space view — the richest summary of a fresh
+                // capture. `before_build` has already drained this message, so
+                // it builds the scene before this frame lays out.
+                self.view = Tab::Space3D;
                 self.hovered_sample = None;
                 self.mode = Mode::Presenting;
             }
@@ -751,7 +761,8 @@ impl PresenterApp {
                 self.presented = Some(Presented::new(*capture));
                 self.source_path = Some(path);
                 self.open_error = None;
-                self.view = Tab::Chromaticity;
+                // Same default as `finish`: open into the 3D space view.
+                self.view = Tab::Space3D;
                 self.hovered_sample = None;
                 self.mode = Mode::Presenting;
             }
@@ -810,7 +821,7 @@ impl PresenterApp {
         format!("{basis} · {fmt}")
     }
 
-    fn present_header(&self, p: &Presented) -> El {
+    fn present_header(&self, p: &Presented, cx: &BuildCx) -> El {
         let dev = &p.capture.device;
         let out = &p.capture.output;
         let out_label = match &out.mode {
@@ -823,26 +834,43 @@ impl PresenterApp {
             .as_deref()
             .map(file_name)
             .unwrap_or("color validation presenter");
-        let mut items = vec![
-            brand(subtitle),
-            spacer(),
-            fact(
-                "device",
-                format!(
-                    "{} · SN {} · cal {}",
-                    dev.product, dev.serial, dev.cal_index
-                ),
+        let mut facts = vec![fact(
+            "device",
+            format!(
+                "{} · SN {} · cal {}",
+                dev.product, dev.serial, dev.cal_index
             ),
-            fact("output", out_label),
-        ];
+        )];
+        facts.push(fact("output", out_label));
         // The compositor that served the capture (v2+; absent for older files).
         if let Some(comp) = compositor_label(&p.capture.compositor) {
-            items.push(fact("compositor", comp));
+            facts.push(fact("compositor", comp));
         }
-        items.push(fact("captured", p.capture.timestamp.clone()));
-        items.push(button("Open…").key("open").secondary());
-        items.push(button("New capture").key("new-capture").secondary());
-        row(items).gap(tokens::SPACE_4).align(Align::Center)
+        facts.push(fact("captured", p.capture.timestamp.clone()));
+        let actions = [
+            button("Open…").key("open").secondary(),
+            button("New capture").key("new-capture").secondary(),
+        ];
+        // One line when it fits; on a narrow (half-width) window the facts
+        // wrap onto their own row under the brand + actions.
+        if cx.viewport().is_some_and(|(vw, _)| vw < HEADER_BREAK) {
+            let mut top = vec![brand(subtitle), spacer()];
+            top.extend(actions);
+            column([
+                row(top).gap(tokens::SPACE_4).align(Align::Center),
+                row(facts)
+                    .gap(tokens::SPACE_4)
+                    .align(Align::Center)
+                    .width(Size::Fill(1.0)),
+            ])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+        } else {
+            let mut items = vec![brand(subtitle), spacer()];
+            items.extend(facts);
+            items.extend(actions);
+            row(items).gap(tokens::SPACE_4).align(Align::Center)
+        }
     }
 
     fn sidebar(&self, p: &Presented, cx: &BuildCx) -> El {
@@ -903,24 +931,36 @@ impl PresenterApp {
         let i = p.selected.min(p.analyzed.trials.len() - 1);
         let t = &p.analyzed.trials[i];
 
+        // The 3D view spends an extra controls row (projection selector and
+        // overlay toggles split apart); budget for it.
+        let extra_rows = usize::from(self.view == Tab::Space3D);
+        let layout = content_layout(cx, extra_chrome, extra_rows);
         // Inner plot size: the budgeted square minus the card's padding on both
         // sides, so the enclosing `plot_card` ends up at the budgeted footprint.
-        let plot_px = plot_size(cx, extra_chrome) - 2.0 * PLOT_CARD_PAD;
+        let plot_px = layout.plot_card_px - 2.0 * PLOT_CARD_PAD;
 
         // Heading: title + the top-level view selector. Per-view controls (which
         // can be many — the 3D view alone has a projection selector, three
         // reference-gamut toggles, and a measured-shell toggle) go on their own
-        // full-width row below, so the heading never overflows on a narrow window.
+        // full-width row(s) below, so the heading never overflows on a narrow
+        // window.
+        // The title column yields to the view selector and ellipsizes — trial
+        // labels and ground-truth lines are long enough to collide with it on
+        // a half-width window.
         let heading: Vec<El> = vec![
             column([
-                h3(self.trial_label(p, i)),
-                text(ground_truth_line(t)).muted().font_size(13.0),
+                h3(self.trial_label(p, i)).nowrap_text().ellipsis(),
+                text(ground_truth_line(t))
+                    .muted()
+                    .font_size(13.0)
+                    .nowrap_text()
+                    .ellipsis(),
             ])
-            .gap(2.0),
-            spacer(),
+            .gap(2.0)
+            .width(Size::Fill(1.0)),
             view_selector(self.view),
         ];
-        let mut controls: Vec<El> = Vec::new();
+        let mut control_rows: Vec<El> = Vec::new();
 
         // Which sample (if any) is hovered, by the active view's mechanism: the
         // 2D charts set `hovered_sample` from pointer events over per-sample hit
@@ -936,18 +976,19 @@ impl PresenterApp {
         // The main plot + its tab-specific legend (shown when nothing is hovered).
         let (plot, legend) = match self.view {
             Tab::Space3D => {
-                // Which colour space to project samples into.
-                controls.push(space3d_view_selector(self.space3d_view));
-                // Reference-gamut cages, in two groups: absolute (each at its
-                // gamut's spec white) and relative (scaled to this trial). The
-                // trial's own gamut is always drawn as the target. Same meaning
-                // in every projection.
-                controls.push(ref_group("abs", "abs", self.space3d_refs.abs));
-                controls.push(ref_group("rel", "rel", self.space3d_refs.rel));
-                // The measured-gamut shell, only when this trial was probed.
-                if p.capture.trials.get(i).is_some_and(|t| t.gamut.is_some()) {
-                    controls.push(measured_toggle(self.space3d_show_measured));
-                }
+                // Two rows with distinct semantics: which colour space to
+                // project into (a pick-one selector), then the gamut overlays
+                // (independent toggles). Sharing one row made the selector
+                // read as more toggle soup.
+                control_rows.push(space3d_view_selector(self.space3d_view));
+                // The measured-gamut shell toggle, only when this trial was probed.
+                let measured = p
+                    .capture
+                    .trials
+                    .get(i)
+                    .is_some_and(|t| t.gamut.is_some())
+                    .then_some(self.space3d_show_measured);
+                control_rows.push(overlays_row(self.space3d_refs, measured));
                 // The geometry handles are cached on `Presented` and refreshed
                 // in `before_build`; `None` only during a transient first frame.
                 let chart = match &p.space3d {
@@ -961,10 +1002,11 @@ impl PresenterApp {
             Tab::Chromaticity => {
                 // Color fill is bounded to the presenter's negotiated gamut.
                 let gamut = presenter_gamut(cx);
-                controls.push(space_toggle(self.space));
+                let mut c = vec![space_toggle(self.space)];
                 if gamut.is_some() {
-                    controls.push(field_toggle(self.show_field));
+                    c.push(field_toggle(self.show_field));
                 }
+                control_rows.push(row(c).gap(tokens::SPACE_2).align(Align::Center));
                 let field = if self.show_field { gamut } else { None };
                 (
                     chromaticity_chart(t, self.space, field, plot_px, hovered),
@@ -985,33 +1027,36 @@ impl PresenterApp {
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
         ];
-        // The active view's controls, on their own row so they have the full
-        // width to spread into (Luminance has none, so the row is skipped).
-        if !controls.is_empty() {
-            // Tight inter-group gap: the 3D view packs a projection selector and
-            // two (abs/rel) gamut groups onto this row, which is snug at 1280px.
+        // The active view's control rows, full width (Luminance has none).
+        rows.extend(control_rows.into_iter().map(|r| r.width(Size::Fill(1.0))));
+        if layout.stacked {
+            // Narrow window (half a 1080p display): the stat/legend column
+            // can't keep its minimum width beside the plot, so it stacks
+            // beneath instead, each card taking the full content width.
+            rows.push(plot_card(plot));
+            rows.push(summary_card(t).width(Size::Fill(1.0)));
+            rows.push(detail.width(Size::Fill(1.0)));
+        } else {
             rows.push(
-                row(controls)
-                    .gap(tokens::SPACE_1)
-                    .align(Align::Center)
+                row([
+                    plot_card(plot),
+                    column([
+                        summary_card(t).width(Size::Fill(1.0)),
+                        detail.width(Size::Fill(1.0)),
+                    ])
+                    // SPACE_2, not _3: the column's intrinsic height is the
+                    // vertical high-water mark at 800-high windows when the
+                    // banner row and the 3D view's second controls row are
+                    // both present.
+                    .gap(tokens::SPACE_2)
                     .width(Size::Fill(1.0)),
+                ])
+                .gap(tokens::SPACE_4)
+                .align(Align::Start)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
             );
         }
-        rows.push(
-            row([
-                plot_card(plot),
-                column([
-                    summary_card(t).width(Size::Fill(1.0)),
-                    detail.width(Size::Fill(1.0)),
-                ])
-                .gap(tokens::SPACE_3)
-                .width(Size::Fill(1.0)),
-            ])
-            .gap(tokens::SPACE_4)
-            .align(Align::Start)
-            .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0)),
-        );
 
         column(rows)
             .gap(tokens::SPACE_4)
@@ -1020,12 +1065,16 @@ impl PresenterApp {
     }
 
     fn present_view(&self, p: &Presented, cx: &BuildCx) -> El {
-        let mut items = vec![self.present_header(p), divider()];
+        let mut items = vec![self.present_header(p, cx), divider()];
+        // The banner row (and its column gap) eats into the plot's vertical
+        // budget like the running view's progress strip does.
+        let mut extra_chrome = 0.0;
         if let Some(e) = &self.open_error {
             items.push(open_error_banner(e));
+            extra_chrome = 36.0;
         }
         items.push(
-            row([self.sidebar(p, cx), self.content_panel(p, cx, 0.0)])
+            row([self.sidebar(p, cx), self.content_panel(p, cx, extra_chrome)])
                 .gap(tokens::SPACE_6)
                 .align(Align::Stretch)
                 .width(Size::Fill(1.0))
@@ -1050,8 +1099,14 @@ impl PresenterApp {
         if let Some(e) = &self.open_error {
             items.push(open_error_banner(e));
         }
-        // Scroll so the form fits any window / output count.
-        items.push(scroll([self.form.view().width(Size::Fixed(720.0))]).key("setup-scroll"));
+        // Scroll so the form fits any window / output count; the fixed-width
+        // card centers in whatever the window gives it.
+        items.push(
+            scroll([column([self.form.view().width(Size::Fixed(760.0))])
+                .align(Align::Center)
+                .width(Size::Fill(1.0))])
+            .key("setup-scroll"),
+        );
         column(items)
             .gap(tokens::SPACE_4)
             .width(Size::Fill(1.0))
@@ -1233,6 +1288,11 @@ impl PresenterApp {
 /// matches the old bare-plot footprint and the stat column keeps its width.
 const PLOT_CARD_PAD: f32 = tokens::SPACE_4;
 
+/// Viewport width below which the present header wraps its facts onto a second
+/// row (a half-width window on a 1080p display sits well under this; the
+/// single-row header needs ~1100px).
+const HEADER_BREAK: f32 = 1160.0;
+
 /// Wrap a fixed-size plot in damascene's panel card, so all three views share one
 /// content-separation surface (CARD fill + border + radius + shadow) instead of
 /// a hand-drawn frame. Hugs the square plot rather than filling the row width.
@@ -1250,26 +1310,59 @@ fn hovered_scene_sample(cx: &BuildCx, t: &AnalyzedTrial) -> Option<usize> {
     (pick.mark == 0 && pick.point < t.samples.len()).then_some(pick.point)
 }
 
-/// Responsive square side (px) for the plot, derived from the window viewport.
-/// Grows the diagram to fill the content area — leaving the stat/legend column
-/// its minimum width — and is bounded vertically so it always fits on screen.
-/// Falls back to a sensible size when no viewport is attached (headless).
-fn plot_size(cx: &BuildCx, extra_chrome: f32) -> f32 {
+/// How [`PresenterApp::content_panel`] arranges itself at the current viewport.
+struct ContentLayout {
+    /// Footprint (square side, px) of the plot card, padding included.
+    plot_card_px: f32,
+    /// Stats and legend stack beneath the plot instead of beside it — a window
+    /// at half a 1080p display can't fit the stat column at readable width.
+    stacked: bool,
+}
+
+/// Derive the panel arrangement from the window viewport: side-by-side with
+/// the plot grown to fill the content area when the stat/legend column keeps
+/// its minimum width, stacked otherwise. Bounded vertically so the panel
+/// always fits on screen (present mode has no scroll — the 3D view owns the
+/// wheel). `extra_control_rows` counts per-view control rows beyond the first
+/// (the 3D view spends a second one); falls back to a sensible size when no
+/// viewport is attached (headless).
+fn content_layout(cx: &BuildCx, extra_chrome: f32, extra_control_rows: usize) -> ContentLayout {
     const ROOT_PAD: f32 = 24.0; // SPACE_6, window padding each side
     const SIDEBAR_W: f32 = 300.0;
     const COL_GAP: f32 = 24.0; // sidebar ↔ content
     const ROW_GAP: f32 = 16.0; // chart ↔ stat column
     const RIGHT_MIN: f32 = 410.0; // keep the stat/legend column readable
-    const V_CHROME: f32 = 230.0; // header + heading + paddings/gaps above the chart
+    const V_CHROME: f32 = 238.0; // header + heading + one controls row + gaps
+    const CONTROL_ROW_H: f32 = 48.0; // each control row past the first
     const PLOT_MIN: f32 = 360.0;
     const PLOT_MAX: f32 = 920.0;
+    // Stacked mode: vertical room kept beneath the plot for the summary and
+    // legend/inspector cards, and a smaller plot floor (the cards win).
+    const STACKED_STATS: f32 = 510.0;
+    const STACKED_PLOT_MIN: f32 = 240.0;
 
     let (vw, vh) = cx.viewport().unwrap_or((1280.0, 800.0));
     let content_w = vw - 2.0 * ROOT_PAD - SIDEBAR_W - COL_GAP;
-    let h_budget = content_w - ROW_GAP - RIGHT_MIN;
-    let vh = vh - extra_chrome;
-    let v_budget = vh - V_CHROME;
-    h_budget.min(v_budget).clamp(PLOT_MIN, PLOT_MAX)
+    // The header wraps its facts onto a second row on a narrow window.
+    let header_wrap = if vw < HEADER_BREAK { 34.0 } else { 0.0 };
+    let v_budget = vh
+        - extra_chrome
+        - V_CHROME
+        - header_wrap
+        - extra_control_rows as f32 * CONTROL_ROW_H;
+    if content_w < PLOT_MIN + ROW_GAP + RIGHT_MIN {
+        let plot = (v_budget - STACKED_STATS).min(content_w);
+        ContentLayout {
+            plot_card_px: plot.clamp(STACKED_PLOT_MIN, PLOT_MAX),
+            stacked: true,
+        }
+    } else {
+        let h_budget = content_w - ROW_GAP - RIGHT_MIN;
+        ContentLayout {
+            plot_card_px: h_budget.min(v_budget).clamp(PLOT_MIN, PLOT_MAX),
+            stacked: false,
+        }
+    }
 }
 
 /// The presenter window's negotiated gamut, mapped from host diagnostics.
@@ -1435,12 +1528,34 @@ fn space_toggle(space: Space) -> El {
     button(space.label()).key("space-toggle").secondary()
 }
 
+/// The 3D view's gamut-overlay toggles, on one row: the reference cages in
+/// their two anchor groups (absolute — each at its gamut's spec white — and
+/// relative — scaled to this trial), plus the measured-gamut shell when this
+/// trial was probed (`measured` carries its on/off state, or `None` to omit).
+/// Separator-delimited groups, so they don't read as one long toggle strip.
+fn overlays_row(refs: RefCages, measured: Option<bool>) -> El {
+    // Fixed-height rules: `vertical_separator` fills its row's cross axis,
+    // which collapses to zero in a hug-height row.
+    let rule = || vertical_separator().height(Size::Fixed(20.0));
+    let mut items = vec![
+        ref_group("abs", "abs", refs.abs),
+        rule(),
+        ref_group("rel", "rel", refs.rel),
+    ];
+    if let Some(on) = measured {
+        items.push(rule());
+        items.push(measured_toggle(on));
+    }
+    row(items).gap(tokens::SPACE_3).align(Align::Center)
+}
+
 /// One anchor group ("abs" / "rel") of reference-gamut cage toggles: a caption
-/// followed by a button per gamut, routed `ref:<kind>:<gamut-key>`.
+/// followed by a button per gamut, routed `ref:<kind>:<gamut-key>`. Compact
+/// labels — the overlay row carries six of these.
 fn ref_group(caption: &str, kind: &str, set: [bool; crate::space3d::N_REF_GAMUTS]) -> El {
     let mut items = vec![text(format!("{caption}:")).muted().font_size(12.0)];
     for (gi, g) in REF_GAMUTS.iter().enumerate() {
-        let b = button(g.name).key(format!("ref:{kind}:{}", g.key));
+        let b = button(g.short).key(format!("ref:{kind}:{}", g.key));
         items.push(if set[gi] { b.primary() } else { b.secondary() });
     }
     row(items).gap(tokens::SPACE_1).align(Align::Center)
@@ -1448,7 +1563,7 @@ fn ref_group(caption: &str, kind: &str, set: [bool; crate::space3d::N_REF_GAMUTS
 
 /// Toggle for the measured-gamut shell overlay in the 3D view; primary when on.
 fn measured_toggle(on: bool) -> El {
-    let b = button("measured").key("measured-toggle");
+    let b = button("measured shell").key("measured-toggle");
     if on { b.primary() } else { b.secondary() }
 }
 

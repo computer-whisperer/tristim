@@ -196,8 +196,12 @@ fn abs_lab_white() -> [f64; 3] {
 pub struct RefGamut {
     /// Toggle route suffix (`ref:<key>`) and stable identity.
     pub key: &'static str,
-    /// Button / in-plot label text.
+    /// In-plot label text.
     pub name: &'static str,
+    /// Compact toggle-button label — the overlay row packs six of these (plus
+    /// captions and the shell toggle), so the full names don't fit a
+    /// half-width window.
+    pub short: &'static str,
     pub space: ColorSpace,
     /// Reference white luminance (cd/m²) the cage is anchored at in the absolute
     /// views — a gamut alone fixes no brightness, so this stands in for its
@@ -216,6 +220,7 @@ pub const REF_GAMUTS: [RefGamut; N_REF_GAMUTS] = [
     RefGamut {
         key: "srgb",
         name: "sRGB",
+        short: "sRGB",
         space: ColorSpace::SRGB,
         ref_white_nits: 80.0,
         color: [0.42, 0.60, 1.0, 0.5],
@@ -223,6 +228,7 @@ pub const REF_GAMUTS: [RefGamut; N_REF_GAMUTS] = [
     RefGamut {
         key: "p3",
         name: "Display P3",
+        short: "P3",
         space: ColorSpace::DISPLAY_P3,
         ref_white_nits: 100.0,
         color: [0.36, 0.85, 0.52, 0.5],
@@ -230,6 +236,7 @@ pub const REF_GAMUTS: [RefGamut; N_REF_GAMUTS] = [
     RefGamut {
         key: "bt2020",
         name: "Rec.2020",
+        short: "2020",
         space: ColorSpace::BT2020,
         ref_white_nits: 10_000.0,
         color: [1.0, 0.70, 0.30, 0.5],
