@@ -1335,7 +1335,7 @@ impl App for PresenterApp {
         vec![crate::chart::field_shader()]
     }
 
-    fn on_event(&mut self, e: UiEvent) {
+    fn on_event(&mut self, e: UiEvent, _cx: &EventCx) {
         // "Open…" works from both the setup screen and the presenter.
         if matches!(e.kind, UiEventKind::Click | UiEventKind::Activate) && e.route() == Some("open")
         {

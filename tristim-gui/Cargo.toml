@@ -18,8 +18,8 @@ path = "src/main.rs"
 [dependencies]
 # Presenter UI stack, from crates.io. 0.4.x carries the 3D scene support and
 # explicit wide-gamut color-mode handling the GUI relies on.
-damascene-core = "0.4"
-damascene-winit-wgpu = "0.4"
+damascene-core = "0.4.1"
+damascene-winit-wgpu = "0.4.1"
 
 # tristim backend libraries (members of the main workspace, reached by path).
 tristim-capture = { path = "../tristim-capture" }
