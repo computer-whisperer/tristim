@@ -10,9 +10,10 @@ refs/
 *.swp
 *~
 
-# Scratch CSVs at the workspace root — keeps the root clean.
-# Committed measurements live under `measurements/`.
+# Local measurement data (scratch CSVs, session measurement dirs).
+# Measurement artifacts are working data, not repository content.
 /*.csv
+/measurements/
 
 # Headless bundle-dump artifacts from the presenter (SVG / tree / draw-ops).
 /tristim-gui/out/

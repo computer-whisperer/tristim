@@ -58,9 +58,10 @@ Driver-specific notes:
   spectral corrections (CCSS), ambient mode, refresh-synchronized
   integration, and the Rev-B AIO mode are not ported yet.
 
-**Unofficial.** Not affiliated with, endorsed by, or sponsored by Datacolor.
-"Spyder", "SpyderX", "SpyderX2", and "Spyder 2024" are Datacolor's
-trademarks, referenced only to identify supported hardware.
+**Unofficial.** Not affiliated with, endorsed by, or sponsored by Datacolor
+or X-Rite. "Spyder", "SpyderX", "SpyderX2", and "Spyder 2024" are
+Datacolor's trademarks; "i1Display" and "ColorMunki" are X-Rite's. All are
+referenced only to identify supported hardware.
 
 ## API layers
 
@@ -83,9 +84,9 @@ trademarks, referenced only to identify supported hardware.
   control, integration-time override, per-reading wall times) for sensor
   characterization tooling. Fetched via `Colorimeter::raw_diagnostics()`;
   `None` on devices that only expose XYZ.
-- **`spyder` module** — the concrete driver. Device-aware tooling can reach
-  the calibration matrices, setup block, and wire protocol directly; generic
-  consumers never need to.
+- **`spyder` / `i1d3` modules** — the concrete drivers. Device-aware tooling
+  can reach the calibration matrices, setup blocks, and wire protocols
+  directly; generic consumers never need to.
 
 ## Setup — udev rule
 

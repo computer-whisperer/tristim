@@ -1,19 +1,22 @@
 # tristim
 
-A Rust toolkit for tristimulus colorimetry on Linux/Wayland: a clean-room
-driver for Datacolor Spyder-family colorimeters, plus a standalone tool that
-validates how a Wayland compositor actually reproduces color on each display.
+A Rust toolkit for tristimulus colorimetry on Linux/Wayland: clean-room
+drivers for USB display colorimeters, plus a standalone tool that validates
+how a Wayland compositor actually reproduces color on each display.
 
 tristim has two faces:
 
-- **Reusable crates.** Other projects depend on these directly as a git
-  Cargo dependency — most notably the Spyder device driver. The crates carry
-  no compositor-specific assumptions.
+- **Reusable crates.** `tristim-driver` (the colorimeter hardware layer) and
+  `tristim-display` (the Wayland test-patch client) carry no
+  compositor-specific or tool-specific assumptions and are designed to be
+  consumed standalone — e.g. by closed-loop display calibration tools. Other
+  projects already depend on them as git Cargo dependencies.
 - **A standalone compositor color-validation tool.** Point it at a display,
   let it drive test patches through the compositor's normal client path, and
   measure what the panel actually emits. It reports where color reproduction
   is faithful and where it drifts — white point across the brightness range,
-  per-channel maximum emission, primaries and gamut, and EOTF/gamma response.
+  primaries and gamut, and EOTF/transfer response, for SDR and HDR
+  (PQ / BT.2020 via `wp_color_management_v1`) alike.
 
 It is compositor-agnostic by design: it asks for colors the way any client
 would and measures the result, rather than side-channeling into a specific
@@ -23,63 +26,85 @@ compositor builds — including
 crates from its own `prism-tune` calibration tool. Any closed-loop
 calibration lives in the consuming project, not here.
 
-**Status:** working measurement path on a Datacolor Spyder 2024 (USB
-`085c:0a0b`). SDR and HDR (PQ / BT.2020 via `wp_color_management_v1`) patch
-paths are operational. The general-purpose display-characterization analysis
-is under active development.
-
-**Affiliation:** unofficial. Not affiliated with, endorsed by, or sponsored by
-Datacolor. "Spyder", "SpyderX", "SpyderX2", and "Spyder 2024" are Datacolor's
-trademarks, referenced here only to identify supported hardware.
-
 ## Hardware support
 
-| Product line   | USB ID        | Protocol            | Status |
-|----------------|---------------|---------------------|--------|
-| Spyder 2024    | `085c:0a0b`   | spydX2 (V3.4+)      | tested |
-| SpyderX2       | `085c:0a0a`   | spydX2 (V3.4+)      | should work, untested |
-| Original SpyderX | `085c:0a00` | spydX (older opset) | not handled (different opcode set) |
+| Product line | USB ID | Protocol | Status |
+|---|---|---|---|
+| Spyder 2024 | `085c:0a0b` | spydX2 | tested |
+| SpyderX2 | `085c:0a0a` | spydX2 | should work, untested |
+| Original SpyderX | `085c:0a00` | spydX | **untested port** |
+| i1Display Pro / ColorMunki Display | `0765:5020` | i1d3 | **untested port** — covers the OEM rebadges too (NEC SpectraSensor Pro, HP DreamColor, …) |
 
-All targets use the vendor-class USB protocol reverse-engineered by Graeme Gill
-for ArgyllCMS (`spectro/spydX2.c`). This is a clean-room Rust re-implementation
-working from the documented wire format, not a code translation.
+The wire protocols were reverse-engineered by Graeme Gill for ArgyllCMS
+(`spectro/spydX2.c`, `spectro/spydX.c`, `spectro/i1d3.c`). The drivers here
+are a clean-room Rust re-implementation working from the documented wire
+formats, not a code translation, and do not link ArgyllCMS. Untested ports
+were written without hardware on hand; validation reports are very welcome.
+See [`tristim-driver/README.md`](tristim-driver/README.md) for details and
+per-device notes.
 
 ## Workspace layout
 
-- `tristim-driver/` — device-generic colorimeter layer. The reusable core; no
-  Wayland dependency. Exposes a `Colorimeter` trait (open a device with
-  `open_any`), measurements as a device-agnostic `Sample` (absolute XYZ plus
-  optional raw sensor counts), per-measurement [`MeasurementConfidence`] (σY/Y,
-  Δu'v', floor σ vs. trust thresholds — computed from raw counts when present,
-  else from XYZ-repeat scatter), a per-device `measure_adaptive` primitive for
-  batch loops like dense 3D LUT calibration, and a `RawDiagnostics` capability
-  for low-level characterization. The one implemented driver is the Datacolor
-  `spyder` family (SpyderX2 / Spyder 2024); its wire protocol and calibration
-  mechanics stay behind the trait.
-- `tristim-display/` — Wayland layer-shell client that renders known SDR/HDR
-  patches on a chosen output, with optional centered-window mode for
-  ABL-limited OLED peak measurement.
-- `tristim-capture/` — serde schema for capture files: the contract between
-  the gatherer and the analysis/presentation tools. No heavy deps.
-- `tristim-cli/` — the gatherer binary `tristim`. Subcommands:
-  `list-outputs`, `info`, `measure` (one shot); `characterize` (sensor
-  noise / trust sweep); `speed` (per-cell wall-time × repeat count probe);
-  `integration` (sweep `setup.s2` integration time at one level);
-  `gamut` (probe a format's reproduced gamut, optionally with adaptive
-  integration via `--fast-integration MS`); `capture` (format × color-sequence
-  sweep → capture JSON); `report` (analyze a capture).
+The gather/present split runs through the whole workspace: tools that talk
+to hardware record *facts only* (what the compositor advertised, what was
+negotiated, code-value→measurement samples); interpretation happens
+downstream against the recorded facts.
 
-ArgyllCMS source is referenced (read-only) under `refs/argyll/` for
-protocol-decoding purposes. We don't link it.
+- [`tristim-driver/`](tristim-driver) — device-generic colorimeter layer; no
+  Wayland dependency. A `Colorimeter` trait over the supported instruments
+  (open one with `open_any()`), measurements as device-agnostic absolute-XYZ
+  `Sample`s, per-measurement trust metrics (`MeasurementConfidence`), an
+  adaptive-exposure primitive for batch loops, and an optional
+  `RawDiagnostics` capability for sensor characterization.
+- [`tristim-display/`](tristim-display) — Wayland layer-shell client that
+  shows solid-color test patches on a chosen output. Every RGB `wl_shm`
+  buffer format, the full parametric `wp_color_management_v1` surface, and
+  an optional centered-window mode for ABL-limited OLED peak measurement.
+  Code values go into the buffer verbatim; the crate is the workspace's
+  authority on which color representations a compositor can be asked for.
+- `tristim-capture/` — serde schema for capture files: the on-disk contract
+  between the gatherer and the analysis/presentation tools. No heavy deps.
+- `tristim-color/` — pure color science (color spaces, transfer functions,
+  ICtCp, error metrics) used to interpret captures.
+- `tristim-analyze/` — turns a capture into a verdict: derives the expected
+  output for each trial from the negotiated color description and scores how
+  far each measurement landed from it.
+- `tristim-gather/` — capture orchestration shared by the CLI and GUI:
+  drives a colorimeter and a patch surface through format × color-sequence
+  sweeps, reporting progress through an event callback.
+- `tristim-cli/` — the gatherer binary `tristim`. Subcommands for output
+  enumeration, one-shot measurement, sensor characterization
+  (`characterize`, `speed`, `integration`), gamut probing, capture
+  sessions, and capture analysis (`report`). `tristim help` has the full
+  option set.
+- [`tristim-gui/`](tristim-gui) — graphical front end: capture-setup form,
+  live capture progress, and visualization of analyzed captures
+  (chromaticity field with error vectors, luminance response, aggregate
+  stats). Deliberately outside the Cargo workspace so its GPU/UI dependency
+  tree stays out of the backend lockfile — build it from its own directory
+  (see its README).
 
-## License
+`tristim-driver` and `tristim-display` are headed to crates.io; the other
+crates are internal libraries behind the two applications.
 
-Dual MIT / Apache-2.0 (Rust ecosystem standard).
+## How the tool talks to the compositor
+
+`tristim-display` is an ordinary Wayland client. It writes code values into
+a `wl_buffer` and commits it on a layer-shell surface — exactly the path any
+application's content takes. For HDR it declares a parametric
+`wp_color_management_v1` description (e.g. PQ + BT.2020 + mastering
+metadata) so the compositor treats the buffer as already-encoded HDR
+content.
+
+This is deliberate: the tool measures what the compositor legitimately does
+with a client's color request, so the resulting characterization is an
+honest check on the compositor's pipeline rather than a measurement of a
+bypassed one.
 
 ## Setup — udev rule
 
-Datacolor colorimeters are vendor-class USB devices that need explicit access
-for non-root users:
+The colorimeters are vendor-class USB devices that need explicit access for
+non-root users:
 
 ```sh
 sudo cp 50-tristim.rules /etc/udev/rules.d/
@@ -87,19 +112,16 @@ sudo udevadm control --reload
 # unplug + replug the colorimeter
 ```
 
-After that the device is accessible to your logged-in user via systemd-logind's
-`uaccess` tag — no group membership needed.
+After that the device is accessible to your logged-in user via
+systemd-logind's `uaccess` tag — no group membership needed.
 
-## How the display tool talks to the compositor
+## Affiliation
 
-`tristim-display` is an ordinary Wayland client. It writes raw SDR RGB (or
-PQ-encoded fp16 in HDR mode) into a `wl_buffer` and commits it on a
-layer-shell surface — exactly the path any application's content takes. For
-HDR it declares a `wp_color_management_v1` parametric description (PQ +
-BT.2020 + mastering metadata) so the compositor treats the buffer as
-already-encoded HDR content.
+Unofficial. Not affiliated with, endorsed by, or sponsored by Datacolor or
+X-Rite. "Spyder", "SpyderX", "SpyderX2", and "Spyder 2024" are Datacolor's
+trademarks; "i1Display" and "ColorMunki" are X-Rite's. All are referenced
+here only to identify supported hardware.
 
-This is deliberate: the tool measures what the compositor legitimately does
-with a client's color request, so the resulting characterization is an
-honest check on the compositor's pipeline rather than a measurement of a
-bypassed one.
+## License
+
+Dual MIT / Apache-2.0.
