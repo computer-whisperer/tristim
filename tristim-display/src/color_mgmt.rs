@@ -448,7 +448,95 @@ impl std::fmt::Display for AttachError {
     }
 }
 
+impl AttachError {
+    /// A short reason suitable for a chip next to a disabled mode toggle.
+    pub fn reason(&self) -> String {
+        match self {
+            AttachError::UnknownTransferFunction(n) | AttachError::TfNotAdvertised(n) => {
+                format!("TF {n} unsupported")
+            }
+            AttachError::UnknownPrimaries(n) | AttachError::PrimariesNotAdvertised(n) => {
+                format!("primaries {n} unsupported")
+            }
+            AttachError::UnknownRenderIntent(n) | AttachError::IntentNotAdvertised(n) => {
+                format!("intent {n} unsupported")
+            }
+            AttachError::FeatureNotAdvertised(f) => format!("no {f} feature"),
+            AttachError::PowerExponentOutOfRange(_) => "power exponent out of range".to_string(),
+        }
+    }
+}
+
 impl std::error::Error for AttachError {}
+
+/// Check `req` against the compositor's advertised capabilities without
+/// sending anything — exactly the gating [`ColorManagedSurface::attach`]
+/// applies before its first request. Pre-flight callers
+/// ([`DisplayCapabilities::plan`](crate::DisplayCapabilities::plan)) and
+/// the attach path share this so the two can't drift.
+pub fn validate_description(
+    req: &DescriptionRequest,
+    caps: &ColorCapabilities,
+) -> Result<(), AttachError> {
+    use wp_color_manager_v1::{Feature, RenderIntent};
+
+    let intent = intent_named(&req.render_intent)
+        .ok_or_else(|| AttachError::UnknownRenderIntent(req.render_intent.clone()))?;
+    // Perceptual is the protocol's baseline; anything else must be
+    // advertised or set_image_description raises a protocol error.
+    if intent != RenderIntent::Perceptual && !caps.has_intent(intent) {
+        return Err(AttachError::IntentNotAdvertised(req.render_intent.clone()));
+    }
+
+    match &req.kind {
+        DescriptionKind::Parametric(p) => {
+            caps.require_feature(Feature::Parametric, "parametric")?;
+            match &p.transfer_function {
+                TransferChoice::Named(name) => {
+                    let tf = tf_named(name)
+                        .ok_or_else(|| AttachError::UnknownTransferFunction(name.clone()))?;
+                    if !caps.has_tf(tf) {
+                        return Err(AttachError::TfNotAdvertised(name.clone()));
+                    }
+                }
+                TransferChoice::Power(exp) => {
+                    if !(1.0..=10.0).contains(exp) {
+                        return Err(AttachError::PowerExponentOutOfRange(*exp));
+                    }
+                    caps.require_feature(Feature::SetTfPower, "set_tf_power")?;
+                }
+            }
+            match &p.primaries {
+                PrimariesChoice::Named(name) => {
+                    let pr = primaries_named(name)
+                        .ok_or_else(|| AttachError::UnknownPrimaries(name.clone()))?;
+                    if !caps.has_primaries(pr) {
+                        return Err(AttachError::PrimariesNotAdvertised(name.clone()));
+                    }
+                }
+                PrimariesChoice::Custom(_) => {
+                    caps.require_feature(Feature::SetPrimaries, "set_primaries")?;
+                }
+            }
+            if p.luminances.is_some() {
+                caps.require_feature(Feature::SetLuminances, "set_luminances")?;
+            }
+            if let Some(m) = &p.mastering {
+                if m.luminance_nits.is_some() || m.primaries.is_some() {
+                    caps.require_feature(
+                        Feature::SetMasteringDisplayPrimaries,
+                        "set_mastering_display_primaries",
+                    )?;
+                }
+                // max_cll / max_fall are plain CTA-861 metadata, ungated.
+            }
+            Ok(())
+        }
+        DescriptionKind::WindowsScrgb => {
+            caps.require_feature(Feature::WindowsScrgb, "windows_scrgb")
+        }
+    }
+}
 
 impl ColorManagedSurface {
     /// Build an image description from `req` + attach it to
@@ -469,15 +557,10 @@ impl ColorManagedSurface {
         D: Dispatch<WpImageDescriptionV1, Arc<Mutex<DescriptionState>>> + 'static,
         D: Dispatch<WpColorManagementSurfaceV1, ()> + 'static,
     {
-        use wp_color_manager_v1::{Feature, RenderIntent};
-
-        let intent = intent_named(&req.render_intent)
-            .ok_or_else(|| AttachError::UnknownRenderIntent(req.render_intent.clone()))?;
-        // Perceptual is the protocol's baseline; anything else must be
-        // advertised or set_image_description raises a protocol error.
-        if intent != RenderIntent::Perceptual && !caps.has_intent(intent) {
-            return Err(AttachError::IntentNotAdvertised(req.render_intent.clone()));
-        }
+        // Validate everything before sending anything: a mid-build error
+        // would otherwise leave a half-configured creator queued.
+        validate_description(req, caps)?;
+        let intent = intent_named(&req.render_intent).expect("validated above");
 
         // The state Mutex is the side-channel the dispatch impl updates
         // from ready/failed.
@@ -485,38 +568,23 @@ impl ColorManagedSurface {
 
         let description = match &req.kind {
             DescriptionKind::Parametric(p) => {
-                caps.require_feature(Feature::Parametric, "parametric")?;
                 let creator = manager.create_parametric_creator(qh, ());
 
                 match &p.transfer_function {
                     TransferChoice::Named(name) => {
-                        let tf = tf_named(name)
-                            .ok_or_else(|| AttachError::UnknownTransferFunction(name.clone()))?;
-                        if !caps.has_tf(tf) {
-                            return Err(AttachError::TfNotAdvertised(name.clone()));
-                        }
-                        creator.set_tf_named(tf);
+                        creator.set_tf_named(tf_named(name).expect("validated above"));
                     }
                     TransferChoice::Power(exp) => {
-                        if !(1.0..=10.0).contains(exp) {
-                            return Err(AttachError::PowerExponentOutOfRange(*exp));
-                        }
-                        caps.require_feature(Feature::SetTfPower, "set_tf_power")?;
                         creator.set_tf_power((exp * 10_000.0).round() as u32);
                     }
                 }
 
                 match &p.primaries {
                     PrimariesChoice::Named(name) => {
-                        let pr = primaries_named(name)
-                            .ok_or_else(|| AttachError::UnknownPrimaries(name.clone()))?;
-                        if !caps.has_primaries(pr) {
-                            return Err(AttachError::PrimariesNotAdvertised(name.clone()));
-                        }
-                        creator.set_primaries_named(pr);
+                        creator
+                            .set_primaries_named(primaries_named(name).expect("validated above"));
                     }
                     PrimariesChoice::Custom(c) => {
-                        caps.require_feature(Feature::SetPrimaries, "set_primaries")?;
                         creator.set_primaries(
                             coord_to_protocol(c.red[0]),
                             coord_to_protocol(c.red[1]),
@@ -531,7 +599,6 @@ impl ColorManagedSurface {
                 }
 
                 if let Some(l) = p.luminances {
-                    caps.require_feature(Feature::SetLuminances, "set_luminances")?;
                     creator.set_luminances(
                         nits_to_min_ticks(l.min_nits),
                         nits_to_lum(l.max_nits),
@@ -541,17 +608,9 @@ impl ColorManagedSurface {
 
                 if let Some(m) = &p.mastering {
                     if let Some((min, max)) = m.luminance_nits {
-                        caps.require_feature(
-                            Feature::SetMasteringDisplayPrimaries,
-                            "set_mastering_display_primaries",
-                        )?;
                         creator.set_mastering_luminance(nits_to_min_ticks(min), nits_to_lum(max));
                     }
                     if let Some(c) = m.primaries {
-                        caps.require_feature(
-                            Feature::SetMasteringDisplayPrimaries,
-                            "set_mastering_display_primaries",
-                        )?;
                         creator.set_mastering_display_primaries(
                             coord_to_protocol(c.red[0]),
                             coord_to_protocol(c.red[1]),
@@ -573,10 +632,7 @@ impl ColorManagedSurface {
 
                 creator.create(qh, state.clone())
             }
-            DescriptionKind::WindowsScrgb => {
-                caps.require_feature(Feature::WindowsScrgb, "windows_scrgb")?;
-                manager.create_windows_scrgb(qh, state.clone())
-            }
+            DescriptionKind::WindowsScrgb => manager.create_windows_scrgb(qh, state.clone()),
         };
 
         // Get the surface extension + set the description on it with

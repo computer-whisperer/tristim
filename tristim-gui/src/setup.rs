@@ -164,12 +164,12 @@ impl CaptureForm {
         }
     }
 
-    /// Store capabilities and force off any selected format they don't cover.
+    /// Store capabilities and force off any selected format they can't plan.
     fn apply_capabilities(&mut self, caps: display::DisplayCapabilities) {
         for f in &mut self.formats {
             if f.on {
                 if let Ok(spec) = gather::parse_format(f.token) {
-                    if spec.reachability(&caps).is_err() {
+                    if spec.plan(&caps).is_err() {
                         f.on = false;
                     }
                 }
@@ -178,11 +178,11 @@ impl CaptureForm {
         self.capabilities = Some(caps);
     }
 
-    /// Why `token` can't be reached on the current compositor, or `None` if it's
-    /// reachable (or capabilities haven't been queried yet, so we don't gate).
-    fn unreachable(&self, token: &str) -> Option<gather::Unreachable> {
+    /// Why `token` can't be arranged on the current compositor, or `None` if it
+    /// plans (or capabilities haven't been queried yet, so we don't gate).
+    fn unreachable(&self, token: &str) -> Option<display::Unarrangeable> {
         let caps = self.capabilities.as_ref()?;
-        gather::parse_format(token).ok()?.reachability(caps).err()
+        gather::parse_format(token).ok()?.plan(caps).err()
     }
 
     /// Re-enumerate the compositor's outputs (a quick Wayland roundtrip).

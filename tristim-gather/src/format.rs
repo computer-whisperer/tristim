@@ -1,27 +1,29 @@
-//! Color-format specs: parse a `name[:k=v,...]` token into the buffer format
-//! and color description to negotiate. Shared by the CLI (`--format`)
-//! and the GUI's capture form, so the set of known formats lives in one place.
+//! Color-format specs: parse a `name[:k=v,...]` token into the
+//! [`RenderMode`] to arrange. Shared by the CLI (`--format`) and the
+//! GUI's capture form, so the set of known formats lives in one place.
 //!
-//! Every spec accepts a `buf=<wl_shm name>` parameter overriding its
-//! default buffer format (e.g. `srgb:buf=xrgb2101010` to probe an sRGB
-//! description through a 10-bit buffer, or `pq-bt2020:buf=xbgr16161616`
-//! for PQ in 16-bit unorm on compositors without fp16 shm support).
+//! Specs name color *representations*; the buffer format realizing one
+//! is tristim-display's problem ([`BufferPolicy::Auto`] — fp16
+//! preferred for HDR, float required for extended-range, 8-bit for
+//! SDR). Every spec accepts a `buf=<wl_shm name>` parameter pinning the
+//! buffer instead ([`BufferPolicy::Exact`]) for when the buffer itself
+//! is the question — e.g. `pq-bt2020:buf=xrgb2101010` to ask what the
+//! compositor does with PQ in a 10-bit buffer.
 
 use std::collections::HashMap;
 
 use tristim_capture as cap;
 use tristim_display::{
-    self as display, BufferFormat, DescriptionKind, DescriptionRequest, ParametricDescription,
-    PrimariesChoice, TransferChoice,
+    self as display, BufferFormat, BufferPolicy, DescriptionKind, DescriptionRequest,
+    ParametricDescription, PipelinePlan, RenderMode, Unarrangeable,
 };
 
-/// A parsed `--format` spec: the buffer format + the description to negotiate
-/// (`None` = unmanaged). Construct via [`parse_format`].
+/// A parsed `--format` spec: a token plus the [`RenderMode`] it names.
+/// Construct via [`parse_format`].
 #[derive(Debug, Clone)]
 pub struct FormatSpec {
     token: String,
-    buffer_format: BufferFormat,
-    description: Option<DescriptionRequest>,
+    mode: RenderMode,
 }
 
 impl FormatSpec {
@@ -30,89 +32,36 @@ impl FormatSpec {
         &self.token
     }
 
-    /// `wl_shm` pixel-format name for this spec's buffer.
-    pub fn pixel_format_str(&self) -> &'static str {
-        self.buffer_format.name()
+    /// The color representation + buffer policy this spec names.
+    pub fn mode(&self) -> &RenderMode {
+        &self.mode
     }
 
-    pub(crate) fn buffer_format(&self) -> BufferFormat {
-        self.buffer_format
+    /// Can this spec be arranged on a compositor with the given
+    /// capabilities, and through which buffer? Thin delegation to
+    /// [`DisplayCapabilities::plan`](display::DisplayCapabilities::plan);
+    /// the `Err` carries chip-sized
+    /// [`reason`](display::Unarrangeable::reason) text.
+    pub fn plan(&self, caps: &display::DisplayCapabilities) -> Result<PipelinePlan, Unarrangeable> {
+        caps.plan(&self.mode)
+    }
+
+    /// Label for records when no pipeline was arranged: the pinned
+    /// buffer name, or `"auto"` when display would have chosen.
+    pub(crate) fn buffer_label(&self) -> &'static str {
+        match self.mode.buffer {
+            BufferPolicy::Exact(f) => f.name(),
+            BufferPolicy::Auto => "auto",
+        }
     }
 
     pub(crate) fn description(&self) -> Option<DescriptionRequest> {
-        self.description.clone()
-    }
-
-    /// Check whether this format can be reproduced on a compositor with the
-    /// given [`DisplayCapabilities`](display::DisplayCapabilities). `Ok(())`
-    /// means reachable; the `Err` carries the first unmet requirement
-    /// (buffer format, color-management protocol, transfer function,
-    /// primaries, feature, or render intent) for display.
-    pub fn reachability(&self, caps: &display::DisplayCapabilities) -> Result<(), Unreachable> {
-        if !caps.supports_buffer_format(self.buffer_format) {
-            return Err(Unreachable::BufferFormat(self.buffer_format));
-        }
-        let Some(d) = &self.description else {
-            return Ok(());
-        };
-        if !caps.has_color_management() {
-            return Err(Unreachable::NoColorManagement);
-        }
-        if !caps.supports_render_intent(&d.render_intent) {
-            return Err(Unreachable::RenderIntent(d.render_intent.clone()));
-        }
-        match &d.kind {
-            DescriptionKind::Parametric(p) => {
-                if !caps.supports_feature("parametric") {
-                    return Err(Unreachable::Feature("parametric"));
-                }
-                match &p.transfer_function {
-                    TransferChoice::Named(tf) => {
-                        if !caps.supports_transfer_function(tf) {
-                            return Err(Unreachable::TransferFunction(tf.clone()));
-                        }
-                    }
-                    TransferChoice::Power(_) => {
-                        if !caps.supports_feature("set_tf_power") {
-                            return Err(Unreachable::Feature("set_tf_power"));
-                        }
-                    }
-                }
-                match &p.primaries {
-                    PrimariesChoice::Named(pr) => {
-                        if !caps.supports_primaries(pr) {
-                            return Err(Unreachable::Primaries(pr.clone()));
-                        }
-                    }
-                    PrimariesChoice::Custom(_) => {
-                        if !caps.supports_feature("set_primaries") {
-                            return Err(Unreachable::Feature("set_primaries"));
-                        }
-                    }
-                }
-                if p.luminances.is_some() && !caps.supports_feature("set_luminances") {
-                    return Err(Unreachable::Feature("set_luminances"));
-                }
-                if let Some(m) = &p.mastering {
-                    if (m.luminance_nits.is_some() || m.primaries.is_some())
-                        && !caps.supports_feature("set_mastering_display_primaries")
-                    {
-                        return Err(Unreachable::Feature("set_mastering_display_primaries"));
-                    }
-                }
-            }
-            DescriptionKind::WindowsScrgb => {
-                if !caps.supports_feature("windows_scrgb") {
-                    return Err(Unreachable::Feature("windows_scrgb"));
-                }
-            }
-        }
-        Ok(())
+        self.mode.description.clone()
     }
 
     /// The capture-schema description mirroring what we requested.
     pub(crate) fn color_description(&self) -> Option<cap::ColorDescription> {
-        let d = self.description.as_ref()?;
+        let d = self.mode.description.as_ref()?;
         Some(match &d.kind {
             DescriptionKind::Parametric(p) => cap::ColorDescription {
                 transfer_function: p.transfer_function.label(),
@@ -140,40 +89,6 @@ impl FormatSpec {
                 mastering: None,
             },
         })
-    }
-}
-
-/// Why a format can't be reached on the current compositor. See
-/// [`FormatSpec::reachability`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unreachable {
-    /// The compositor doesn't advertise the required `wl_shm` buffer format.
-    BufferFormat(BufferFormat),
-    /// The format needs a color description but the compositor exposes no
-    /// `wp_color_manager_v1`.
-    NoColorManagement,
-    /// The transfer function isn't in the compositor's advertised set.
-    TransferFunction(String),
-    /// The primaries aren't in the compositor's advertised set.
-    Primaries(String),
-    /// A required optional feature (protocol `feature` enum entry name)
-    /// isn't advertised.
-    Feature(&'static str),
-    /// The render intent isn't in the compositor's advertised set.
-    RenderIntent(String),
-}
-
-impl Unreachable {
-    /// A short reason suitable for a chip next to a disabled format toggle.
-    pub fn reason(&self) -> String {
-        match self {
-            Unreachable::BufferFormat(f) => format!("no {} buffer", f.name()),
-            Unreachable::NoColorManagement => "no color management".to_string(),
-            Unreachable::TransferFunction(tf) => format!("TF {tf} unsupported"),
-            Unreachable::Primaries(p) => format!("primaries {p} unsupported"),
-            Unreachable::Feature(f) => format!("no {f} feature"),
-            Unreachable::RenderIntent(i) => format!("intent {i} unsupported"),
-        }
     }
 }
 
@@ -214,49 +129,43 @@ pub fn parse_format(spec: &str) -> Result<FormatSpec, String> {
             max_fall_nits: Some(num("maxfall")?.unwrap_or(peak / 2.0)),
         })
     };
-    // Buffer override: any wl_shm RGB format name this build can write.
-    let buf = |default: BufferFormat| -> Result<BufferFormat, String> {
+    // Buffer policy: display chooses unless buf= pins a format.
+    let buffer = || -> Result<BufferPolicy, String> {
         match params.get("buf") {
-            None => Ok(default),
+            None => Ok(BufferPolicy::Auto),
             Some(name) => BufferFormat::from_name(name)
+                .map(BufferPolicy::Exact)
                 .ok_or_else(|| format!("unknown buffer format {name:?} in buf= param")),
         }
     };
-    let managed = |bf, tf: &str, prim: &str, mastering| {
-        let mut p = ParametricDescription::named(tf, prim);
-        p.mastering = mastering;
+    let described = |description: DescriptionRequest| {
         Ok::<_, String>(FormatSpec {
             token: token.clone(),
-            buffer_format: buf(bf)?,
-            description: Some(DescriptionRequest::parametric(p)),
+            mode: RenderMode {
+                description: Some(description),
+                buffer: buffer()?,
+            },
         })
+    };
+    let managed = |tf: &str, prim: &str, mastering| {
+        let mut p = ParametricDescription::named(tf, prim);
+        p.mastering = mastering;
+        described(DescriptionRequest::parametric(p))
     };
 
     match name {
         "unmanaged" => Ok(FormatSpec {
             token: token.clone(),
-            buffer_format: buf(BufferFormat::Xrgb8888)?,
-            description: None,
+            mode: RenderMode {
+                description: None,
+                buffer: buffer()?,
+            },
         }),
-        "srgb" => managed(BufferFormat::Xrgb8888, "srgb", "srgb", None),
-        "srgb-p3" => managed(BufferFormat::Xrgb8888, "srgb", "display_p3", None),
-        "pq-bt2020" => managed(
-            BufferFormat::Xbgr16161616f,
-            "st2084_pq",
-            "bt2020",
-            Some(mk_mastering(400.0)?),
-        ),
-        "pq-p3" => managed(
-            BufferFormat::Xbgr16161616f,
-            "st2084_pq",
-            "display_p3",
-            Some(mk_mastering(400.0)?),
-        ),
-        "scrgb" => Ok(FormatSpec {
-            token: token.clone(),
-            buffer_format: buf(BufferFormat::Xbgr16161616f)?,
-            description: Some(DescriptionRequest::windows_scrgb()),
-        }),
+        "srgb" => managed("srgb", "srgb", None),
+        "srgb-p3" => managed("srgb", "display_p3", None),
+        "pq-bt2020" => managed("st2084_pq", "bt2020", Some(mk_mastering(400.0)?)),
+        "pq-p3" => managed("st2084_pq", "display_p3", Some(mk_mastering(400.0)?)),
+        "scrgb" => described(DescriptionRequest::windows_scrgb()),
         other => Err(format!(
             "unknown format {other:?} (known: {})",
             KNOWN_FORMATS.join(", ")
@@ -284,27 +193,23 @@ mod tests {
     use tristim_display::DisplayCapabilities;
 
     #[test]
-    fn reachability_gates_on_capabilities() {
+    fn planning_gates_on_capabilities() {
         // niri-like: no color management, only the mandatory 8-bit buffers.
         let bare = DisplayCapabilities::default();
-        assert!(
+        assert_eq!(
             parse_format("unmanaged")
                 .unwrap()
-                .reachability(&bare)
-                .is_ok()
+                .plan(&bare)
+                .unwrap()
+                .buffer,
+            BufferFormat::Xrgb8888
         );
         assert_eq!(
-            parse_format("srgb").unwrap().reachability(&bare),
-            Err(Unreachable::NoColorManagement)
+            parse_format("srgb").unwrap().plan(&bare),
+            Err(Unarrangeable::NoColorManagement)
         );
-        // fp16 is checked before color management, so the HDR format trips on
-        // the buffer first.
-        assert!(matches!(
-            parse_format("pq-bt2020").unwrap().reachability(&bare),
-            Err(Unreachable::BufferFormat(_))
-        ));
 
-        // A wide-gamut + HDR compositor: everything reachable.
+        // A wide-gamut + HDR compositor: everything arrangeable, HDR on fp16.
         let rich = DisplayCapabilities::advertising(
             &["srgb", "st2084_pq"],
             &["srgb", "bt2020", "display_p3"],
@@ -312,10 +217,18 @@ mod tests {
         );
         for tok in KNOWN_FORMATS {
             assert!(
-                parse_format(tok).unwrap().reachability(&rich).is_ok(),
-                "{tok} should be reachable on a full compositor"
+                parse_format(tok).unwrap().plan(&rich).is_ok(),
+                "{tok} should be arrangeable on a full compositor"
             );
         }
+        assert_eq!(
+            parse_format("pq-bt2020")
+                .unwrap()
+                .plan(&rich)
+                .unwrap()
+                .buffer,
+            BufferFormat::Xbgr16161616f
+        );
 
         // Same, but without display_p3 primaries → the P3 formats trip.
         let no_p3 = DisplayCapabilities::advertising(
@@ -324,49 +237,34 @@ mod tests {
             &[BufferFormat::Xbgr16161616f],
         );
         assert!(matches!(
-            parse_format("srgb-p3").unwrap().reachability(&no_p3),
-            Err(Unreachable::Primaries(_))
+            parse_format("srgb-p3").unwrap().plan(&no_p3),
+            Err(Unarrangeable::Description(_))
         ));
-        assert!(
-            parse_format("pq-bt2020")
-                .unwrap()
-                .reachability(&no_p3)
-                .is_ok()
-        );
+        assert!(parse_format("pq-bt2020").unwrap().plan(&no_p3).is_ok());
 
-        // fp16 absent but color management present → only the fp16 formats
-        // trip, and on the buffer.
-        let sdr_cm = DisplayCapabilities::advertising(&["srgb"], &["srgb", "display_p3"], &[]);
-        assert!(
-            parse_format("srgb-p3")
-                .unwrap()
-                .reachability(&sdr_cm)
-                .is_ok()
-        );
-        assert!(matches!(
-            parse_format("pq-p3").unwrap().reachability(&sdr_cm),
-            Err(Unreachable::BufferFormat(_))
-        ));
-        // ...unless buf= retargets PQ at an advertised deep-unorm buffer;
-        // then only the TF gate remains.
+        // fp16 absent: PQ degrades to an advertised deep unorm with a note,
+        // or fails when nothing adequate exists.
         let deep = DisplayCapabilities::advertising(
             &["srgb", "st2084_pq"],
             &["srgb", "bt2020"],
-            &[BufferFormat::Xbgr2101010],
+            &[BufferFormat::Xrgb2101010],
         );
-        assert!(
-            parse_format("pq-bt2020:buf=xbgr2101010")
-                .unwrap()
-                .reachability(&deep)
-                .is_ok()
-        );
+        let plan = parse_format("pq-bt2020").unwrap().plan(&deep).unwrap();
+        assert_eq!(plan.buffer, BufferFormat::Xrgb2101010);
+        assert!(!plan.notes.is_empty());
+        let sdr_only =
+            DisplayCapabilities::advertising(&["srgb", "st2084_pq"], &["srgb", "bt2020"], &[]);
+        assert!(matches!(
+            parse_format("pq-bt2020").unwrap().plan(&sdr_only),
+            Err(Unarrangeable::NoAdequateBuffer { .. })
+        ));
     }
 
     #[test]
     fn format_unmanaged_has_no_description() {
         let f = parse_format("unmanaged").unwrap();
-        assert!(f.description.is_none());
-        assert_eq!(f.pixel_format_str(), "xrgb8888");
+        assert!(f.mode().description.is_none());
+        assert_eq!(f.buffer_label(), "auto");
         assert!(f.color_description().is_none());
     }
 
@@ -382,7 +280,6 @@ mod tests {
     #[test]
     fn format_pq_params_override_mastering() {
         let f = parse_format("pq-bt2020:peak=600,maxfall=300").unwrap();
-        assert_eq!(f.pixel_format_str(), "xbgr16161616f");
         let d = f.color_description().unwrap();
         assert_eq!(d.transfer_function, "st2084_pq");
         assert_eq!(d.primaries, "bt2020");
@@ -393,10 +290,14 @@ mod tests {
     }
 
     #[test]
-    fn buf_param_overrides_buffer_format() {
+    fn buf_param_pins_the_buffer() {
         let f = parse_format("srgb:buf=xrgb2101010").unwrap();
-        assert_eq!(f.pixel_format_str(), "xrgb2101010");
-        // The description is unchanged by the buffer override.
+        assert_eq!(
+            f.mode().buffer,
+            BufferPolicy::Exact(BufferFormat::Xrgb2101010)
+        );
+        assert_eq!(f.buffer_label(), "xrgb2101010");
+        // The description is unchanged by the buffer pin.
         assert_eq!(f.color_description().unwrap().transfer_function, "srgb");
         assert!(parse_format("srgb:buf=nope").is_err());
     }
@@ -404,7 +305,6 @@ mod tests {
     #[test]
     fn format_scrgb_records_protocol_definition() {
         let f = parse_format("scrgb").unwrap();
-        assert_eq!(f.pixel_format_str(), "xbgr16161616f");
         let d = f.color_description().unwrap();
         assert_eq!(d.transfer_function, "ext_linear");
         assert_eq!(d.primaries, "srgb");

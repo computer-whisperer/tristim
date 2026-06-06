@@ -64,6 +64,7 @@
 
 pub mod color_mgmt;
 pub mod format;
+pub mod mode;
 pub mod pq;
 
 pub use color_mgmt::{
@@ -71,6 +72,7 @@ pub use color_mgmt::{
     Luminances, Mastering, ParametricDescription, PrimariesChoice, PrimaryCoords, TransferChoice,
 };
 pub use format::{BufferFormat, EncodedPixel};
+pub use mode::{BufferPolicy, PipelinePlan, RenderMode, Unarrangeable};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -150,6 +152,9 @@ pub enum Error {
 
     #[error("invalid color description request: {0}")]
     BadDescription(#[from] color_mgmt::AttachError),
+
+    #[error("can't arrange this mode here: {0}")]
+    Unarrangeable(#[from] mode::Unarrangeable),
 }
 
 /// A layer-shell surface fixed on a chosen output, holding a solid color.
@@ -173,28 +178,39 @@ impl PatchSurface {
         Self::open(output_name, BufferFormat::Xrgb8888, None)
     }
 
-    /// Open a patch surface on `output_name`.
-    ///
-    /// `format` selects the buffer pixel format (see [`BufferFormat`] —
-    /// only `Xrgb8888`/`Argb8888` are mandatory; check
-    /// [`DisplayCapabilities::supports_buffer_format`] first for the
-    /// rest). `description`, when `Some`, negotiates a
-    /// `wp_color_management_v1` image description for the surface —
-    /// recording how the compositor responds is part of what the
-    /// validator measures; `None` leaves the surface unmanaged.
-    ///
-    /// Errors: [`Error::NoColorManager`] if a description was requested
-    /// but the compositor doesn't advertise the protocol;
-    /// [`Error::BadDescription`] if the request names something this
-    /// build can't map, or uses a feature/TF/primaries/intent the
-    /// compositor didn't advertise (sending those anyway would be a
-    /// fatal protocol error); [`Error::DescriptionFailed`] if the
-    /// compositor rejected the description.
+    /// Open a patch surface with an explicit buffer format. Equivalent
+    /// to [`open_mode`](Self::open_mode) with [`BufferPolicy::Exact`].
     pub fn open(
         output_name: &str,
         format: BufferFormat,
         description: Option<DescriptionRequest>,
     ) -> Result<Self, Error> {
+        Self::open_mode(
+            output_name,
+            &RenderMode {
+                description,
+                buffer: BufferPolicy::Exact(format),
+            },
+        )
+    }
+
+    /// Arrange `mode` on `output_name`: connect, learn what the
+    /// compositor advertises, [`plan`](DisplayCapabilities::plan) the
+    /// pipeline (choosing the buffer format under
+    /// [`BufferPolicy::Auto`]), and negotiate the color description if
+    /// the mode has one. The arranged buffer format is reported by
+    /// [`buffer_format`](Self::buffer_format); `None` description
+    /// leaves the surface unmanaged.
+    ///
+    /// Errors: [`Error::NoColorManager`] if a description was requested
+    /// but the compositor doesn't advertise the protocol;
+    /// [`Error::Unarrangeable`] if the plan fails (description needs
+    /// something unadvertised, or no adequate buffer format — sending
+    /// unadvertised requests would be a fatal protocol error, so they
+    /// are refused client-side); [`Error::DescriptionFailed`] if the
+    /// compositor rejected the description on the wire.
+    pub fn open_mode(output_name: &str, mode: &RenderMode) -> Result<Self, Error> {
+        let description = mode.description.clone();
         let conn = Connection::connect_to_env()?;
         let (globals, mut event_queue) = registry_queue_init::<AppState>(&conn)?;
         let qh = event_queue.handle();
@@ -233,7 +249,9 @@ impl PatchSurface {
             shm,
             pool: None,
             surface_state: SurfaceState::WaitingForOutputs,
-            format,
+            // Placeholder until the plan below picks the real format —
+            // nothing draws before then (no surface exists yet).
+            format: BufferFormat::Xrgb8888,
             current_rgb: [0.0; 3],
             current_width: PATCH_WIDTH,
             current_height: PATCH_HEIGHT,
@@ -249,14 +267,26 @@ impl PatchSurface {
         // Pump events until OutputState has enumerated all outputs, so we
         // can match `output_name`. SCTK fires output events on the first
         // dispatch round-trip; one or two roundtrips is typically enough.
+        // The same roundtrips deliver the wl_shm formats and the color
+        // manager's supported_* enumeration — everything plan() needs.
         event_queue.roundtrip(&mut state)?;
         event_queue.roundtrip(&mut state)?;
 
         // Pick the matching output.
         let wl_output = pick_output(&state.output_state, output_name)?;
 
+        // Plan the pipeline against what the compositor advertised: the
+        // description must be arrangeable and the buffer format adequate
+        // (chosen here under BufferPolicy::Auto).
+        let plan = DisplayCapabilities {
+            color: state.capabilities.clone(),
+            shm_formats: state.shm.formats().to_vec(),
+        }
+        .plan(mode)?;
+        state.format = plan.buffer;
+
         // Pool size depends on the format's bytes-per-pixel.
-        let pool_size = (PATCH_WIDTH * PATCH_HEIGHT) as usize * format.bytes_per_pixel() * 2; // double-buffer
+        let pool_size = (PATCH_WIDTH * PATCH_HEIGHT) as usize * plan.buffer.bytes_per_pixel() * 2; // double-buffer
         let pool = SlotPool::new(pool_size, &state.shm)?;
         state.pool = Some(pool);
 
@@ -354,6 +384,24 @@ impl PatchSurface {
     /// records verbatim.
     pub fn color_capabilities(&self) -> &ColorCapabilities {
         &self.state.capabilities
+    }
+
+    /// The full capability snapshot from this surface's connection —
+    /// color capabilities plus advertised `wl_shm` formats. Lets a
+    /// caller [`plan`](DisplayCapabilities::plan) further modes without
+    /// another connect + roundtrip (as [`query_capabilities`] would).
+    pub fn display_capabilities(&self) -> DisplayCapabilities {
+        DisplayCapabilities {
+            color: self.state.capabilities.clone(),
+            shm_formats: self.state.shm.formats().to_vec(),
+        }
+    }
+
+    /// The buffer format this surface was arranged with — the planned
+    /// choice under [`BufferPolicy::Auto`], or the pinned format. A
+    /// fact for the capture record.
+    pub fn buffer_format(&self) -> BufferFormat {
+        self.state.format
     }
 
     /// The negotiation outcome for the color description attached to
@@ -599,11 +647,23 @@ impl DisplayCapabilities {
     /// The first format in `preference` order the compositor supports —
     /// e.g. `first_supported(&[Xbgr16161616f, Abgr16161616f, Xbgr16161616,
     /// Xrgb2101010])` for "fp16 preferred, deep unorm acceptable".
+    /// Prefer [`plan`](Self::plan), which knows each representation's
+    /// buffer needs; this is the low-level building block.
     pub fn first_supported(&self, preference: &[BufferFormat]) -> Option<BufferFormat> {
         preference
             .iter()
             .copied()
             .find(|&f| self.supports_buffer_format(f))
+    }
+
+    /// Can this [`RenderMode`] be arranged here, and through which
+    /// buffer? The pre-flight twin of [`PatchSurface::open_mode`]: the
+    /// same checks, without a connection. `Ok` carries the chosen
+    /// buffer format and any "limited by" notes; `Err` the first
+    /// blocker, with chip-sized [`reason`](Unarrangeable::reason) text
+    /// for UI surfacing.
+    pub fn plan(&self, mode: &RenderMode) -> Result<PipelinePlan, Unarrangeable> {
+        mode::plan(self, mode)
     }
 
     /// Whether the compositor exposes color management at all (the

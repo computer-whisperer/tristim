@@ -19,7 +19,7 @@ mod gamut;
 mod sequence;
 mod time;
 
-pub use format::{FormatSpec, KNOWN_FORMATS, Unreachable, parse_format};
+pub use format::{FormatSpec, KNOWN_FORMATS, parse_format};
 pub use gamut::{
     GamutConfig, GamutEvent, GamutMesh, GamutProbe, GamutVertex, MeshVertex, Patch, PatchStatus,
     RefineParams, ReproChecker, probe_gamut, probe_gamut_refined, refine_gamut,
@@ -200,11 +200,13 @@ pub fn run_capture(
         .find(|o| o.name == config.output);
 
     // Probe surface: collect capabilities, then run the one-time puck-placement
-    // countdown with a black patch on screen.
-    let (capabilities, compositor) = {
+    // countdown with a black patch on screen. `display_caps` is the planning
+    // snapshot each format's pipeline is pre-flighted against.
+    let (capabilities, display_caps, compositor) = {
         let mut probe = PatchSurface::open_sdr(&config.output)?;
         probe.set_code_values([0.0, 0.0, 0.0])?;
         let caps = to_cap_capabilities(probe.color_capabilities());
+        let display_caps = probe.display_capabilities();
         // Compositor identity: the socket peer process + the advertised globals
         // (both from the probe's Wayland connection) plus the session's
         // XDG_CURRENT_DESKTOP hint. All best-effort facts (see CompositorInfo).
@@ -229,7 +231,7 @@ pub fn run_capture(
             }
             sleep(Duration::from_secs(1));
         }
-        (caps, compositor)
+        (caps, display_caps, compositor)
     };
 
     let settle_ms = config.settle.as_millis() as u64;
@@ -240,15 +242,75 @@ pub fn run_capture(
         if should_cancel() {
             break;
         }
+        // Pre-flight: can tristim-display arrange this representation here,
+        // and through which buffer? Refusals are recorded as facts on the
+        // trial, never aborting the run.
+        let plan = display_caps.plan(fs.mode());
+        let mut pixel_format = match &plan {
+            Ok(p) => p.buffer.name().to_string(),
+            Err(_) => fs.buffer_label().to_string(),
+        };
         on_event(GatherEvent::FormatStart {
             index: fi,
             total: format_count,
             token: fs.token().to_string(),
-            pixel_format: fs.pixel_format_str().to_string(),
+            pixel_format: pixel_format.clone(),
             requested: fs.color_description(),
         });
 
-        let (surface, outcome) = open_format(&config.output, fs)?;
+        let (surface, outcome) = match plan {
+            // Pin the planned buffer so the recorded pixel_format above is
+            // exactly what the surface uses.
+            Ok(p) => open_format(
+                &config.output,
+                &display::RenderMode {
+                    description: fs.description(),
+                    buffer: display::BufferPolicy::Exact(p.buffer),
+                },
+            )?,
+            // Gatherer policy: a compositor with no color management at all
+            // still gets measured — show an unmanaged buffer under the same
+            // buffer policy; `requested` records what we intended and the
+            // analysis tool assumes sRGB for unmanaged.
+            Err(display::Unarrangeable::NoColorManagement) => {
+                let fallback = display::RenderMode {
+                    description: None,
+                    buffer: fs.mode().buffer,
+                };
+                match display_caps
+                    .plan(&fallback)
+                    .map(|p| PatchSurface::open(&config.output, p.buffer, None))
+                {
+                    Ok(Ok(s)) => {
+                        pixel_format = s.buffer_format().name().to_string();
+                        (Some(s), cap::Negotiation::Unmanaged)
+                    }
+                    Ok(Err(e)) => (
+                        None,
+                        cap::Negotiation::Rejected {
+                            cause: "unmanaged_fallback_failed".into(),
+                            message: e.to_string(),
+                        },
+                    ),
+                    Err(u) => (
+                        None,
+                        cap::Negotiation::Rejected {
+                            cause: "not_arrangeable".into(),
+                            message: u.to_string(),
+                        },
+                    ),
+                }
+            }
+            // Anything else (description needs an unadvertised value or
+            // feature, no adequate buffer): record the refusal and move on.
+            Err(u) => (
+                None,
+                cap::Negotiation::Rejected {
+                    cause: "not_arrangeable".into(),
+                    message: u.to_string(),
+                },
+            ),
+        };
         on_event(GatherEvent::Negotiation(outcome.clone()));
 
         let mut samples = Vec::new();
@@ -384,7 +446,7 @@ pub fn run_capture(
         let n = samples.len();
         trials.push(cap::FormatTrial {
             requested: fs.color_description(),
-            pixel_format: fs.pixel_format_str().to_string(),
+            pixel_format,
             outcome,
             gamut,
             samples,
@@ -439,16 +501,16 @@ pub fn run_capture(
     })
 }
 
-/// Open a patch surface for one format, returning the surface (if patches can
-/// be shown) and the negotiation outcome to record. Mirrors the gatherer's
-/// negotiation policy: a compositor that exposes no color manager still gets a
-/// plain unmanaged buffer of the same pixel format; an outright rejection is
-/// recorded without sending anything.
+/// Arrange one mode on the output, returning the surface (if patches can be
+/// shown) and the negotiation outcome to record. Refusals — client-side
+/// (unarrangeable here) or wire-level (compositor rejected the description)
+/// — come back as [`cap::Negotiation::Rejected`] facts rather than aborting
+/// the run; only transport-level failures error out.
 pub(crate) fn open_format(
     output: &str,
-    fs: &FormatSpec,
+    mode: &display::RenderMode,
 ) -> Result<(Option<PatchSurface>, cap::Negotiation), GatherError> {
-    match PatchSurface::open(output, fs.buffer_format(), fs.description()) {
+    match PatchSurface::open_mode(output, mode) {
         Ok(s) => {
             let outcome = match s.description_state() {
                 None => cap::Negotiation::Unmanaged,
@@ -463,26 +525,35 @@ pub(crate) fn open_format(
             };
             Ok((Some(s), outcome))
         }
-        // The compositor has color management but refused this description.
-        // Record the refusal; don't send it anyway.
+        // The compositor has color management but refused this description
+        // on the wire. Record the refusal.
         Err(display::Error::DescriptionFailed { cause, message }) => {
             Ok((None, cap::Negotiation::Rejected { cause, message }))
         }
-        // No color management at all: still useful — send a plain buffer of the
-        // same pixel format and measure (the analysis tool assumes sRGB for
-        // unmanaged); `requested` still records what we intended.
-        Err(display::Error::NoColorManager) => {
-            match PatchSurface::open(output, fs.buffer_format(), None) {
-                Ok(s) => Ok((Some(s), cap::Negotiation::Unmanaged)),
-                Err(e) => Ok((
-                    None,
-                    cap::Negotiation::Rejected {
-                        cause: "unmanaged_fallback_failed".into(),
-                        message: e.to_string(),
-                    },
-                )),
-            }
-        }
+        // The mode can't be arranged here (description needs an unadvertised
+        // value or feature, no adequate buffer, or no color management at
+        // all). A fact worth recording, not a run-stopper.
+        Err(display::Error::Unarrangeable(u)) => Ok((
+            None,
+            cap::Negotiation::Rejected {
+                cause: "not_arrangeable".into(),
+                message: u.to_string(),
+            },
+        )),
+        Err(display::Error::BadDescription(e)) => Ok((
+            None,
+            cap::Negotiation::Rejected {
+                cause: "not_arrangeable".into(),
+                message: e.to_string(),
+            },
+        )),
+        Err(display::Error::NoColorManager) => Ok((
+            None,
+            cap::Negotiation::Rejected {
+                cause: "no_color_management".into(),
+                message: "compositor doesn't advertise wp_color_manager_v1".into(),
+            },
+        )),
         Err(e) => Err(e.into()),
     }
 }

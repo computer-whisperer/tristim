@@ -53,13 +53,21 @@ compositor's advertised capabilities so the caller can record the facts.
   (luminance, display primaries, max CLL/FALL), render-intent selection,
   and the `windows_scrgb` description shortcut. Negotiation outcome is
   exposed as `Pending / Ready / Failed`.
+- **Pipeline planning** — consumers think in *representations*
+  (`RenderMode`: a color description + `BufferPolicy`), not buffer
+  formats. Under `BufferPolicy::Auto` the crate picks an adequate
+  advertised buffer (float required for extended-range encodings like
+  scRGB, fp16 preferred then deep unorm for PQ/HLG, 8-bit for SDR);
+  `BufferPolicy::Exact` pins one for when the buffer itself is the
+  question. `DisplayCapabilities::plan()` is the pre-flight twin of
+  `PatchSurface::open_mode()` — same checks, no connection — returning
+  the chosen buffer + "limited by" notes, or a typed `Unarrangeable`
+  with chip-sized reason text.
 - **Capability gating everywhere** — optional protocol requests are fatal
   protocol errors when the compositor didn't advertise the feature, so
-  `open()` checks the advertised features/TFs/primaries/intents first and
-  returns a typed `AttachError` instead of dying. `query_capabilities()`
-  reports advertised buffer formats and color capabilities up front;
-  `first_supported(&[...])` picks the best advertised buffer format from a
-  preference list.
+  planning/attaching checks the advertised features/TFs/primaries/intents
+  first and refuses client-side instead of dying. `query_capabilities()`
+  reports advertised buffer formats and color capabilities up front.
 - **Windowed patches** — `set_window_fraction(0.04)` paints a centered
   bright window on black, for OLED/ABL-limited peak measurement at
   industry-spec window sizes (the surface stays fullscreen so the desktop

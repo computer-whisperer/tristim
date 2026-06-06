@@ -155,7 +155,7 @@ fn open_session(
         hw_version: info.firmware,
     });
 
-    let (surface, outcome) = open_format(&config.output, &config.format)?;
+    let (surface, outcome) = open_format(&config.output, config.format.mode())?;
     on_event(GamutEvent::Negotiation(outcome.clone()));
     let mut surface = match surface {
         Some(s) => s,
