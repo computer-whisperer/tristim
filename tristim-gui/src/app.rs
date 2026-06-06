@@ -133,6 +133,18 @@ enum OpenOutcome {
     Failed(String),
 }
 
+/// Result of the background export save-dialog + write.
+enum ExportOutcome {
+    /// The save dialog was dismissed.
+    Cancelled,
+    /// The export was written; `what` describes it for the toast.
+    Saved {
+        path: String,
+        what: String,
+    },
+    Failed(String),
+}
+
 /// A format trial being measured right now: enough to assemble a `FormatTrial`
 /// and score it live, before the run finishes.
 struct LiveTrial {
@@ -401,6 +413,12 @@ pub struct PresenterApp {
     open_rx: Option<Receiver<OpenOutcome>>,
     /// Last open-file error, shown in the header / setup screen.
     open_error: Option<String>,
+    /// Export dialog visibility (present mode).
+    export_open: bool,
+    /// Pending export save-dialog + write, resolved on a background thread.
+    export_rx: Option<Receiver<ExportOutcome>>,
+    /// Toasts queued for the host (export results); drained per frame.
+    toasts: Vec<ToastSpec>,
     /// Which plot is shown (present mode).
     view: Tab,
     /// Chromaticity projection for the diagram.
@@ -427,6 +445,9 @@ impl PresenterApp {
             running: None,
             source_path: None,
             open_rx: None,
+            export_open: false,
+            export_rx: None,
+            toasts: Vec::new(),
             open_error: None,
             view: Tab::Space3D,
             space: Space::UvPrime,
@@ -450,6 +471,9 @@ impl PresenterApp {
             running: None,
             source_path: None,
             open_rx: None,
+            export_open: false,
+            export_rx: None,
+            toasts: Vec::new(),
             open_error: None,
             view: Tab::Space3D,
             space: Space::UvPrime,
@@ -527,6 +551,9 @@ impl PresenterApp {
             running: Some(running),
             source_path: None,
             open_rx: None,
+            export_open: false,
+            export_rx: None,
+            toasts: Vec::new(),
             open_error: None,
             // Unlike the live entry points (which default to Space3D), the
             // dump-only running harness starts on a 2D view: the headless lint
@@ -608,6 +635,12 @@ impl PresenterApp {
     /// exercise the filled layout.
     pub fn set_show_field(&mut self, on: bool) {
         self.show_field = on;
+    }
+
+    /// Open/close the export dialog. Used by the headless dump to lint the
+    /// modal's layout.
+    pub fn set_export_open(&mut self, on: bool) {
+        self.export_open = on;
     }
 
     /// Enable the setup form's gamut-probe controls. Used by the headless dump
@@ -813,6 +846,118 @@ impl PresenterApp {
         self.apply_open(outcome);
     }
 
+    /// Kick off an export: render the chosen format from the presented
+    /// capture (cheap, on this thread), then run the native save dialog and
+    /// the file write on a background thread. The result is drained into a
+    /// toast in [`Self::before_build`].
+    fn start_export(&mut self, csv: bool) {
+        self.export_open = false;
+        if self.export_rx.is_some() {
+            return; // a dialog is already in flight
+        }
+        let Some(p) = &self.presented else { return };
+        let stem = self
+            .source_path
+            .as_deref()
+            .map(file_name)
+            .unwrap_or("capture")
+            .trim_end_matches(".json")
+            .to_string();
+        let (what, suggested, body) = if csv {
+            let n: usize = p.capture.trials.iter().map(|t| t.samples.len()).sum();
+            (
+                format!("{n} samples"),
+                format!("{stem}.csv"),
+                cap::export::to_csv(&p.capture),
+            )
+        } else {
+            let sel = p.selected.min(p.capture.trials.len().saturating_sub(1));
+            match cap::export::trial_to_ti3(&p.capture, sel) {
+                Some(body) => (
+                    format!(
+                        "trial {sel}, {} patches",
+                        p.capture.trials[sel].samples.len()
+                    ),
+                    format!("{stem}-trial{sel}.ti3"),
+                    body,
+                ),
+                None => {
+                    self.toasts.push(ToastSpec::error(format!(
+                        "can't export trial {sel} as .ti3: no samples to normalize against"
+                    )));
+                    return;
+                }
+            }
+        };
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let outcome = match rfd::FileDialog::new()
+                .set_title("Export measurements")
+                .set_file_name(&suggested)
+                .save_file()
+            {
+                None => ExportOutcome::Cancelled,
+                Some(path) => match std::fs::write(&path, body) {
+                    Ok(()) => ExportOutcome::Saved {
+                        path: path.display().to_string(),
+                        what,
+                    },
+                    Err(e) => ExportOutcome::Failed(format!("{}: {e}", path.display())),
+                },
+            };
+            let _ = tx.send(outcome);
+        });
+        self.export_rx = Some(rx);
+    }
+
+    /// Drain a pending export result into a toast.
+    fn drain_export(&mut self) {
+        let outcome = match &self.export_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(o) => o,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => ExportOutcome::Cancelled,
+            },
+            None => return,
+        };
+        self.export_rx = None;
+        match outcome {
+            ExportOutcome::Cancelled => {}
+            ExportOutcome::Saved { path, what } => self
+                .toasts
+                .push(ToastSpec::success(format!("wrote {path} ({what})"))),
+            ExportOutcome::Failed(e) => self
+                .toasts
+                .push(ToastSpec::error(format!("export failed: {e}"))),
+        }
+    }
+
+    /// The export-choice modal: the focused trial as CGATS `.ti3` (the ICC
+    /// pipeline's measurement input) or the whole capture as one flat CSV.
+    fn export_modal(&self, p: &Presented) -> El {
+        let sel = p.selected.min(p.capture.trials.len().saturating_sub(1));
+        let label = self.trial_label(p, sel);
+        let caption = |s: &str| text(s).muted().font_size(12.0).wrap_text().fill_width();
+        // No wrapping column: `modal`'s panel is already a stretch-aligned,
+        // gapped column at a fixed width.
+        modal(
+            "export",
+            "Export measurements",
+            [
+                caption("Renders the capture's recorded facts for other tools."),
+                button(format!("Trial {sel} ({label}) → .ti3"))
+                    .key("export:ti3")
+                    .primary(),
+                caption(
+                    "CGATS display measurement data: ArgyllCMS `colprof` builds an \
+                     ICC profile from it; `profcheck` and DisplayCAL read it too.",
+                ),
+                button("All samples → .csv").key("export:csv").secondary(),
+                caption("One flat table of every sample across all trials."),
+            ],
+        )
+    }
+
     /// Short label for trial `i`: the requested (or unmanaged) basis + format.
     fn trial_label(&self, p: &Presented, i: usize) -> String {
         let fmt = &p.analyzed.trials[i].pixel_format;
@@ -836,6 +981,7 @@ impl PresenterApp {
         row([
             brand(subtitle),
             spacer(),
+            button("Export…").key("export").secondary(),
             button("Open…").key("open").secondary(),
             button("New capture").key("new-capture").secondary(),
         ])
@@ -1206,6 +1352,10 @@ impl PresenterApp {
     fn on_present_event(&mut self, e: UiEvent) {
         match e.kind {
             UiEventKind::Click | UiEventKind::Activate => match e.route() {
+                Some("export") => self.export_open = self.presented.is_some(),
+                Some("export:dismiss") => self.export_open = false,
+                Some("export:ti3") => self.start_export(false),
+                Some("export:csv") => self.start_export(true),
                 Some("field-toggle") => self.show_field = !self.show_field,
                 Some("space-toggle") => self.space = self.space.toggled(),
                 // Clear the hovered sample on any view switch — hit geometry is
@@ -1380,6 +1530,7 @@ impl App for PresenterApp {
         // Drain background work before laying out the frame.
         self.drain_capture();
         self.drain_open();
+        self.drain_export();
         // Keep the 3D scene's cached geometry handles current with the focused
         // trial. Done here (not in `build`, which is `&self`) so the handles
         // persist across frames and the backend re-uploads nothing on orbit.
@@ -1408,9 +1559,22 @@ impl App for PresenterApp {
                 None => self.setup_view(),
             },
         };
-        body.padding(tokens::SPACE_6)
+        let body = body
+            .padding(tokens::SPACE_6)
             .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0))
+            .height(Size::Fill(1.0));
+        // The export dialog floats over the padded page (so its scrim covers
+        // the whole window).
+        match (&self.mode, &self.presented) {
+            (Mode::Presenting, Some(p)) if self.export_open => {
+                overlays(body, [Some(self.export_modal(p))])
+            }
+            _ => body,
+        }
+    }
+
+    fn drain_toasts(&mut self) -> Vec<ToastSpec> {
+        std::mem::take(&mut self.toasts)
     }
 
     fn shaders(&self) -> Vec<AppShader> {

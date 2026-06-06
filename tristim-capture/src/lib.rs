@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
+pub mod export;
+
 /// Current schema version. Bump on any breaking change to the types below;
 /// readers should reject captures whose `schema_version` they don't understand.
 ///
@@ -496,7 +498,7 @@ impl Capture {
 mod tests {
     use super::*;
 
-    fn sample_capture() -> Capture {
+    pub(crate) fn sample_capture() -> Capture {
         Capture {
             schema_version: SCHEMA_VERSION,
             timestamp: "2026-05-24T12:00:00Z".to_string(),

@@ -52,6 +52,16 @@ file dialog to load another capture, replacing the one in view. The dialog uses
 the `xdg-desktop-portal` file chooser and runs off the main thread, so it works
 on Wayland without linking GTK and without freezing the window.
 
+## Exporting measurements
+
+**Export…** (in the presenter header) renders the capture's recorded facts
+for other tools: the focused trial as CGATS `.ti3` display measurement data
+(ArgyllCMS `colprof` builds an ICC profile from it; `profcheck` and
+DisplayCAL read it too), or every sample of every trial as one flat CSV.
+The save dialog runs through the same portal machinery as **Open…**; the
+result lands as a toast. The `tristim export` CLI subcommand offers the
+same formats (plus all-trials `.ti3` in one go).
+
 ## Headless layout check (`dump`)
 
 The `dump` binary builds the presenter tree for each trial in a capture and runs

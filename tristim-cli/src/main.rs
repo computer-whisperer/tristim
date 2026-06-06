@@ -23,6 +23,7 @@
 //!                                        probe one encoding's reproduced gamut
 //!   tristim capture --output NAME ...    run a capture session, write JSON
 //!   tristim report FILE.json             analyze a capture, print per-trial error
+//!   tristim export FILE.json --ti3|--csv export a capture's measurements
 
 use std::error::Error;
 use std::time::Duration;
@@ -50,6 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "gamut" => cmd_gamut(&argv[2..]),
         "capture" => cmd_capture(&argv[2..]),
         "report" => cmd_report(&argv[2..]),
+        "export" => cmd_export(&argv[2..]),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
@@ -170,6 +172,11 @@ fn print_usage() {
     eprintln!("  report FILE.json [--top N]");
     eprintln!("        Analyze a capture and print per-trial error (Δu'v', ΔE) and the");
     eprintln!("        worst-offending samples (default N=8).");
+    eprintln!("  export FILE.json (--ti3 [--trial N] | --csv) [-o PATH]");
+    eprintln!("        Export a capture's measurements. --ti3 writes ArgyllCMS/CGATS");
+    eprintln!("        display measurement data per trial (one .ti3 per trial, or just");
+    eprintln!("        trial N) — feed it to colprof to build an ICC profile. --csv");
+    eprintln!("        writes every sample of every trial as one flat table.");
 }
 
 // ── diagnostics ─────────────────────────────────────────────────────────────
@@ -922,6 +929,84 @@ fn cmd_report(args: &[String]) -> Result<(), Box<dyn Error>> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// Short label for a trial in export logs: `basis · pixel_format`.
+fn export_trial_label(trial: &cap::FormatTrial) -> String {
+    let basis = match &trial.requested {
+        Some(d) => format!("{}/{}", d.transfer_function, d.primaries),
+        None => "unmanaged".to_string(),
+    };
+    format!("{basis} · {}", trial.pixel_format)
+}
+
+fn cmd_export(args: &[String]) -> Result<(), Box<dyn Error>> {
+    const USAGE: &str = "usage: tristim export FILE.json (--ti3 [--trial N] | --csv) [-o PATH]";
+    let path = args
+        .first()
+        .filter(|a| !a.starts_with('-'))
+        .ok_or(USAGE)?
+        .clone();
+    let ti3 = args.iter().any(|a| a == "--ti3");
+    let csv = args.iter().any(|a| a == "--csv");
+    if ti3 == csv {
+        return Err(USAGE.into());
+    }
+    let capture = cap::Capture::load(&path)?;
+    let stem = path.strip_suffix(".json").unwrap_or(&path).to_string();
+    let out = arg_value(args, "-o");
+
+    if csv {
+        let out = out.unwrap_or_else(|| format!("{stem}.csv"));
+        std::fs::write(&out, cap::export::to_csv(&capture))?;
+        let rows: usize = capture.trials.iter().map(|t| t.samples.len()).sum();
+        println!(
+            "wrote {out} ({rows} samples across {} trials)",
+            capture.trials.len()
+        );
+        return Ok(());
+    }
+
+    if let Some(t) = arg_value(args, "--trial") {
+        let t: usize = t.parse().map_err(|_| format!("bad trial index {t:?}"))?;
+        let label = capture
+            .trials
+            .get(t)
+            .map(export_trial_label)
+            .ok_or_else(|| format!("no trial {t} (capture has {})", capture.trials.len()))?;
+        let body = cap::export::trial_to_ti3(&capture, t)
+            .ok_or_else(|| format!("trial {t} ({label}) has no exportable samples"))?;
+        let out = out.unwrap_or_else(|| format!("{stem}-trial{t}.ti3"));
+        std::fs::write(&out, body)?;
+        println!(
+            "wrote {out} ({} patches, {label})",
+            capture.trials[t].samples.len()
+        );
+        return Ok(());
+    }
+
+    // All trials: one .ti3 each. `-o` names a single file, so it only makes
+    // sense with --trial.
+    if out.is_some() {
+        return Err("-o names one file; combine it with --trial N".into());
+    }
+    let mut wrote = 0;
+    for (t, trial) in capture.trials.iter().enumerate() {
+        let label = export_trial_label(trial);
+        match cap::export::trial_to_ti3(&capture, t) {
+            Some(body) => {
+                let out = format!("{stem}-trial{t}.ti3");
+                std::fs::write(&out, body)?;
+                println!("wrote {out} ({} patches, {label})", trial.samples.len());
+                wrote += 1;
+            }
+            None => println!("skipped trial {t} ({label}): no exportable samples"),
+        }
+    }
+    if wrote == 0 {
+        return Err("no trial had exportable samples".into());
     }
     Ok(())
 }

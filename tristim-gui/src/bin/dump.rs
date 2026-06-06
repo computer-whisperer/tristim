@@ -259,6 +259,10 @@ fn run(path: &str, out_dir: &str) -> Result<usize, String> {
         );
         total += render(&app, &format!("space3d-overlays-{w}w"))?;
         app.set_space3d_overlays(RefCages::default(), false);
+        // The export dialog over the presenter.
+        app.set_export_open(true);
+        total += render(&app, &format!("export-dialog-{w}w"))?;
+        app.set_export_open(false);
     }
     Ok(total)
 }

@@ -75,7 +75,9 @@ downstream against the recorded facts.
 - `tristim-cli/` — the gatherer binary `tristim`. Subcommands for output
   enumeration, one-shot measurement, sensor characterization
   (`characterize`, `speed`, `integration`), gamut probing, capture
-  sessions, and capture analysis (`report`). `tristim help` has the full
+  sessions, capture analysis (`report`), and export (`export` — CGATS
+  `.ti3` per trial for the ArgyllCMS/DisplayCAL toolchain, e.g. `colprof`
+  to build an ICC profile, or flat CSV). `tristim help` has the full
   option set.
 - [`tristim-gui/`](tristim-gui) — graphical front end: capture-setup form,
   live capture progress, and visualization of analyzed captures
