@@ -821,56 +821,24 @@ impl PresenterApp {
         format!("{basis} · {fmt}")
     }
 
-    fn present_header(&self, p: &Presented, cx: &BuildCx) -> El {
-        let dev = &p.capture.device;
-        let out = &p.capture.output;
-        let out_label = match &out.mode {
-            Some(m) => format!("{} · {}×{}", out.name, m.width, m.height),
-            None => out.name.clone(),
-        };
+    /// Brand + window actions only. The capture's provenance facts live in
+    /// the sidebar's [`capture_card`], beside (and cleanly separated from)
+    /// the live [`display_info`](Self::display_info) card.
+    fn present_header(&self) -> El {
         // The wordmark subtitle names the file in focus (bounded, leftmost).
         let subtitle = self
             .source_path
             .as_deref()
             .map(file_name)
             .unwrap_or("color validation presenter");
-        let mut facts = vec![fact(
-            "device",
-            format!(
-                "{} · SN {} · cal {}",
-                dev.product, dev.serial, dev.cal_index
-            ),
-        )];
-        facts.push(fact("output", out_label));
-        // The compositor that served the capture (v2+; absent for older files).
-        if let Some(comp) = compositor_label(&p.capture.compositor) {
-            facts.push(fact("compositor", comp));
-        }
-        facts.push(fact("captured", p.capture.timestamp.clone()));
-        let actions = [
+        row([
+            brand(subtitle),
+            spacer(),
             button("Open…").key("open").secondary(),
             button("New capture").key("new-capture").secondary(),
-        ];
-        // One line when it fits; on a narrow (half-width) window the facts
-        // wrap onto their own row under the brand + actions.
-        if cx.viewport().is_some_and(|(vw, _)| vw < HEADER_BREAK) {
-            let mut top = vec![brand(subtitle), spacer()];
-            top.extend(actions);
-            column([
-                row(top).gap(tokens::SPACE_4).align(Align::Center),
-                row(facts)
-                    .gap(tokens::SPACE_4)
-                    .align(Align::Center)
-                    .width(Size::Fill(1.0)),
-            ])
-            .gap(tokens::SPACE_2)
-            .width(Size::Fill(1.0))
-        } else {
-            let mut items = vec![brand(subtitle), spacer()];
-            items.extend(facts);
-            items.extend(actions);
-            row(items).gap(tokens::SPACE_4).align(Align::Center)
-        }
+        ])
+        .gap(tokens::SPACE_4)
+        .align(Align::Center)
     }
 
     fn sidebar(&self, p: &Presented, cx: &BuildCx) -> El {
@@ -888,15 +856,17 @@ impl PresenterApp {
         if p.analyzed.trials.is_empty() {
             items.push(text("(capture has no trials)").muted().font_size(12.0));
         }
-        items.push(divider());
+        items.push(capture_card(p));
         items.push(self.display_info(cx));
         column(items).width(Size::Fixed(300.0)).gap(tokens::SPACE_2)
     }
 
-    /// What the presenter's *own* window negotiated — the other side of the
-    /// glass from the capture under test.
+    /// What the presenter's *own* window negotiated — live system state, the
+    /// other side of the glass from the capture under test. Deliberately a
+    /// separate card from [`capture_card`] so current state never reads as
+    /// capture provenance.
     fn display_info(&self, cx: &BuildCx) -> El {
-        let mut rows: Vec<El> = vec![section_label("Presenter display")];
+        let mut rows: Vec<El> = Vec::new();
         match cx.diagnostics() {
             Some(d) => {
                 rows.push(kv_field("backend", d.backend));
@@ -918,7 +888,7 @@ impl PresenterApp {
             }
             None => rows.push(text("(no host diagnostics yet)").muted().font_size(12.0)),
         }
-        column(rows).gap(tokens::SPACE_2)
+        sidebar_card("Presenter display", rows)
     }
 
     /// The plot + stats panel for the in-focus trial. `extra_chrome` is added to
@@ -1089,7 +1059,7 @@ impl PresenterApp {
     }
 
     fn present_view(&self, p: &Presented, cx: &BuildCx) -> El {
-        let mut items = vec![self.present_header(p, cx), divider()];
+        let mut items = vec![self.present_header(), divider()];
         // The banner row (and its column gap) eats into the plot's vertical
         // budget like the running view's progress strip does.
         let mut extra_chrome = 0.0;
@@ -1312,11 +1282,6 @@ impl PresenterApp {
 /// matches the old bare-plot footprint and the stat column keeps its width.
 const PLOT_CARD_PAD: f32 = tokens::SPACE_4;
 
-/// Viewport width below which the present header wraps its facts onto a second
-/// row (a half-width window on a 1080p display sits well under this; the
-/// single-row header needs ~1100px).
-const HEADER_BREAK: f32 = 1160.0;
-
 /// Wrap a plot in damascene's panel card, so all three views share one
 /// content-separation surface (CARD fill + border + radius + shadow) instead
 /// of a hand-drawn frame. Hugs the plot rather than filling the row width;
@@ -1369,9 +1334,7 @@ fn content_layout(cx: &BuildCx, extra_chrome: f32) -> ContentLayout {
 
     let (vw, vh) = cx.viewport().unwrap_or((1280.0, 800.0));
     let content_w = vw - 2.0 * ROOT_PAD - SIDEBAR_W - COL_GAP;
-    // The header wraps its facts onto a second row on a narrow window.
-    let header_wrap = if vw < HEADER_BREAK { 34.0 } else { 0.0 };
-    let v_budget = vh - extra_chrome - V_CHROME - header_wrap;
+    let v_budget = vh - extra_chrome - V_CHROME;
     if content_w < PLOT_MIN + ROW_GAP + RIGHT_MIN {
         let plot = (v_budget - STACKED_STATS).min(content_w);
         ContentLayout {
@@ -1704,13 +1667,46 @@ fn kv_field(label: &str, value: impl Into<String>) -> El {
     .width(Size::Fill(1.0))
 }
 
-/// A `label · value` column used in the header strip.
-fn fact(label: &str, value: impl Into<String>) -> El {
-    column([
-        text(label).muted().font_size(11.0),
-        text(value).font_size(13.0),
-    ])
-    .gap(2.0)
+/// The capture's provenance facts, from the capture file alone: instrument,
+/// measured output, serving compositor (v2+ files), and timestamp. The live
+/// counterpart is [`PresenterApp::display_info`]; the two are separate cards
+/// so file facts and current system state never mix.
+fn capture_card(p: &Presented) -> El {
+    let dev = &p.capture.device;
+    let out = &p.capture.output;
+    let out_label = match &out.mode {
+        Some(m) => format!("{} · {}×{}", out.name, m.width, m.height),
+        None => out.name.clone(),
+    };
+    let mut rows = vec![
+        kv_field(
+            "device",
+            format!(
+                "{} · SN {} · cal {}",
+                dev.product, dev.serial, dev.cal_index
+            ),
+        ),
+        kv_field("output", out_label),
+    ];
+    if let Some(comp) = compositor_label(&p.capture.compositor) {
+        rows.push(kv_field("compositor", comp));
+    }
+    rows.push(kv_field("captured", p.capture.timestamp.clone()));
+    sidebar_card("Capture", rows)
+}
+
+/// A compact card for the sidebar: `card()`'s separation surface with a
+/// section-label title, tight padding, and SPACE_1 field gaps (the kv
+/// fields' muted-label/bright-value rhythm separates them). The standard
+/// `titled_card` header band alone is 64px — two sidebar cards at standard
+/// metrics overflow an 800-high window's vertical budget (the bundle-dump
+/// lint's `present-error` state is the tightest case).
+fn sidebar_card(title: &str, rows: Vec<El>) -> El {
+    let mut items = vec![section_label(title)];
+    items.extend(rows);
+    card([column(items).gap(tokens::SPACE_1).width(Size::Fill(1.0))])
+        .padding(tokens::SPACE_4)
+        .width(Size::Fill(1.0))
 }
 
 /// A fixed-label / monospaced-value row used throughout the stat panels.
