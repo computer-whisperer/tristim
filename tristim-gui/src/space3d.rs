@@ -434,9 +434,11 @@ impl Space3dScene {
     }
 }
 
-/// Build the 3D-space El for a cached scene, sized to a `px` square so it lays
-/// out like the 2D charts.
-pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
+/// Build the 3D-space El for a cached scene. Fills whatever rect its parent
+/// resolves — the plot card's overlay stack sizes it (square beside the stat
+/// column, full content width when stacked; see
+/// `PresenterApp::content_panel`).
+pub fn space_chart(scene: &Space3dScene) -> El {
     if !scene.has_data {
         return column([
             text("No scored samples to embed.").muted(),
@@ -446,8 +448,8 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
                 .wrap_text(),
         ])
         .gap(tokens::SPACE_2)
-        .width(Size::Fixed(px))
-        .height(Size::Fixed(px));
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
     }
 
     // A neutral reference floor/grid, sized to the world scale the projections
@@ -509,7 +511,8 @@ pub fn space_chart(scene: &Space3dScene, px: f32) -> El {
     // No `.key(...)`: the scene sits at a stable spot in the tree, so its
     // structural node id keys the camera state (and the hover pick) across
     // frames and trial/view switches — an explicit key buys nothing here.
-    chart3d(spec).width(Size::Fixed(px)).height(Size::Fixed(px))
+    // `chart3d` is fill-sized by default.
+    chart3d(spec)
 }
 
 /// The legend/detail card for the 3D view.

@@ -931,10 +931,7 @@ impl PresenterApp {
         let i = p.selected.min(p.analyzed.trials.len() - 1);
         let t = &p.analyzed.trials[i];
 
-        // The 3D view spends an extra controls row (projection selector and
-        // overlay toggles split apart); budget for it.
-        let extra_rows = usize::from(self.view == Tab::Space3D);
-        let layout = content_layout(cx, extra_chrome, extra_rows);
+        let layout = content_layout(cx, extra_chrome);
         // Inner plot size: the budgeted square minus the card's padding on both
         // sides, so the enclosing `plot_card` ends up at the budgeted footprint.
         let plot_px = layout.plot_card_px - 2.0 * PLOT_CARD_PAD;
@@ -976,28 +973,48 @@ impl PresenterApp {
         // The main plot + its tab-specific legend (shown when nothing is hovered).
         let (plot, legend) = match self.view {
             Tab::Space3D => {
-                // Two rows with distinct semantics: which colour space to
-                // project into (a pick-one selector), then the gamut overlays
-                // (independent toggles). Sharing one row made the selector
-                // read as more toggle soup.
-                control_rows.push(space3d_view_selector(self.space3d_view));
-                // The measured-gamut shell toggle, only when this trial was probed.
+                // The 3D controls float over the scene inside the plot card
+                // (a hug-sized island in the top-left corner; the scene's
+                // content clusters around the centre, so the corner is cheap
+                // real estate). This frees the scene to fill the whole card —
+                // notably its full width in stacked mode, where full-width
+                // control rows above the card used to eat the vertical budget
+                // and leave a collapsed square. The measured-gamut shell
+                // toggle joins only when this trial was probed.
                 let measured = p
                     .capture
                     .trials
                     .get(i)
                     .is_some_and(|t| t.gamut.is_some())
                     .then_some(self.space3d_show_measured);
-                control_rows.push(overlays_row(self.space3d_refs, measured));
+                // Width inside the card: the full content column when
+                // stacked, the budgeted square beside the stat column.
+                let inner_w = if layout.stacked {
+                    layout.content_w
+                } else {
+                    layout.plot_card_px
+                } - 2.0 * PLOT_CARD_PAD;
+                let controls =
+                    space3d_controls(inner_w, self.space3d_view, self.space3d_refs, measured);
                 // The geometry handles are cached on `Presented` and refreshed
                 // in `before_build`; `None` only during a transient first frame.
                 let chart = match &p.space3d {
-                    Some(scene) => space_chart(scene, plot_px),
+                    Some(scene) => space_chart(scene),
                     None => column([text("Preparing 3D space…").muted()])
-                        .width(Size::Fixed(plot_px))
-                        .height(Size::Fixed(plot_px)),
+                        .width(Size::Fill(1.0))
+                        .height(Size::Fill(1.0)),
                 };
-                (chart, space_legend(self.space3d_view))
+                // Scene first, controls after: layers paint in order (controls
+                // on top) and hit-test in reverse (buttons win over orbit).
+                let plot = stack([chart, controls]).height(Size::Fixed(plot_px));
+                let plot = if layout.stacked {
+                    // Stacked: span the full content width (the card fills it).
+                    plot.width(Size::Fill(1.0))
+                } else {
+                    // Beside the stat column: keep the budgeted square footprint.
+                    plot.width(Size::Fixed(plot_px))
+                };
+                (plot, space_legend(self.space3d_view))
             }
             Tab::Chromaticity => {
                 // Color fill is bounded to the presenter's negotiated gamut.
@@ -1027,13 +1044,21 @@ impl PresenterApp {
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
         ];
-        // The active view's control rows, full width (Luminance has none).
+        // The active view's control rows, full width (the 3D view's float
+        // over the plot instead; Luminance has none).
         rows.extend(control_rows.into_iter().map(|r| r.width(Size::Fill(1.0))));
         if layout.stacked {
             // Narrow window (half a 1080p display): the stat/legend column
             // can't keep its minimum width beside the plot, so it stacks
             // beneath instead, each card taking the full content width.
-            rows.push(plot_card(plot));
+            // The 3D card spans that width too (its plot fills the card);
+            // the 2D cards keep hugging their square plots.
+            let pc = plot_card(plot);
+            rows.push(if self.view == Tab::Space3D {
+                pc.width(Size::Fill(1.0))
+            } else {
+                pc
+            });
             rows.push(summary_card(t).width(Size::Fill(1.0)));
             rows.push(detail.width(Size::Fill(1.0)));
         } else {
@@ -1046,8 +1071,7 @@ impl PresenterApp {
                     ])
                     // SPACE_2, not _3: the column's intrinsic height is the
                     // vertical high-water mark at 800-high windows when the
-                    // banner row and the 3D view's second controls row are
-                    // both present.
+                    // banner row is present.
                     .gap(tokens::SPACE_2)
                     .width(Size::Fill(1.0)),
                 ])
@@ -1293,9 +1317,10 @@ const PLOT_CARD_PAD: f32 = tokens::SPACE_4;
 /// single-row header needs ~1100px).
 const HEADER_BREAK: f32 = 1160.0;
 
-/// Wrap a fixed-size plot in damascene's panel card, so all three views share one
-/// content-separation surface (CARD fill + border + radius + shadow) instead of
-/// a hand-drawn frame. Hugs the square plot rather than filling the row width.
+/// Wrap a plot in damascene's panel card, so all three views share one
+/// content-separation surface (CARD fill + border + radius + shadow) instead
+/// of a hand-drawn frame. Hugs the plot rather than filling the row width;
+/// the stacked 3D view overrides that to span the content width.
 fn plot_card(plot: El) -> El {
     card([plot]).width(Size::Hug).padding(PLOT_CARD_PAD)
 }
@@ -1317,23 +1342,24 @@ struct ContentLayout {
     /// Stats and legend stack beneath the plot instead of beside it — a window
     /// at half a 1080p display can't fit the stat column at readable width.
     stacked: bool,
+    /// Width (px) of the whole content column (right of the sidebar). The
+    /// plot card's width when a view spans it instead of hugging the square.
+    content_w: f32,
 }
 
 /// Derive the panel arrangement from the window viewport: side-by-side with
 /// the plot grown to fill the content area when the stat/legend column keeps
 /// its minimum width, stacked otherwise. Bounded vertically so the panel
 /// always fits on screen (present mode has no scroll — the 3D view owns the
-/// wheel). `extra_control_rows` counts per-view control rows beyond the first
-/// (the 3D view spends a second one); falls back to a sensible size when no
-/// viewport is attached (headless).
-fn content_layout(cx: &BuildCx, extra_chrome: f32, extra_control_rows: usize) -> ContentLayout {
+/// wheel). Falls back to a sensible size when no viewport is attached
+/// (headless).
+fn content_layout(cx: &BuildCx, extra_chrome: f32) -> ContentLayout {
     const ROOT_PAD: f32 = 24.0; // SPACE_6, window padding each side
     const SIDEBAR_W: f32 = 300.0;
     const COL_GAP: f32 = 24.0; // sidebar ↔ content
     const ROW_GAP: f32 = 16.0; // chart ↔ stat column
     const RIGHT_MIN: f32 = 410.0; // keep the stat/legend column readable
     const V_CHROME: f32 = 238.0; // header + heading + one controls row + gaps
-    const CONTROL_ROW_H: f32 = 48.0; // each control row past the first
     const PLOT_MIN: f32 = 360.0;
     const PLOT_MAX: f32 = 920.0;
     // Stacked mode: vertical room kept beneath the plot for the summary and
@@ -1345,19 +1371,20 @@ fn content_layout(cx: &BuildCx, extra_chrome: f32, extra_control_rows: usize) ->
     let content_w = vw - 2.0 * ROOT_PAD - SIDEBAR_W - COL_GAP;
     // The header wraps its facts onto a second row on a narrow window.
     let header_wrap = if vw < HEADER_BREAK { 34.0 } else { 0.0 };
-    let v_budget =
-        vh - extra_chrome - V_CHROME - header_wrap - extra_control_rows as f32 * CONTROL_ROW_H;
+    let v_budget = vh - extra_chrome - V_CHROME - header_wrap;
     if content_w < PLOT_MIN + ROW_GAP + RIGHT_MIN {
         let plot = (v_budget - STACKED_STATS).min(content_w);
         ContentLayout {
             plot_card_px: plot.clamp(STACKED_PLOT_MIN, PLOT_MAX),
             stacked: true,
+            content_w,
         }
     } else {
         let h_budget = content_w - ROW_GAP - RIGHT_MIN;
         ContentLayout {
             plot_card_px: h_budget.min(v_budget).clamp(PLOT_MIN, PLOT_MAX),
             stacked: false,
+            content_w,
         }
     }
 }
@@ -1523,6 +1550,39 @@ fn field_toggle(on: bool) -> El {
 /// Toggle between the two chromaticity projections, labeled with the current.
 fn space_toggle(space: Space) -> El {
     button(space.label()).key("space-toggle").secondary()
+}
+
+/// The 3D view's floating control island: the projection selector plus the
+/// gamut-overlay toggles, stacked over the scene's top-left corner inside the
+/// plot card. The overlay toggles split onto more rows as `inner_w` (the
+/// width available inside the card) narrows, so the island never overflows
+/// the card. The thresholds are this build's measured intrinsic row widths
+/// plus slack — the bundle-dump layout lint guards them against drift.
+fn space3d_controls(inner_w: f32, view: Space3dView, refs: RefCages, measured: Option<bool>) -> El {
+    const FULL_ROW: f32 = 560.0; // abs | rel | measured shell (~536 intrinsic)
+    const REF_GROUPS_ROW: f32 = 410.0; // abs | rel (~389 intrinsic)
+    let mut rows: Vec<El> = vec![space3d_view_selector(view)];
+    if inner_w >= FULL_ROW {
+        rows.push(overlays_row(refs, measured));
+    } else if inner_w >= REF_GROUPS_ROW {
+        rows.push(overlays_row(refs, None));
+        if let Some(on) = measured {
+            rows.push(measured_toggle(on));
+        }
+    } else {
+        rows.push(ref_group("abs", "abs", refs.abs));
+        rows.push(ref_group("rel", "rel", refs.rel));
+        if let Some(on) = measured {
+            rows.push(measured_toggle(on));
+        }
+    }
+    column(rows)
+        .gap(tokens::SPACE_2)
+        // Start, not the default Stretch: a bare `measured_toggle` button
+        // would otherwise stretch to the widest row's width.
+        .align(Align::Start)
+        .width(Size::Hug)
+        .height(Size::Hug)
 }
 
 /// The 3D view's gamut-overlay toggles, on one row: the reference cages in
