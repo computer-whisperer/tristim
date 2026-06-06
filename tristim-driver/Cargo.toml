@@ -5,9 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Clean-room Rust driver for Datacolor Spyder colorimeters (Spyder 2024 / SpyderX2), with a device-generic Colorimeter trait"
+description = "Clean-room Rust drivers for display colorimeters (Datacolor Spyder family, X-Rite i1Display Pro family), behind a device-generic Colorimeter trait"
 readme = "README.md"
-keywords = ["colorimeter", "spyder", "datacolor", "color", "calibration"]
+keywords = ["colorimeter", "spyder", "i1display", "color", "calibration"]
 categories = ["hardware-support", "science"]
 
 [dependencies]
