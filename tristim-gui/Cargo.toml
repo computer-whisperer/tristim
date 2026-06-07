@@ -32,6 +32,10 @@ tristim-color = { path = "../tristim-color" }
 # capture loop (also driven by the CLI). Both are damascene-free workspace members.
 tristim-display = { path = "../tristim-display" }
 tristim-gather = { path = "../tristim-gather" }
+# Device layer, for the setup screen's sensor probe (identity + calibration
+# slots, and recognizing permission failures). Capture runs themselves go
+# through tristim-gather.
+tristim-driver = { path = "../tristim-driver" }
 
 # Native open-file dialog (for loading additional captures). The xdg-portal
 # backend runs out-of-process over D-Bus — Wayland-native and safe to call off

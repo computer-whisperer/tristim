@@ -8,11 +8,13 @@
 //! alignment/spacing smells, raw (non-token) colors, and panels that should be
 //! stock widgets.
 //!
-//! States covered, per viewport: the setup form (plain, gamut-probe expanded,
-//! capability-gated, and with both error rows), the running view frozen at
-//! each phase of a capture, the presenter over every trial in every view and
-//! projection (legend and inspector variants), the open-error banner over the
-//! presenter, and a trial-less capture.
+//! States covered, per viewport: the setup form (sensor probed with named
+//! calibration slots; gamut-probe expanded with the probe in flight;
+//! capability-gated with no sensor found; and with both error rows plus the
+//! multi-line udev permission failure), the running view frozen at each phase
+//! of a capture, the presenter over every trial in every view and projection
+//! (legend and inspector variants), the open-error banner over the presenter,
+//! and a trial-less capture.
 //!
 //! Usage: `cargo run --bin dump -- <capture.json> [out_dir]`
 //! (out_dir defaults to `out/`). Exits non-zero if any lint finding fires.
@@ -115,24 +117,48 @@ fn run(path: &str, out_dir: &str) -> Result<usize, String> {
         ]
         .map(|(n, l)| (n.to_string(), l.to_string()))
     };
-    // The capture-setup form.
+    // The capture-setup form, with a probed sensor: device line shown and the
+    // calibration stepper on named slots (the longest 2024 name selected, so
+    // the widened value box is linted at its worst case).
+    let spyder_cals = || {
+        [
+            "General",
+            "Standard LED",
+            "Wide Gamut LED",
+            "GB LED",
+            "High Brightness",
+            "OLED",
+            "Mini-LED",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, n)| (i as u8, n.to_string()))
+    };
     let mut setup_app = PresenterApp::setup();
     setup_app.set_setup_outputs(demo_outputs());
+    setup_app.set_setup_sensor_found("Spyder 2024 · SN 87000216 · FW 6.00", spyder_cals(), 2);
     // The same form with the gamut-probe controls expanded (the repeats/depth
-    // steppers row only renders when probing is on).
+    // steppers row only renders when probing is on). Sensor left in its
+    // probe-in-flight state — the "detecting…" row.
     let mut setup_gamut_app = PresenterApp::setup();
     setup_gamut_app.set_setup_outputs(demo_outputs());
     setup_gamut_app.set_setup_probe_gamut(true);
     // The form gated to a minimal (niri-like) compositor: no color management,
     // no fp16, so every managed format renders disabled with its reason chip —
-    // the grayed-row layout we want to lint.
+    // the grayed-row layout we want to lint. Sensor probe failed plain (no
+    // device on the bus) — the single-line failure row.
     let mut setup_capgated_app = PresenterApp::setup();
     setup_capgated_app.set_setup_outputs(demo_outputs());
     setup_capgated_app.set_setup_capabilities(tristim_display::DisplayCapabilities::default());
-    // The form's two error rows at once: the open-file banner above it and the
-    // validation error beneath it (both deliberately long).
+    setup_capgated_app.set_setup_sensor_failed(
+        "no colorimeter found on the USB bus (supported vendors: Datacolor 085c, X-Rite 0765) — is the instrument plugged in?",
+    );
+    // The form's two error rows at once — the open-file banner above it and the
+    // validation error beneath it (both deliberately long) — plus the worst-case
+    // sensor row: the multi-line permission failure with the udev recipe.
     let mut setup_error_app = PresenterApp::setup();
     setup_error_app.set_setup_outputs(demo_outputs());
+    setup_error_app.set_setup_sensor_failed(&tristim_gui::app::udev_hint_message());
     setup_error_app.set_open_error(Some(format!(
         "failed to load {path}: invalid capture: missing field `trials` at line 1 column 2048"
     )));

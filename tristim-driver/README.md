@@ -67,7 +67,10 @@ referenced only to identify supported hardware.
 
 - **`Colorimeter` trait** — the device-generic surface. `open_any()` probes
   the bus and returns the first supported instrument with a sensible default
-  calibration selected. `measure(n)` takes `n` repeats and returns a
+  calibration selected; when nothing opens, the error distinguishes a
+  permission failure (udev rule missing), a known vendor's unsupported
+  model, and an empty bus. `calibrations()` lists the on-board display-type
+  presets by id and name. `measure(n)` takes `n` repeats and returns a
   [`Sample`]: absolute XYZ plus raw 6-channel sensor counts when the device
   exposes them.
 - **`MeasurementConfidence`** — trust metrics computed from any `Sample`

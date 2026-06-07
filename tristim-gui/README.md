@@ -33,8 +33,13 @@ cargo run                      # capture-setup form (run a new capture)
 Launched with no argument, the GUI opens a capture-setup form: pick the output
 to measure, toggle which color formats (`unmanaged`, `srgb`, `srgb-p3`,
 `pq-bt2020`, `pq-p3`) and sequences (`grey`, `primaries`, `scatter`, each with a
-step count) to run, and adjust settle / prep / window / calibration. The footer
-previews the total measurement count and a rough duration. **Start capture**
+step count) to run, and adjust settle / prep / window / calibration. A
+background probe opens the colorimeter on entry and reports it in the form's
+sensor row — identity when found, otherwise what's wrong (including the udev
+recipe for permission failures) with a **Re-detect** button. A found sensor
+also feeds the calibration field its real display-type presets ("General",
+"Wide Gamut LED", …) instead of a bare index. The footer previews the total
+measurement count and a rough duration. **Start capture**
 runs `tristim_gather::run_capture` on a background thread; a live progress view
 shows the device, the current format and patch, and a cancellable progress bar.
 

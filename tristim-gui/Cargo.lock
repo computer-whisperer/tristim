@@ -3467,6 +3467,7 @@ dependencies = [
  "tristim-capture",
  "tristim-color",
  "tristim-display",
+ "tristim-driver",
  "tristim-gather",
 ]
 

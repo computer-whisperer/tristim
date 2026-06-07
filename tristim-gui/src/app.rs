@@ -120,7 +120,63 @@ enum CaptureMsg {
     Progress(GatherEvent),
     // Boxed: a `Capture` dwarfs a `GatherEvent`, so box it to keep the channel
     // message small (clippy::large_enum_variant).
-    Finished(Result<Box<Capture>, String>),
+    Finished(Result<Box<Capture>, RunFailure>),
+}
+
+/// Why a capture run (or sensor probe) failed, with enough structure for the
+/// form to append actionable guidance.
+struct RunFailure {
+    message: String,
+    /// The error chain bottomed out in the driver's `AccessDenied` — the one
+    /// failure with a fix worth spelling out (the udev rule).
+    device_access: bool,
+}
+
+impl RunFailure {
+    fn from_gather(e: &gather::GatherError) -> Self {
+        Self {
+            message: e.to_string(),
+            device_access: matches!(
+                e,
+                gather::GatherError::Device(tristim_driver::Error::AccessDenied { .. })
+            ),
+        }
+    }
+
+    /// The message, with the udev recipe appended for permission failures.
+    /// Indented lines render as commands — see `setup::message_lines`.
+    fn guidance(&self) -> String {
+        if self.device_access {
+            format!("{}\n{UDEV_HINT}", self.message)
+        } else {
+            self.message.clone()
+        }
+    }
+}
+
+/// What to do about the driver's `AccessDenied`, shaped for `message_lines`
+/// (two-space-indented lines render as shell commands).
+const UDEV_HINT: &str = "The colorimeter needs a udev rule before non-root users can open it:\n  sudo cp 50-tristim.rules /etc/udev/rules.d/\n  sudo udevadm control --reload\nthen unplug and replug the instrument.";
+
+/// Successful sensor probe: identity line + calibration slots for the form.
+struct SensorReport {
+    label: String,
+    cals: Vec<(u8, String)>,
+}
+
+/// The full permission-failure message a real sensor probe produces (the
+/// driver's `AccessDenied` text plus the udev recipe), for the headless dump
+/// to lint the worst-case multi-line sensor row.
+pub fn udev_hint_message() -> String {
+    RunFailure {
+        message: tristim_driver::Error::AccessDenied {
+            vid: 0x085c,
+            pid: 0x0a0b,
+        }
+        .to_string(),
+        device_access: true,
+    }
+    .guidance()
 }
 
 /// Result of the background open-file dialog.
@@ -411,6 +467,14 @@ pub struct PresenterApp {
     source_path: Option<String>,
     /// Pending open-file dialog, resolved on a background thread.
     open_rx: Option<Receiver<OpenOutcome>>,
+    /// Pending sensor probe (open the colorimeter, read identity + slots,
+    /// drop it), resolved on a background thread.
+    sensor_rx: Option<Receiver<Result<SensorReport, RunFailure>>>,
+    /// A sensor probe should start on the next frame. Deferred to
+    /// [`Self::before_build`] rather than spawned where it's requested so
+    /// headless dumps — which build views but never run frames — stay free
+    /// of USB side effects.
+    sensor_probe_pending: bool,
     /// Last open-file error, shown in the header / setup screen.
     open_error: Option<String>,
     /// Export dialog visibility (present mode).
@@ -445,6 +509,8 @@ impl PresenterApp {
             running: None,
             source_path: None,
             open_rx: None,
+            sensor_rx: None,
+            sensor_probe_pending: false,
             export_open: false,
             export_rx: None,
             toasts: Vec::new(),
@@ -471,6 +537,8 @@ impl PresenterApp {
             running: None,
             source_path: None,
             open_rx: None,
+            sensor_rx: None,
+            sensor_probe_pending: true,
             export_open: false,
             export_rx: None,
             toasts: Vec::new(),
@@ -551,6 +619,8 @@ impl PresenterApp {
             running: Some(running),
             source_path: None,
             open_rx: None,
+            sensor_rx: None,
+            sensor_probe_pending: false,
             export_open: false,
             export_rx: None,
             toasts: Vec::new(),
@@ -662,6 +732,27 @@ impl PresenterApp {
         self.form.set_capabilities(caps);
     }
 
+    /// Inject a successful sensor probe (device line + `(id, name)` calibration
+    /// slots, selecting `cal_id`). Used by the headless dump to lint the
+    /// sensor row and the widened named-calibration stepper without hardware.
+    pub fn set_setup_sensor_found(
+        &mut self,
+        label: &str,
+        cals: impl IntoIterator<Item = (u8, String)>,
+        cal_id: u8,
+    ) {
+        self.form
+            .set_sensor_found(label.to_string(), cals.into_iter().collect());
+        self.form.select_cal(cal_id);
+    }
+
+    /// Inject a failed sensor probe. Used by the headless dump to lint the
+    /// in-row failure message (including the multi-line udev-recipe form —
+    /// pass [`udev_hint_message`]'s output).
+    pub fn set_setup_sensor_failed(&mut self, message: &str) {
+        self.form.set_sensor_failed(message.to_string());
+    }
+
     /// Set the 3D overlays (reference cages + measured shell). Used by the
     /// headless dump to build the overlay geometry on real samples and lint
     /// the toggled controls. Rebuilds the cached scene like [`Self::set_view`].
@@ -688,9 +779,72 @@ impl PresenterApp {
         self.form.set_error(msg);
     }
 
+    /// Spawn the sensor probe: open the colorimeter, read identity +
+    /// calibration slots, drop it (releasing the USB interface). The result is
+    /// drained in [`Self::before_build`].
+    fn spawn_sensor_probe(&mut self) {
+        if self.sensor_rx.is_some() {
+            return; // a probe is already in flight
+        }
+        self.form.set_sensor_probing();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let outcome = match tristim_driver::open_any() {
+                Ok(dev) => {
+                    let info = dev.info();
+                    Ok(SensorReport {
+                        label: format!(
+                            "{} · SN {} · FW {}.{:02}",
+                            info.model, info.serial, info.firmware.0, info.firmware.1
+                        ),
+                        cals: dev
+                            .calibrations()
+                            .into_iter()
+                            .map(|c| (c.id.0, c.name))
+                            .collect(),
+                    })
+                    // `dev` drops here — the interface is free again before
+                    // any capture run wants it.
+                }
+                Err(e) => Err(RunFailure {
+                    device_access: matches!(e, tristim_driver::Error::AccessDenied { .. }),
+                    message: e.to_string(),
+                }),
+            };
+            let _ = tx.send(outcome);
+        });
+        self.sensor_rx = Some(rx);
+    }
+
+    /// Drain a finished sensor probe into the form.
+    fn drain_sensor(&mut self) {
+        if let Some(rx) = &self.sensor_rx
+            && let Ok(outcome) = rx.try_recv()
+        {
+            self.sensor_rx = None;
+            self.apply_sensor_outcome(outcome);
+        }
+    }
+
+    fn apply_sensor_outcome(&mut self, outcome: Result<SensorReport, RunFailure>) {
+        match outcome {
+            Ok(report) => self.form.set_sensor_found(report.label, report.cals),
+            Err(f) => self.form.set_sensor_failed(f.guidance()),
+        }
+    }
+
     /// Spawn the capture on a background thread and switch to Running. Progress
     /// flows back over a channel drained in [`Self::before_build`].
     fn launch(&mut self, cfg: CaptureConfig) {
+        // An in-flight sensor probe holds the device's USB interface; wait it
+        // out (it's an open + a few EEPROM reads) so the run's own open can't
+        // race it into a spurious "Resource busy". The timeout only guards a
+        // wedged probe — then the run proceeds and reports the conflict.
+        if let Some(rx) = self.sensor_rx.take()
+            && let Ok(outcome) = rx.recv_timeout(std::time::Duration::from_secs(5))
+        {
+            self.apply_sensor_outcome(outcome);
+        }
         let total_formats = cfg.formats.len();
         let sweep_per_format = cfg.sequence.len() + cfg.scatter.as_ref().map_or(0, |s| s.count);
         let probe_gamut = cfg.gamut.is_some();
@@ -709,7 +863,7 @@ impl PresenterApp {
                 || cancel_thread.load(Ordering::Relaxed),
             )
             .map(Box::new)
-            .map_err(|e| e.to_string());
+            .map_err(|e| RunFailure::from_gather(&e));
             let _ = tx.send(CaptureMsg::Finished(result));
         });
 
@@ -737,7 +891,7 @@ impl PresenterApp {
 
     /// A capture run finished: auto-save and switch to presenting it, or fall
     /// back to setup with the error shown.
-    fn finish(&mut self, result: Result<Box<Capture>, String>) {
+    fn finish(&mut self, result: Result<Box<Capture>, RunFailure>) {
         self.running = None;
         match result {
             Ok(capture) => {
@@ -755,9 +909,12 @@ impl PresenterApp {
                 self.hovered_sample = None;
                 self.mode = Mode::Presenting;
             }
-            Err(e) => {
-                self.form.set_error(e);
+            Err(f) => {
+                self.form.set_error(f.guidance());
                 self.mode = Mode::Setup;
+                // The failed run says something about the sensor (unplugged?
+                // permissions?) — refresh the form's sensor row to match.
+                self.sensor_probe_pending = true;
             }
         }
     }
@@ -821,7 +978,10 @@ impl PresenterApp {
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        finished = Some(Err("capture thread ended unexpectedly".to_string()));
+                        finished = Some(Err(RunFailure {
+                            message: "capture thread ended unexpectedly".to_string(),
+                            device_access: false,
+                        }));
                         break;
                     }
                 }
@@ -1397,6 +1557,7 @@ impl PresenterApp {
                 Some("new-capture") => {
                     self.form.refresh_outputs();
                     self.form.refresh_capabilities();
+                    self.sensor_probe_pending = true;
                     self.mode = Mode::Setup;
                 }
                 Some(k) => {
@@ -1527,9 +1688,19 @@ fn capture_filename(timestamp: &str) -> String {
 
 impl App for PresenterApp {
     fn before_build(&mut self) {
+        // Kick a requested sensor probe off here — not where it was requested
+        // — so headless dumps (which never run frames) stay USB-free. Gated
+        // to setup mode: a probe spawned mid-run would race the capture
+        // thread for the device. (A request that misses the gate fires when
+        // the app next returns to setup, which is exactly when it's wanted.)
+        if self.sensor_probe_pending && matches!(self.mode, Mode::Setup) {
+            self.sensor_probe_pending = false;
+            self.spawn_sensor_probe();
+        }
         // Drain background work before laying out the frame.
         self.drain_capture();
         self.drain_open();
+        self.drain_sensor();
         self.drain_export();
         // Keep the 3D scene's cached geometry handles current with the focused
         // trial. Done here (not in `build`, which is `&self`) so the handles
@@ -1592,9 +1763,14 @@ impl App for PresenterApp {
             Mode::Setup => {
                 if matches!(e.kind, UiEventKind::Click | UiEventKind::Activate)
                     && let Some(route) = e.route()
-                    && let FormAction::Start(cfg) = self.form.handle(route)
                 {
-                    self.launch(*cfg);
+                    // Re-detect is the app's (the probe is a thread it owns);
+                    // everything else is the form's.
+                    if route == "sensor:refresh" {
+                        self.sensor_probe_pending = true;
+                    } else if let FormAction::Start(cfg) = self.form.handle(route) {
+                        self.launch(*cfg);
+                    }
                 }
             }
             Mode::Running => {

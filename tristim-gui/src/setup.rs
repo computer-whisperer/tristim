@@ -35,6 +35,23 @@ pub enum FormAction {
     Start(Box<CaptureConfig>),
 }
 
+/// What the background sensor probe has established about the colorimeter.
+/// Owned by the form (it drives the sensor row and the calibration options);
+/// the probe itself — a thread that opens the device, reads identity + slots,
+/// and drops it — lives in the app, which feeds results in via
+/// [`CaptureForm::set_sensor_found`] / [`CaptureForm::set_sensor_failed`].
+pub enum SensorStatus {
+    /// Probe in flight (also the cold-start state — the app kicks a probe off
+    /// on the first frame in setup mode).
+    Probing,
+    /// A colorimeter answered: its identity line, e.g.
+    /// `"Spyder 2024 · SN 87000216 · FW 6.00"`.
+    Found(String),
+    /// Nothing usable: the driver's message (possibly multi-line, with
+    /// indented shell commands — see [`message_lines`]).
+    Failed(String),
+}
+
 struct OutputItem {
     name: String,
     label: String,
@@ -57,7 +74,15 @@ pub struct CaptureForm {
     selected_output: Option<usize>,
     formats: Vec<FormatToggle>,
     seqs: Vec<SeqItem>,
+    /// Numeric calibration index — the fallback when no probe has supplied
+    /// named options (and the persisted value behind [`Self::cal_options`]).
     cal_index: u8,
+    /// `(id, name)` calibration slots from the probed device, when a probe has
+    /// succeeded. While present the cal field steps through these by name and
+    /// `cal_index` tracks the selected id.
+    cal_options: Option<Vec<(u8, String)>>,
+    /// What the sensor probe knows (drives the form's sensor row).
+    sensor: SensorStatus,
     settle_ms: u64,
     prep_secs: u64,
     window_pct: u32,
@@ -115,6 +140,8 @@ impl CaptureForm {
                 },
             ],
             cal_index: 0,
+            cal_options: None,
+            sensor: SensorStatus::Probing,
             settle_ms: 250,
             prep_secs: 6,
             window_pct: 100,
@@ -129,6 +156,42 @@ impl CaptureForm {
     /// Record a validation/run error to show beneath the form.
     pub fn set_error(&mut self, msg: String) {
         self.error = Some(msg);
+    }
+
+    /// A sensor probe started: show "detecting…" without dropping the current
+    /// calibration options (a refresh usually re-finds the same device).
+    pub fn set_sensor_probing(&mut self) {
+        self.sensor = SensorStatus::Probing;
+    }
+
+    /// A sensor probe succeeded: show the device line and step the cal field
+    /// through its real slots. Keeps the current selection when the same id
+    /// still exists (e.g. on re-detecting the same device).
+    pub fn set_sensor_found(&mut self, label: String, cals: Vec<(u8, String)>) {
+        if !cals.iter().any(|(id, _)| *id == self.cal_index) {
+            self.cal_index = cals.first().map_or(0, |(id, _)| *id);
+        }
+        self.cal_options = (!cals.is_empty()).then_some(cals);
+        self.sensor = SensorStatus::Found(label);
+    }
+
+    /// A sensor probe failed: show why, and fall back to the numeric cal
+    /// stepper — the named options described a device that isn't answering.
+    pub fn set_sensor_failed(&mut self, message: String) {
+        self.cal_options = None;
+        self.sensor = SensorStatus::Failed(message);
+    }
+
+    /// Select calibration `id` if the probed device offers it (no-op
+    /// otherwise). Used by the headless dump to lint a named slot.
+    pub fn select_cal(&mut self, id: u8) {
+        if self
+            .cal_options
+            .as_ref()
+            .is_some_and(|opts| opts.iter().any(|(i, _)| *i == id))
+        {
+            self.cal_index = id;
+        }
     }
 
     /// Enable/disable the gamut-probe controls. Used by the headless dump to
@@ -255,8 +318,8 @@ impl CaptureForm {
                 "prep:dec" => self.prep_secs = self.prep_secs.saturating_sub(1),
                 "window:inc" => self.window_pct = (self.window_pct + 5).min(100),
                 "window:dec" => self.window_pct = self.window_pct.saturating_sub(5).max(5),
-                "cal:inc" => self.cal_index = (self.cal_index + 1).min(15),
-                "cal:dec" => self.cal_index = self.cal_index.saturating_sub(1),
+                "cal:inc" => self.step_cal(1),
+                "cal:dec" => self.step_cal(-1),
                 "gamut:toggle" => self.probe_gamut = !self.probe_gamut,
                 "gamut-rep:inc" => self.gamut_repeats = (self.gamut_repeats + 1).min(64),
                 "gamut-rep:dec" => self.gamut_repeats = self.gamut_repeats.saturating_sub(1).max(1),
@@ -273,6 +336,24 @@ impl CaptureForm {
             }
         }
         FormAction::None
+    }
+
+    /// Step the calibration selection: through the probed device's slots when
+    /// we have them, else the blind numeric index (capped at 15 — devices
+    /// validate the real bound themselves).
+    fn step_cal(&mut self, dir: i8) {
+        match &self.cal_options {
+            Some(opts) => {
+                let pos = opts
+                    .iter()
+                    .position(|(id, _)| *id == self.cal_index)
+                    .unwrap_or(0);
+                let next = pos.saturating_add_signed(dir as isize).min(opts.len() - 1);
+                self.cal_index = opts[next].0;
+            }
+            None if dir > 0 => self.cal_index = (self.cal_index + 1).min(15),
+            None => self.cal_index = self.cal_index.saturating_sub(1),
+        }
     }
 
     /// Turn the current form state into a runnable config, or an error message.
@@ -410,6 +491,7 @@ impl CaptureForm {
             .muted()
             .font_size(12.0)
             .wrap_text(),
+            field("Sensor", self.sensor_view()),
             field("Output", self.outputs_view()),
             field("Formats", self.formats_view()),
             field("Sequences", self.seqs_view()),
@@ -434,10 +516,7 @@ impl CaptureForm {
                     "Window",
                     stepper(format!("{} %", self.window_pct), "window:dec", "window:inc"),
                 ),
-                field(
-                    "Cal index",
-                    stepper(format!("{}", self.cal_index), "cal:dec", "cal:inc"),
-                ),
+                field("Calibration", self.cal_view()),
             ])
             .gap(tokens::SPACE_3)
             .width(Size::Fill(1.0)),
@@ -452,7 +531,7 @@ impl CaptureForm {
             .width(Size::Fill(1.0)),
         ];
         if let Some(e) = &self.error {
-            rows.push(text(e).font_size(12.0).text_color(tokens::DESTRUCTIVE));
+            rows.push(message_lines(e, tokens::DESTRUCTIVE));
         }
 
         // Gap the body ourselves: `titled_card` drops the rows into
@@ -463,6 +542,44 @@ impl CaptureForm {
             "New capture",
             [column(rows).gap(tokens::SPACE_3).width(Size::Fill(1.0))],
         )
+    }
+
+    /// The sensor row: what the background probe found, plus a re-detect
+    /// trigger (routed by the app — detection is a thread it owns).
+    fn sensor_view(&self) -> El {
+        let status = match &self.sensor {
+            SensorStatus::Probing => text("detecting…").muted().font_size(12.0),
+            SensorStatus::Found(label) => text(label.clone()).font_size(13.0),
+            SensorStatus::Failed(message) => message_lines(message, tokens::DESTRUCTIVE),
+        };
+        column([
+            status,
+            row([
+                button("Re-detect").key("sensor:refresh").secondary(),
+                spacer(),
+            ])
+            .width(Size::Fill(1.0)),
+        ])
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+    }
+
+    /// The calibration field: named slots from the probed device when we have
+    /// them (`0 · General`), else the blind numeric index.
+    fn cal_view(&self) -> El {
+        let (value, width) = match &self.cal_options {
+            Some(opts) => {
+                let name = opts
+                    .iter()
+                    .find(|(id, _)| *id == self.cal_index)
+                    .map_or("?", |(_, n)| n.as_str());
+                // Wider value box: display-type names ("Wide Gamut LED") need
+                // the room; the numeric fallback keeps the compact stepper.
+                (format!("{} · {}", self.cal_index, name), 150.0)
+            }
+            None => (format!("{}", self.cal_index), 72.0),
+        };
+        stepper_w(value, "cal:dec", "cal:inc", width)
     }
 
     fn outputs_view(&self) -> El {
@@ -637,16 +754,42 @@ fn field(label: &str, body: El) -> El {
 /// A `−  value  +` stepper bound to two routes. The value centers in its fixed
 /// box so it sits midway between the buttons instead of hugging `−`.
 fn stepper(value: String, dec: &str, inc: &str) -> El {
+    stepper_w(value, dec, inc, 72.0)
+}
+
+/// [`stepper`] with an explicit value-box width, for values wider than the
+/// numeric default (the named calibration slots).
+fn stepper_w(value: String, dec: &str, inc: &str, value_w: f32) -> El {
     row([
         button("−").key(dec.to_string()).secondary(),
         mono(value)
             .font_size(13.0)
             .center_text()
-            .width(Size::Fixed(72.0)),
+            .width(Size::Fixed(value_w)),
         button("+").key(inc.to_string()).secondary(),
     ])
     .gap(tokens::SPACE_2)
     .align(Align::Center)
+}
+
+/// Render a possibly multi-line message: plain lines as wrapped text in
+/// `color`, lines indented with two spaces as muted mono (the convention the
+/// udev-recipe hint uses for shell commands).
+fn message_lines(msg: &str, color: Color) -> El {
+    column(
+        msg.lines()
+            .map(|l| match l.strip_prefix("  ") {
+                Some(cmd) => mono(cmd.to_string()).font_size(12.0).muted(),
+                None => text(l.to_string())
+                    .font_size(12.0)
+                    .text_color(color)
+                    .wrap_text()
+                    .width(Size::Fill(1.0)),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .gap(tokens::SPACE_1)
+    .width(Size::Fill(1.0))
 }
 
 /// Human-friendly duration: `45s`, `3m 20s`.
