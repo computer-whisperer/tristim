@@ -816,14 +816,24 @@ impl PresenterApp {
         self.sensor_rx = Some(rx);
     }
 
-    /// Drain a finished sensor probe into the form.
+    /// Drain a finished sensor probe into the form. A disconnected channel
+    /// (probe thread died without reporting) still clears `sensor_rx` —
+    /// otherwise the spawn guard would block every future probe and the form
+    /// would show "detecting…" forever.
     fn drain_sensor(&mut self) {
-        if let Some(rx) = &self.sensor_rx
-            && let Ok(outcome) = rx.try_recv()
-        {
-            self.sensor_rx = None;
-            self.apply_sensor_outcome(outcome);
-        }
+        let outcome = match &self.sensor_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(o) => o,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => Err(RunFailure {
+                    message: "sensor probe ended unexpectedly".to_string(),
+                    device_access: false,
+                }),
+            },
+            None => return,
+        };
+        self.sensor_rx = None;
+        self.apply_sensor_outcome(outcome);
     }
 
     fn apply_sensor_outcome(&mut self, outcome: Result<SensorReport, RunFailure>) {

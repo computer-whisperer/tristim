@@ -366,14 +366,13 @@ impl Colorimeter for Spyder {
         // 2024 high-level firmware advertises which display-type numbers are
         // valid; honor that over the static table. Bits beyond the known
         // names still list (as "Display type N") — the firmware says they
-        // exist, we just don't know what Datacolor calls them.
-        let valid = |i: usize| {
-            self.caps
-                .display_type_mask
-                .is_none_or(|mask| mask & (1 << i) != 0)
-        };
-        let count = match self.caps.display_type_mask {
-            Some(mask) => names.len().max(16 - mask.leading_zeros() as usize),
+        // exist, we just don't know what Datacolor calls them. An all-zero
+        // mask is firmware nonsense (cal 0 always exists — we selected it at
+        // open); treat it as "no mask" rather than enumerating nothing.
+        let mask = self.caps.display_type_mask.filter(|&m| m != 0);
+        let valid = |i: usize| mask.is_none_or(|m| m & (1 << i) != 0);
+        let count = match mask {
+            Some(m) => names.len().max(16 - m.leading_zeros() as usize),
             None => names.len(),
         };
         (0..count)
