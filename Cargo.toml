@@ -8,12 +8,8 @@ members = [
     "tristim-analyze",
     "tristim-gather",
     "tristim-cli",
+    "tristim-gui",
 ]
-# tristim-gui pulls in damascene (crates.io) plus the GPU/winit stack. It's
-# excluded so that heavy UI dependency tree stays out of the lockfile CI resolves;
-# the crate keeps its own Cargo.lock and is built with `cd tristim-gui && cargo
-# run`. See tristim-gui/README.md.
-exclude = ["tristim-gui"]
 
 [workspace.package]
 version = "0.1.0"

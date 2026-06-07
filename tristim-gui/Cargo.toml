@@ -1,17 +1,14 @@
 [package]
 name = "tristim-gui"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/computer-whisperer/tristim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 # Not published to crates.io: ships as an application (eventual PKGBUILD).
 publish = false
 description = "Damascene-based presenter for tristim captures: load a capture, analyze it, and visualize where a compositor reproduces color faithfully vs. where it drifts."
 default-run = "tristim-gui"
-# Excluded from the tristim workspace (see ../Cargo.toml) to keep the heavy
-# damascene + GPU/winit stack out of the lockfile CI resolves; this crate carries
-# its own Cargo.lock and is built independently with `cargo run` from this directory.
 
 [[bin]]
 name = "tristim-gui"

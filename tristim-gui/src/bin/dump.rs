@@ -16,7 +16,7 @@
 //! (legend and inspector variants), the open-error banner over the presenter,
 //! and a trial-less capture.
 //!
-//! Usage: `cargo run --bin dump -- <capture.json> [out_dir]`
+//! Usage: `cargo run -p tristim-gui --bin dump -- <capture.json> [out_dir]`
 //! (out_dir defaults to `out/`). Exits non-zero if any lint finding fires.
 //! CI runs this over `fixtures/reference-capture.json` (three trials —
 //! unmanaged, managed sRGB, PQ/BT.2020 fp16 — all gamut-probed) and fails on

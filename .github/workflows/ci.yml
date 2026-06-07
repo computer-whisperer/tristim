@@ -19,8 +19,6 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
-      # tristim-gui is workspace-excluded, so --all skips it; check it separately.
-      - run: cargo fmt --manifest-path tristim-gui/Cargo.toml --all --check
 
   clippy:
     name: Clippy
@@ -38,8 +36,6 @@ jobs:
           sudo apt-get install -y pkg-config libusb-1.0-0-dev libwayland-dev libxkbcommon-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # tristim-gui is workspace-excluded (own manifest + Cargo.lock); lint it too.
-      - run: cargo clippy --manifest-path tristim-gui/Cargo.toml --all-targets --locked -- -D warnings
 
   build-test:
     name: Build + Test
@@ -56,26 +52,6 @@ jobs:
         run: cargo build --workspace --all-targets --locked
       - name: Run tests
         run: cargo test --workspace --locked
-
-  # tristim-gui is excluded from the workspace (its damascene + GPU/winit tree is
-  # kept out of the lockfile the jobs above resolve), so it needs its own job
-  # against its own manifest + Cargo.lock. damascene is a crates.io dep, so CI can
-  # fetch it; the system deps match (winit -> wayland/xkb, rusb -> libusb).
-  build-test-gui:
-    name: Build + Test (GUI)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libusb-1.0-0-dev libwayland-dev libxkbcommon-dev
-      - uses: Swatinem/rust-cache@v2
-      - name: Build tristim-gui
-        run: cargo build --manifest-path tristim-gui/Cargo.toml --all-targets --locked
-      - name: Run tristim-gui tests
-        run: cargo test --manifest-path tristim-gui/Cargo.toml --locked
       # Headless layout lint: build every presenter state over the reference
       # capture and fail on any damascene lint finding (overflow, clipped
       # text, spacing smells, raw colors). No compositor in CI: the setup
@@ -83,7 +59,7 @@ jobs:
       # which are themselves lint-checked states. The dump binary was already
       # compiled by the --all-targets build above.
       - name: Bundle-dump layout lint
-        run: cargo run --manifest-path tristim-gui/Cargo.toml --bin dump --locked -- tristim-gui/fixtures/reference-capture.json tristim-gui/out
+        run: cargo run -p tristim-gui --bin dump --locked -- tristim-gui/fixtures/reference-capture.json tristim-gui/out
       # On lint failure, keep the SVG / tree / draw-ops artifacts so the
       # offending layout can be inspected without reproducing locally.
       - name: Upload bundle-dump artifacts

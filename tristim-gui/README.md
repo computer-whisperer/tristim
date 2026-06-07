@@ -13,20 +13,21 @@ drives the shared `tristim-gather` crate (the same loop the `tristim` CLI uses)
 on a background thread, so the GUI is a second front end over the gather libraries
 rather than a fork of them.
 
-## Why this crate is outside the workspace
+## Building
 
-`tristim-gui` depends on [damascene](https://crates.io/crates/damascene-core)
-(crates.io), which drags in the GPU stack (wgpu, winit, …). To keep the portable
-backend libraries — the crates intended for crates.io — building and testing in
-CI without that heavy UI tree, this crate is listed under `[workspace].exclude`
-in the repo root rather than `members`. It therefore lives in the repo but is its
-own standalone crate with its own `Cargo.lock`, built independently:
+A regular member of the tristim workspace, built from the repo root:
 
 ```sh
-cd tristim-gui
-cargo run -- ../capture.json   # view an existing capture
-cargo run                      # capture-setup form (run a new capture)
+cargo run -p tristim-gui -- capture.json   # view an existing capture
+cargo run -p tristim-gui                   # capture-setup form (run a new capture)
 ```
+
+It depends on [damascene](https://crates.io/crates/damascene-core)
+(crates.io), which brings in the GPU stack (wgpu, winit, …) — the heaviest
+dependency tree in the workspace by far. (The crate was workspace-excluded
+for a while to keep that tree out of the backend lockfile; that ended once
+it meant double-building everything for packaging and a second set of CI
+commands.)
 
 ## Running a capture
 
@@ -77,7 +78,7 @@ smells, raw non-token colors, panels that should be stock widgets). It exits
 non-zero if any finding fires, so it doubles as a layout gate.
 
 ```sh
-cargo run --bin dump -- ../capture.json out
+cargo run -p tristim-gui --bin dump -- capture.json out
 # writes out/trial-0.{svg,tree.txt,draw_ops.txt,shader_manifest.txt,lint.txt}
 ```
 

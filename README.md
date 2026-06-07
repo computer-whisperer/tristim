@@ -82,9 +82,8 @@ downstream against the recorded facts.
 - [`tristim-gui/`](tristim-gui) — graphical front end: capture-setup form,
   live capture progress, and visualization of analyzed captures
   (chromaticity field with error vectors, luminance response, aggregate
-  stats). Deliberately outside the Cargo workspace so its GPU/UI dependency
-  tree stays out of the backend lockfile — build it from its own directory
-  (see its README).
+  stats). Carries the workspace's heaviest dependency tree (damascene →
+  wgpu/winit); `cargo run -p tristim-gui` (see its README).
 
 `tristim-driver` and `tristim-display` are headed to crates.io; the other
 crates are internal libraries behind the two applications.
