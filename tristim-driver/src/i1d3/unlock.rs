@@ -4,11 +4,15 @@
 //! unlocked with a response derived from an 8-byte challenge and a 64-bit
 //! per-OEM key. The scheme is plain integer arithmetic (no cryptography);
 //! the keys and the transform were published by Graeme Gill in ArgyllCMS
-//! (`spectro/i1d3.c`) and are re-stated here as wire-format facts.
+//! (`spectro/i1d3.c`) and are re-stated here as wire-format facts — the
+//! device firmware accepts exactly one response per (key, challenge) pair,
+//! so any interoperable implementation computes the same function.
 //!
 //! The flow: query lock status (`0x0020`) → request a challenge (`0x9900`)
 //! → compute and send the response (`0x9a00`, success = reply byte 2 ==
-//! `0x77`) → re-check status. Keys are tried in order until one unlocks.
+//! `0x77`) → re-check status. Keys are tried until one unlocks; the device
+//! decides which key it accepts (product-name matching is not reliable —
+//! most variants report "i1Display3").
 
 /// One OEM unlock key and the marketing name of the variant it matches.
 #[derive(Debug, Clone, Copy)]
@@ -19,9 +23,7 @@ pub struct UnlockKey {
     pub key: [u32; 2],
 }
 
-/// Every known unlock key, in the order ArgyllCMS tries them. The device
-/// itself decides which key it accepts — product-name matching is not
-/// reliable (most variants report "i1Display3").
+/// Every known OEM unlock key.
 pub const UNLOCK_KEYS: &[UnlockKey] = &[
     UnlockKey {
         name: "i1Display Pro",
@@ -69,71 +71,77 @@ pub const UNLOCK_KEYS: &[UnlockKey] = &[
     },
 ];
 
+/// Order in which the 8 (XOR-decoded) challenge bytes pack into the two
+/// 32-bit working words, most-significant byte first.
+const PACK: [[usize; 4]; 2] = [[3, 0, 4, 6], [1, 7, 2, 5]];
+
+/// How each of the 16 response bytes is assembled:
+/// `(word index, byte-within-word, sum byte index, add?)` — take one byte of
+/// one mixed word, then add or subtract one of the two checksum bytes.
+const MIX: [(usize, usize, usize, bool); 16] = [
+    (0, 2, 0, true),
+    (2, 1, 1, false),
+    (3, 0, 1, true),
+    (1, 2, 0, true),
+    (2, 2, 1, false),
+    (3, 2, 0, false),
+    (1, 3, 0, false),
+    (0, 0, 1, false),
+    (3, 1, 0, true),
+    (2, 3, 1, false),
+    (0, 1, 0, true),
+    (1, 1, 1, false),
+    (1, 0, 1, true),
+    (3, 3, 1, true),
+    (2, 0, 0, true),
+    (0, 3, 0, false),
+];
+
 /// Compute the 64-byte unlock response for a 64-byte challenge reply.
 ///
-/// The device only inspects bytes 24..40 of the response; the rest are left
-/// zero (the OEM driver randomizes them, the instrument ignores them). All
-/// arithmetic is wrapping 32-bit / 8-bit, matching the device's expectation.
-pub fn create_unlock_response(key: [u32; 2], challenge: &[u8; 64]) -> [u8; 64] {
-    // 8-byte sub-challenge at offset 35, each byte XORed with challenge[3].
-    let mut sc = [0u8; 8];
-    for (i, b) in sc.iter_mut().enumerate() {
-        *b = challenge[3] ^ challenge[35 + i];
-    }
+/// The firmware checks only bytes 24..40 of the response and derives them
+/// solely from challenge bytes 2, 3, and 35..43 — everything else is left
+/// zero (the OEM driver fills it with random bytes; the instrument ignores
+/// it). All arithmetic is wrapping, per the firmware's u32/u8 semantics.
+pub fn unlock_response(key: [u32; 2], challenge: &[u8; 64]) -> [u8; 64] {
+    // Decode the 8 live challenge bytes (offset 35, XOR-masked with
+    // challenge[3]) and pack them into two words per PACK.
+    let decoded: Vec<u8> = challenge[35..43].iter().map(|&b| challenge[3] ^ b).collect();
+    let ci: Vec<u32> = PACK
+        .iter()
+        .map(|order| order.iter().fold(0u32, |w, &i| (w << 8) | u32::from(decoded[i])))
+        .collect();
 
-    // Shuffle into two 32-bit words.
-    let ci0 = (u32::from(sc[3]) << 24)
-        | (u32::from(sc[0]) << 16)
-        | (u32::from(sc[4]) << 8)
-        | u32::from(sc[6]);
-    let ci1 = (u32::from(sc[1]) << 24)
-        | (u32::from(sc[7]) << 16)
-        | (u32::from(sc[2]) << 8)
-        | u32::from(sc[5]);
-
-    let nk0 = key[0].wrapping_neg();
-    let nk1 = key[1].wrapping_neg();
-
-    let co = [
-        nk0.wrapping_sub(ci1),
-        nk1.wrapping_sub(ci0),
-        ci1.wrapping_mul(nk0),
-        ci0.wrapping_mul(nk1),
+    // Mix with the (negated) key words: two differences, two products.
+    let nk = [key[0].wrapping_neg(), key[1].wrapping_neg()];
+    let mixed = [
+        nk[0].wrapping_sub(ci[1]),
+        nk[1].wrapping_sub(ci[0]),
+        ci[1].wrapping_mul(nk[0]),
+        ci[0].wrapping_mul(nk[1]),
     ];
 
-    // Sum of the sub-challenge bytes plus the bytes of both negated keys.
-    let mut sum: u32 = sc.iter().map(|&b| u32::from(b)).sum();
-    for k in [nk0, nk1] {
-        sum += (k & 0xff) + ((k >> 8) & 0xff) + ((k >> 16) & 0xff) + ((k >> 24) & 0xff);
-    }
-    let s0 = (sum & 0xff) as u8;
-    let s1 = ((sum >> 8) & 0xff) as u8;
+    // Checksum over all 16 input bytes (decoded challenge + negated key),
+    // kept as its two low bytes.
+    let sum: u32 = decoded
+        .iter()
+        .copied()
+        .chain(nk.iter().flat_map(|k| k.to_le_bytes()))
+        .map(u32::from)
+        .sum();
+    let s = [sum as u8, (sum >> 8) as u8];
 
-    // 16 response bytes from the four words and the sum bytes.
-    let byte = |w: u32, shift: u32| (w >> shift) as u8;
-    let sr: [u8; 16] = [
-        byte(co[0], 16).wrapping_add(s0),
-        byte(co[2], 8).wrapping_sub(s1),
-        byte(co[3], 0).wrapping_add(s1),
-        byte(co[1], 16).wrapping_add(s0),
-        byte(co[2], 16).wrapping_sub(s1),
-        byte(co[3], 16).wrapping_sub(s0),
-        byte(co[1], 24).wrapping_sub(s0),
-        byte(co[0], 0).wrapping_sub(s1),
-        byte(co[3], 8).wrapping_add(s0),
-        byte(co[2], 24).wrapping_sub(s1),
-        byte(co[0], 8).wrapping_add(s0),
-        byte(co[1], 8).wrapping_sub(s1),
-        byte(co[1], 0).wrapping_add(s1),
-        byte(co[3], 24).wrapping_add(s1),
-        byte(co[2], 0).wrapping_add(s0),
-        byte(co[0], 24).wrapping_sub(s0),
-    ];
-
-    // The actual response: 16 bytes at offset 24, XORed with challenge[2].
+    // Assemble the 16 payload bytes per MIX and place them at offset 24,
+    // XOR-masked with challenge[2].
     let mut resp = [0u8; 64];
-    for (i, &b) in sr.iter().enumerate() {
-        resp[24 + i] = challenge[2] ^ b;
+    for (slot, &(word, byte, sb, add)) in resp[24..40].iter_mut().zip(&MIX) {
+        let b = (mixed[word] >> (8 * byte)) as u8;
+        let b = if add {
+            b.wrapping_add(s[sb])
+        } else {
+            b.wrapping_sub(s[sb])
+        };
+        *slot = challenge[2] ^ b;
     }
     resp
 }
@@ -155,7 +163,7 @@ mod tests {
     /// Only bytes 24..40 carry the response; everything else must be zero.
     #[test]
     fn response_is_zero_outside_payload() {
-        let r = create_unlock_response(UNLOCK_KEYS[0].key, &test_challenge());
+        let r = unlock_response(UNLOCK_KEYS[0].key, &test_challenge());
         for (i, &b) in r.iter().enumerate() {
             if !(24..40).contains(&i) {
                 assert_eq!(b, 0, "byte {i} not zero");
@@ -168,18 +176,18 @@ mod tests {
     #[test]
     fn keys_produce_distinct_responses() {
         let c = test_challenge();
-        let r0 = create_unlock_response(UNLOCK_KEYS[0].key, &c);
-        let r1 = create_unlock_response(UNLOCK_KEYS[1].key, &c);
+        let r0 = unlock_response(UNLOCK_KEYS[0].key, &c);
+        let r1 = unlock_response(UNLOCK_KEYS[1].key, &c);
         assert_ne!(r0[24..40], r1[24..40]);
     }
 
     /// Regression lock on the transform: a fixed challenge/key pair must keep
-    /// producing these exact bytes. (Computed by this implementation, recorded
-    /// to catch accidental edits to the arithmetic — NOT validated against a
-    /// real instrument yet.)
+    /// producing these exact bytes. (Recorded from the original implementation
+    /// of this transform; guards refactors of the arithmetic — NOT validated
+    /// against a real instrument yet.)
     #[test]
     fn known_answer_snapshot() {
-        let r = create_unlock_response([0xe962_2e9f, 0x8d63_e133], &test_challenge());
+        let r = unlock_response([0xe962_2e9f, 0x8d63_e133], &test_challenge());
         assert_eq!(
             &r[24..40],
             &[

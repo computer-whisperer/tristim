@@ -30,12 +30,12 @@ fn main() -> tristim_driver::Result<()> {
 |---|---|---|---|
 | Spyder 2024 | `085c:0a0b` | spydX2 | tested |
 | SpyderX2 | `085c:0a0a` | spydX2 | should work, untested |
-| Original SpyderX | `085c:0a00` | spydX | **untested port** — same framing as spydX2, different opcodes |
-| i1Display Pro / ColorMunki Display | `0765:5020` | i1d3 | **untested port** — covers the OEM rebadges too (NEC SpectraSensor Pro, HP DreamColor, …) |
+| Original SpyderX | `085c:0a00` | spydX | **untested** — same framing as spydX2, different opcodes |
+| i1Display Pro / ColorMunki Display | `0765:5020` | i1d3 | **untested** — covers the OEM rebadges too (NEC SpectraSensor Pro, HP DreamColor, …) |
 
-Untested ports were written from the documented wire formats without
+Untested drivers were written from the documented wire formats without
 hardware on hand; validation reports are very welcome. `open_any()` prefers
-hardware-validated drivers over untested ports when several devices are
+hardware-validated drivers over untested ones when several devices are
 plugged in.
 
 Not supported: earlier Spyders (1–5; the Spyder 2 needs a vendor firmware
@@ -56,7 +56,7 @@ Driver-specific notes:
   sensor spectral sensitivities in the instrument's EEPROM against the
   CIE 1931 2° observer (ArgyllCMS's own default calibration). Display-type
   spectral corrections (CCSS), ambient mode, refresh-synchronized
-  integration, and the Rev-B AIO mode are not ported yet.
+  integration, and the Rev-B AIO mode are not implemented yet.
 
 **Unofficial.** Not affiliated with, endorsed by, or sponsored by Datacolor
 or X-Rite. "Spyder", "SpyderX", "SpyderX2", and "Spyder 2024" are

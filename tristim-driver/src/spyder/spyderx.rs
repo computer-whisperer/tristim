@@ -1,11 +1,11 @@
 //! Original Datacolor SpyderX driver (USB `085c:0a00`, the `spydX.c` protocol).
 //!
-//! **Untested port.** This implements the wire format reverse-engineered by
-//! Graeme Gill for ArgyllCMS (`spectro/spydX.c`); we have not run it against
-//! real SpyderX hardware. The framing and reset are byte-identical to the
-//! hardware-validated SpyderX2/2024 driver (shared via [`transport`]), so the
-//! risk is concentrated in the opcode payloads and conversion. Validation
-//! reports welcome.
+//! **Untested.** This driver implements the wire format reverse-engineered
+//! and published by Graeme Gill in ArgyllCMS (`spectro/spydX.c`); we have not
+//! run it against real SpyderX hardware. The framing and reset are
+//! byte-identical to the hardware-validated SpyderX2/2024 driver (shared via
+//! [`transport`]), so the risk is concentrated in the opcode payloads and
+//! conversion. Validation reports welcome.
 //!
 //! ## Protocol differences from SpyderX2 / Spyder 2024
 //!
@@ -24,7 +24,7 @@
 //! measurement, and the setup reply carries device-side black offsets (`s3`)
 //! that are always subtracted. *Unlike* the X2, ArgyllCMS additionally
 //! maintains a user-side dark offset (`bcal`) measured with the lens cap on
-//! and persisted to disk with a 30-minute validity window. This port keeps
+//! and persisted to disk with a 30-minute validity window. This driver keeps
 //! that offset **session-only**: it starts at zero and is set by
 //! [`SpyderX::dark_calibrate`]. Without it, readings very close to black carry
 //! a small uncorrected residual; bright-patch accuracy is unaffected.
@@ -210,7 +210,7 @@ pub fn encode_measure_request(cal: &Calibration, setup: &Setup) -> [u8; 7] {
 ///
 /// Follows `spydX_GetReading()` with one deliberate divergence: Argyll feeds
 /// possibly-negative black-subtracted counts straight into the matrix, while
-/// this port clamps each channel at zero first (the same convention as the
+/// this driver clamps each channel at zero first (the same convention as the
 /// hardware-validated X2 path, and what the confidence layer's floor analysis
 /// assumes). The difference only shows within noise of true black.
 pub fn raw_to_xyz(raw: &RawMeasurement, setup: &Setup, cal: &Calibration, dark: &[f64; 3]) -> Xyz {
@@ -234,7 +234,7 @@ pub fn raw_to_xyz(raw: &RawMeasurement, setup: &Setup, cal: &Calibration, dark: 
     }
 }
 
-/// An opened original SpyderX. **Untested port** — see the module docs.
+/// An opened original SpyderX. **Untested driver** — see the module docs.
 ///
 /// Holds the active calibration + setup, so trait measurements need no
 /// per-call calibration argument. The setup block is re-fetched before every
@@ -371,7 +371,7 @@ impl SpyderX {
     }
 
     /// One raw 4-channel reading, auto-zeroing first. ArgyllCMS resets before
-    /// every measurement ("to trigger an auto-zero?"), and this port keeps
+    /// every measurement ("to trigger an auto-zero?"), and this driver keeps
     /// that discipline unconditionally — burst-without-reset behavior is
     /// unverified on this hardware.
     pub fn measure_raw_once(&mut self) -> Result<RawMeasurement> {
@@ -498,7 +498,7 @@ impl Colorimeter for SpyderX {
     // measure_adaptive: trait default (single full burst). The X2's fast tier
     // rides on a hardware-characterized integration override; the SpyderX
     // equivalent (scaling the matrix by v2 ratio) is plausible but unverified,
-    // so this port doesn't offer it. Same reasoning for raw_diagnostics.
+    // so this driver doesn't offer it. Same reasoning for raw_diagnostics.
 
     fn raw_conversion(&self) -> Option<RawConversion> {
         // Mirrors `raw_to_xyz` over the 3 XYZ channels (IR excluded, matching

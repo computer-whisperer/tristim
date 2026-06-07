@@ -7,9 +7,9 @@
 //!
 //! The implemented drivers: the Datacolor [`spyder`] family — SpyderX2 /
 //! Spyder 2024 ([`Spyder`], hardware-validated) and the original SpyderX
-//! ([`SpyderX`], an untested port) — and the X-Rite [`i1d3`] family —
-//! i1Display Pro / ColorMunki Display and OEM rebadges ([`I1d3`], an
-//! untested port). All wire protocols were reverse-engineered by Graeme
+//! ([`SpyderX`], untested) — and the X-Rite [`i1d3`] family —
+//! i1Display Pro / ColorMunki Display and OEM rebadges ([`I1d3`],
+//! untested). All wire protocols were reverse-engineered by Graeme
 //! Gill for ArgyllCMS (`spectro/spydX2.c`, `spectro/spydX.c`,
 //! `spectro/i1d3.c`) and are re-implemented clean-room here from the
 //! documented wire formats. Calibration mechanics live behind the trait in

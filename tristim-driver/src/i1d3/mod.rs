@@ -1,9 +1,9 @@
 //! X-Rite i1Display Pro / ColorMunki Display family driver (USB `0765:5020`,
 //! the `i1d3.c` protocol).
 //!
-//! **Untested port.** This implements the wire format reverse-engineered by
-//! Graeme Gill for ArgyllCMS (`spectro/i1d3.c`); we have not run it against
-//! real hardware. Validation reports welcome.
+//! **Untested.** This driver implements the wire format reverse-engineered
+//! and published by Graeme Gill in ArgyllCMS (`spectro/i1d3.c`); we have not
+//! run it against real hardware. Validation reports welcome.
 //!
 //! Covers the i1Display Pro, ColorMunki Display, and the OEM rebadges that
 //! share the protocol (NEC SpectraSensor Pro, HP DreamColor, Calibrite-era
@@ -12,31 +12,33 @@
 //!
 //! ## How a measurement works
 //!
-//! The sensor is a light-to-frequency converter per RGB channel. The driver
-//! either counts edges over a fixed integration time (*frequency* mode, good
-//! when bright) or measures the time taken to see a target number of edges
-//! (*period* mode, good when dim), adaptively: a 0.2 s frequency measurement
-//! first, then period re-measurement of any channel that yielded fewer than
-//! 200 edges, with edge targets scaled from a pre-measurement. Frequencies
-//! are black-subtracted and mapped to XYZ by a 3×3 matrix computed from the
+//! The sensor is a light-to-frequency converter per RGB channel, readable in
+//! two modes: *frequency* (edge count over a host-chosen integration time —
+//! fixed duration, quantization-limited when dim) and *period* (clock count
+//! until a host-chosen number of edges — precise, but duration scales with
+//! darkness). The driver surveys all channels in frequency mode, then probes
+//! and refines dim channels in period mode under an error/time budget — see
+//! [`adaptive`] for the policy and its rationale. Frequencies are
+//! black-subtracted and mapped to XYZ by a 3×3 matrix computed from the
 //! per-unit sensor spectral sensitivities stored in the instrument's EEPROM
 //! (see [`calmat`]).
 //!
 //! ## Minimal scope
 //!
-//! Deliberately not ported (accuracy/latency polish, not correctness):
+//! Deliberately not implemented (accuracy/latency polish, not correctness):
 //! AIO measurement mode (Rev B), refresh-rate detection and
 //! refresh-synchronized integration, ambient mode, display-specific spectral
 //! calibrations (CCSS), LED control, and the status query `0x0001` (whose
 //! effect ArgyllCMS itself doesn't fully understand and which its
-//! measurement path never consults). The generic EEPROM-derived matrix is
-//! ArgyllCMS's own default.
+//! measurement path never consults).
 
+mod adaptive;
 pub mod calmat;
 pub mod eeprom;
 pub mod observer;
 pub mod unlock;
 
+use adaptive::{CLK_FREQ, Disposition, RefinePlan, SAT_FREQ, SURVEY_INTTIME};
 use crate::colorimeter::{CalibrationId, Colorimeter, DeviceInfo, Error, RawConversion, Result};
 use crate::sample::{Sample, Xyz};
 use rusb::{Context, DeviceHandle, UsbContext};
@@ -52,17 +54,16 @@ const EP_IN: u8 = 0x81;
 const INTERFACE: u8 = 0;
 
 const CMD_TIMEOUT: Duration = Duration::from_secs(1);
-/// Longest reading timeout — period measurements can take up to ~10 s of
-/// integration plus margin (Argyll uses 40 s).
-const MEAS_TIMEOUT: Duration = Duration::from_secs(40);
+/// Longest reading timeout. Bounds the worst command we ever issue: a 20 s
+/// frequency integration (the firmware cap) or a period measurement, whose
+/// firmware gives up after a ~10 s edge-less window, plus USB slack.
+const MEAS_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// L2F sensor saturation frequency (Hz). Readings above this are unreliable.
-const SAT_FREQ: f64 = 250e3;
-/// Sensor clock frequency (Hz).
-const CLK_FREQ: f64 = 12e6;
-/// Default integration time for the initial frequency measurement (seconds;
-/// Argyll's non-refresh default).
-const DEFAULT_INTTIME: f64 = 0.2;
+/// Rev-B fallback integration time (seconds): when period mode errors out
+/// (see [`STATUS_PERIOD_FAIL`]), one long frequency measurement replaces it.
+/// 8 s gives 1/16 Hz count resolution — past the point where instrument
+/// noise, not quantization, limits a near-black reading.
+const FALLBACK_INTTIME: f64 = 8.0;
 
 /// Command codes: high byte is the HID report-style major command (send
 /// byte 0), low byte the minor command (send byte 1, only when major is 0).
@@ -100,15 +101,14 @@ pub enum CommandCode {
 /// back to a long frequency measurement.
 const STATUS_PERIOD_FAIL: u8 = 0x83;
 
-/// An opened i1d3-family colorimeter. **Untested port** — see module docs.
+/// An opened i1d3-family colorimeter. **Untested driver** — see module docs.
 pub struct I1d3 {
     handle: DeviceHandle<Context>,
     info: DeviceInfo,
     /// Marketing name of the unlock-key variant that the device accepted
     /// (or "unlocked" if it never needed a key).
     variant: &'static str,
-    /// `0x0002` = ColorMunki Display (slower measurement engine; the
-    /// adaptive flow skips its second pre-measurement).
+    /// `0x0002` = ColorMunki Display (slower measurement engine).
     prod_type: u16,
     /// Per-channel dark frequency offsets (Hz) from the internal EEPROM.
     black_hz: [f64; 3],
@@ -268,7 +268,7 @@ impl I1d3 {
     fn unlock(&mut self) -> Result<()> {
         for key in unlock::UNLOCK_KEYS {
             let challenge = self.command(CommandCode::LockChallenge, &[], CMD_TIMEOUT)?;
-            let response = unlock::create_unlock_response(key.key, &challenge);
+            let response = unlock::unlock_response(key.key, &challenge);
             // The response occupies the whole payload (bytes 1..64 zero
             // except 24..40); send it verbatim.
             let recv = self.command(CommandCode::LockResponse, &response[1..], CMD_TIMEOUT)?;
@@ -391,189 +391,96 @@ impl I1d3 {
     }
 
     /// Adaptive emissive measurement → per-channel frequency in Hz, black
-    /// level already subtracted. Port of `i1d3_take_emis_measurement()`
-    /// (adaptive mode, no refresh synchronization).
-    // Per-channel mask/index math throughout; explicit indices mirror the
-    // documented algorithm more directly than iterator chains.
-    #[allow(clippy::needless_range_loop)]
+    /// level already subtracted. The I/O loop around the [`adaptive`]
+    /// planner: survey (frequency mode) → probe → refine (period mode), at
+    /// most three commands plus the Rev-B fallback.
     fn measure_emissive_hz(&mut self) -> Result<[f64; 3]> {
-        let mut edgec = [2u16; 3];
-        let mut rgb = [0.0f64; 3]; // result, Hz
-        let mut rmeas; // raw measure: freq counts, then period clocks
-        let mut rgb_trial = [0.0f64; 3]; // trial Hz from pre-measurement
+        let mut hz = [0.0f64; 3];
+        // Channels still in flight: their current estimate and, if it came
+        // from a period probe, the edge target that produced it (so an
+        // identical refinement isn't repeated).
+        let mut pending: [Option<(f64, Option<u16>)>; 3] = [None; 3];
 
-        // Stage 1: fixed-period frequency measurement.
-        let (counts, inttime) = self.freq_measure(DEFAULT_INTTIME)?;
-        for i in 0..3 {
-            rgb[i] = 0.5 * counts[i] / inttime;
-            if rgb[i] > SAT_FREQ {
-                return Err(Error::Saturated);
-            }
-        }
-        rmeas = counts;
-
-        // Channels with too few edges for 0.25% quantization need re-reading.
-        let mut mask = 0u8;
-        for i in 0..3 {
-            if rmeas[i] < 200.0 {
-                mask |= 1 << i;
+        // Survey: one fixed-duration frequency measurement of everything.
+        let (counts, inttime) = self.freq_measure(SURVEY_INTTIME)?;
+        let mut probe_mask = 0u8;
+        for (i, &count) in counts.iter().enumerate() {
+            match adaptive::assess_survey(count, inttime) {
+                Disposition::Done(f) if f > SAT_FREQ => return Err(Error::Saturated),
+                Disposition::Done(f) => hz[i] = f,
+                Disposition::Refine(est) => pending[i] = Some((est, None)),
+                Disposition::Probe => probe_mask |= 1 << i,
             }
         }
 
-        if mask != 0 {
-            // Stage 2: pre-measurement to estimate the period per channel.
-            // Channels with a workable frequency count skip it (their counts
-            // convert directly to a period equivalent).
-            let mut premask = 0u8;
-            let pre_threshold = if self.is_munki_display() { 10.0 } else { 20.0 };
+        // Probe: minimal 2-edge period measurement of channels the survey
+        // couldn't estimate. No edges within the firmware window = dark.
+        if probe_mask != 0 {
+            let Some(clocks) = self.period_or_fallback([2; 3], probe_mask)? else {
+                return self.fallback_hz();
+            };
             for i in 0..3 {
-                if mask & (1 << i) == 0 {
-                    continue;
-                }
-                if rmeas[i] < pre_threshold {
-                    premask |= 1 << i;
-                } else {
-                    let freq = rmeas[i] * 0.5 / inttime;
-                    rmeas[i] = 0.5 * f64::from(edgec[i]) * CLK_FREQ / freq;
-                }
-            }
-
-            if premask != 0 {
-                let clocks = match self.period_measure(edgec, premask) {
-                    Ok(c) => c,
-                    Err(Error::InstrumentError(STATUS_PERIOD_FAIL)) => {
-                        return self.long_freq_fallback();
+                if probe_mask & (1 << i) != 0 {
+                    match adaptive::period_hz(2, clocks[i]) {
+                        Some(est) => pending[i] = Some((est, Some(2))),
+                        None => hz[i] = 0.0,
                     }
-                    Err(e) => return Err(e),
-                };
-                for i in 0..3 {
-                    if premask & (1 << i) != 0 {
-                        rmeas[i] = clocks[i];
-                        if rmeas[i] >= 0.5 {
-                            rgb_trial[i] = CLK_FREQ * 0.5 * f64::from(edgec[i]) / rmeas[i];
-                        }
-                    }
-                }
-
-                // Second pre-measurement at a ~0.1 s edge target, for better
-                // period estimates. Skipped on the ColorMunki Display (slow).
-                if !self.is_munki_display() {
-                    let mut premask2 = 0u8;
-                    for i in 0..3 {
-                        if premask & (1 << i) == 0 || rmeas[i] <= 0.5 {
-                            continue;
-                        }
-                        let nedgec =
-                            (f64::from(edgec[i]) * 0.1 * CLK_FREQ / rmeas[i]).clamp(2.0, 65534.0);
-                        let nedgec = 2 * (nedgec / 2.0).floor() as u16;
-                        if nedgec > edgec[i] {
-                            premask2 |= 1 << i;
-                            edgec[i] = nedgec;
-                        }
-                    }
-                    if premask2 != 0 {
-                        let clocks = match self.period_measure(edgec, premask2) {
-                            Ok(c) => c,
-                            Err(Error::InstrumentError(STATUS_PERIOD_FAIL)) => {
-                                return self.long_freq_fallback();
-                            }
-                            Err(e) => return Err(e),
-                        };
-                        for i in 0..3 {
-                            if premask2 & (1 << i) != 0 {
-                                rmeas[i] = clocks[i];
-                            }
-                            if rmeas[i] >= 0.5 {
-                                rgb_trial[i] = CLK_FREQ * 0.5 * f64::from(edgec[i]) / rmeas[i];
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Stage 3: per-channel target integration times. Aim for 200
-            // edges; when that's unreachable at the default time, lengthen
-            // the integration on a square-root curve, capped at 6 s.
-            let mut tintt = [DEFAULT_INTTIME; 3];
-            let mut tinttime = DEFAULT_INTTIME;
-            for i in 0..3 {
-                if mask & (1 << i) == 0 || rmeas[i] <= 0.5 {
-                    continue;
-                }
-                let nedgec = f64::from(edgec[i]) * DEFAULT_INTTIME * CLK_FREQ / rmeas[i];
-                if nedgec < 200.0 {
-                    let mint = DEFAULT_INTTIME / 6.0;
-                    let bl = ((nedgec - mint) / (200.0 - mint)).max(0.0).sqrt();
-                    let tedges = bl * (200.0 - mint) + mint;
-                    tintt[i] = (tedges / (f64::from(edgec[i]) * CLK_FREQ / rmeas[i])).min(6.0);
-                    tinttime = tinttime.max(tintt[i]);
-                }
-            }
-
-            // Stage 4: final edge counts. Prefer the burst-wide target when
-            // it doesn't stretch this channel's time by more than 10%.
-            for i in 0..3 {
-                if mask & (1 << i) == 0 {
-                    continue;
-                }
-                if rmeas[i] > 0.5 {
-                    let even_edges = |t: f64| -> u16 {
-                        let n = (f64::from(edgec[i]) * t * CLK_FREQ / rmeas[i]).clamp(2.0, 65534.0);
-                        2 * (n / 2.0).floor() as u16
-                    };
-                    let mut nedgec = even_edges(tintt[i]);
-                    let onedgec = even_edges(tinttime);
-                    let atintt = f64::from(onedgec) * rmeas[i] / (f64::from(edgec[i]) * CLK_FREQ);
-                    if atintt < 1.1 * tinttime {
-                        nedgec = onedgec;
-                    }
-                    if edgec[i] == nedgec {
-                        // Same target as the pre-measurement — reuse it.
-                        rgb[i] = CLK_FREQ * 0.5 * f64::from(edgec[i]) / rmeas[i];
-                        mask &= !(1 << i);
-                    } else {
-                        edgec[i] = nedgec;
-                    }
-                } else {
-                    // No edges seen at all: the channel is dark.
-                    rgb[i] = 0.0;
-                    mask &= !(1 << i);
-                }
-            }
-
-            // Stage 5: the precise period measurement.
-            if mask != 0 {
-                let clocks = match self.period_measure(edgec, mask) {
-                    Ok(c) => c,
-                    Err(Error::InstrumentError(STATUS_PERIOD_FAIL)) => {
-                        return self.long_freq_fallback();
-                    }
-                    Err(e) => return Err(e),
-                };
-                for i in 0..3 {
-                    if mask & (1 << i) == 0 {
-                        continue;
-                    }
-                    // A timed-out channel (patch got dimmer than the trial)
-                    // reports 0 clocks; the trial value is more realistic.
-                    rgb[i] = if clocks[i] < 0.5 {
-                        rgb_trial[i]
-                    } else {
-                        CLK_FREQ * 0.5 * f64::from(edgec[i]) / clocks[i]
-                    };
                 }
             }
         }
 
-        self.finish_rgb(rgb)
+        // Refine: one period measurement sized per channel from its estimate.
+        let mut edges = [0u16; 3];
+        let mut refine_mask = 0u8;
+        for (i, p) in pending.iter().enumerate() {
+            let Some((est, probed_edges)) = *p else {
+                continue;
+            };
+            match adaptive::plan_refinement(est) {
+                RefinePlan::Keep => hz[i] = est,
+                // The probe already took this exact measurement.
+                RefinePlan::Measure(e) if probed_edges == Some(e) => hz[i] = est,
+                RefinePlan::Measure(e) => {
+                    edges[i] = e;
+                    refine_mask |= 1 << i;
+                }
+            }
+        }
+        if refine_mask != 0 {
+            let Some(clocks) = self.period_or_fallback(edges, refine_mask)? else {
+                return self.fallback_hz();
+            };
+            for i in 0..3 {
+                if refine_mask & (1 << i) != 0 {
+                    // A refinement that times out (patch got dimmer since the
+                    // estimate) keeps the estimate.
+                    hz[i] = adaptive::period_hz(edges[i], clocks[i])
+                        .unwrap_or_else(|| pending[i].map(|(est, _)| est).unwrap_or(0.0));
+                }
+            }
+        }
+
+        self.finish_rgb(hz)
     }
 
-    /// Rev B mitigation: when period measurement reports `0x83` (no edges
-    /// within its window), fall back to one long frequency measurement.
-    fn long_freq_fallback(&mut self) -> Result<[f64; 3]> {
-        let (counts, inttime) = self.freq_measure(10.0)?;
-        let rgb = counts.map(|c| 0.5 * c / inttime);
-        self.finish_rgb(rgb)
+    /// Period measurement that turns the Rev-B `0x83` failure into `None`
+    /// (meaning: switch to the frequency-mode fallback). Other errors pass
+    /// through.
+    fn period_or_fallback(&mut self, edgec: [u16; 3], mask: u8) -> Result<Option<[f64; 3]>> {
+        match self.period_measure(edgec, mask) {
+            Ok(clocks) => Ok(Some(clocks)),
+            Err(Error::InstrumentError(STATUS_PERIOD_FAIL)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Rev-B mitigation: when period mode reports `0x83` (no edges within its
+    /// window), measure everything with one long frequency integration —
+    /// the only other primitive the instrument has.
+    fn fallback_hz(&mut self) -> Result<[f64; 3]> {
+        let (counts, inttime) = self.freq_measure(FALLBACK_INTTIME)?;
+        let hz = counts.map(|c| 0.5 * c / inttime);
+        self.finish_rgb(hz)
     }
 
     /// Black-subtract, clamp, and saturation-check a raw Hz triple.

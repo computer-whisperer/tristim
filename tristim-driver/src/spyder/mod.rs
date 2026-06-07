@@ -5,7 +5,7 @@
 //! * [`Spyder`] (this module) — SpyderX2 / Spyder 2024, the `spydX2.c`
 //!   protocol. Hardware-validated.
 //! * [`SpyderX`](spyderx::SpyderX) — the original SpyderX, the `spydX.c`
-//!   protocol. **Untested port** — see its module docs.
+//!   protocol. **Untested** — see its module docs.
 //!
 //! Both implement the device-generic [`Colorimeter`] trait. The wire protocol
 //! and per-unit calibration mechanics live in the [`protocol`] and

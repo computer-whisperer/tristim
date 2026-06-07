@@ -289,7 +289,7 @@ pub trait RawDiagnostics {
 
 /// Probe the bus and open the first supported colorimeter, with a sensible
 /// default calibration already selected. Hardware-validated devices are tried
-/// before untested ports.
+/// before untested drivers.
 ///
 /// When nothing opens, the error distinguishes the three first-run failure
 /// modes: a device present but lacking permissions ([`Error::AccessDenied`] —
