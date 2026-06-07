@@ -45,6 +45,8 @@ package() {
   install -Dm644 50-tristim.rules -t "$pkgdir/usr/lib/udev/rules.d/"
   install -Dm644 tristim-gui/dev.tristim.gui.desktop \
     -t "$pkgdir/usr/share/applications/"
+  install -Dm644 assets/tristim.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.tristim.gui.svg"
   install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
   install -Dm644 LICENSE-MIT LICENSE-APACHE \
     -t "$pkgdir/usr/share/licenses/$pkgname/"

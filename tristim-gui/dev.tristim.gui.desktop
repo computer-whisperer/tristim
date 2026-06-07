@@ -6,5 +6,6 @@ Comment=Measure how faithfully a Wayland compositor reproduces color, using a US
 Exec=tristim-gui %f
 TryExec=tristim-gui
 Terminal=false
+Icon=dev.tristim.gui
 Categories=Graphics;
 Keywords=color;colorimeter;calibration;HDR;ICC;display;gamut;

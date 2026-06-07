@@ -1,5 +1,7 @@
 # tristim
 
+<img src="assets/tristim.svg" alt="tristim icon" width="128" align="right">
+
 A Rust toolkit for tristimulus colorimetry on Linux/Wayland: clean-room
 drivers for USB display colorimeters, plus a standalone tool that validates
 how a Wayland compositor actually reproduces color on each display.

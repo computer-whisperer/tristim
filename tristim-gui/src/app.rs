@@ -12,6 +12,7 @@
 //! the [`crate::luminance`] measured-vs-expected plot.
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
@@ -157,6 +158,11 @@ impl RunFailure {
 /// What to do about the driver's `AccessDenied`, shaped for `message_lines`
 /// (two-space-indented lines render as shell commands).
 const UDEV_HINT: &str = "The colorimeter needs a udev rule before non-root users can open it:\n  sudo cp 50-tristim.rules /etc/udev/rules.d/\n  sudo udevadm control --reload\nthen unplug and replug the instrument.";
+
+static TRISTIM_ICON: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse(include_str!("../../assets/tristim.svg"))
+        .expect("bundled tristim icon SVG should parse")
+});
 
 /// Successful sensor probe: identity line + calibration slots for the form.
 struct SensorReport {
@@ -1843,16 +1849,24 @@ impl App for PresenterApp {
 /// The product wordmark + a muted subtitle, shared by every mode's header. The
 /// subtitle is bounded + ellipsized so a long filename can't widen the header.
 fn brand(subtitle: &str) -> El {
-    column([
-        h2("tristim"),
-        text(subtitle)
-            .muted()
-            .font_size(12.0)
-            .nowrap_text()
-            .ellipsis()
-            .width(Size::Fixed(220.0)),
+    row([
+        icon((*TRISTIM_ICON).clone())
+            .icon_size(46.0)
+            .width(Size::Fixed(46.0))
+            .height(Size::Fixed(46.0)),
+        column([
+            h2("tristim"),
+            text(subtitle)
+                .muted()
+                .font_size(12.0)
+                .nowrap_text()
+                .ellipsis()
+                .width(Size::Fixed(220.0)),
+        ])
+        .gap(2.0),
     ])
-    .gap(2.0)
+    .gap(10.0)
+    .align(Align::Center)
 }
 
 /// The final path component of `path` (for the header subtitle).
