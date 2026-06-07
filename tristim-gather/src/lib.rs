@@ -407,14 +407,20 @@ pub fn run_capture(
                             trustworthy: conf.is_trustworthy(),
                         })
                     };
-                    let mesh = refine_gamut(&opts.refine, measure)?;
-                    on_event(GatherEvent::GamutProbed {
-                        index: fi,
-                        vertices: mesh.vertices.len(),
-                        folds: mesh.count(crate::gamut::PatchStatus::Folded),
-                    });
-                    gamut = Some(mesh.to_capture());
-                    mesh_opt = Some(mesh);
+                    let mesh = refine_gamut(&opts.refine, measure, &should_cancel)?;
+                    // A cancelled probe returns an incomplete mesh: its samples
+                    // are real measurements and stay on the trial, but a holey
+                    // shell would mislead downstream (3D shell view, scatter
+                    // constraint), so only a completed probe is recorded.
+                    if !should_cancel() {
+                        on_event(GatherEvent::GamutProbed {
+                            index: fi,
+                            vertices: mesh.vertices.len(),
+                            folds: mesh.count(crate::gamut::PatchStatus::Folded),
+                        });
+                        gamut = Some(mesh.to_capture());
+                        mesh_opt = Some(mesh);
+                    }
                 }
             }
 

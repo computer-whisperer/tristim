@@ -412,7 +412,16 @@ impl GamutMesh {
 /// (`measure`) and that operation's error type — so the hardware path injects a
 /// colorimeter and tests inject a synthetic display. Measures the white corner
 /// first to fix the Lab reference, then refines the 6 faces.
-pub fn refine_gamut<M, E>(params: &RefineParams, mut measure: M) -> Result<GamutMesh, E>
+///
+/// `should_cancel` is polled between patches: once it returns `true` no further
+/// subdivision happens and the mesh built so far is returned. A cancelled mesh
+/// is incomplete (faces have holes where patches were never visited) — callers
+/// decide whether a partial shell is worth keeping.
+pub fn refine_gamut<M, E>(
+    params: &RefineParams,
+    mut measure: M,
+    should_cancel: impl Fn() -> bool,
+) -> Result<GamutMesh, E>
 where
     M: FnMut([f64; 3]) -> Result<ProbeSample, E>,
 {
@@ -422,6 +431,7 @@ where
     let mut ctx = RefineCtx {
         params,
         white,
+        should_cancel: &should_cancel,
         vertices: Vec::new(),
         cache: HashMap::new(),
         patches: Vec::new(),
@@ -456,6 +466,7 @@ fn cv_key(cv: [f64; 3]) -> [u64; 3] {
 struct RefineCtx<'a> {
     params: &'a RefineParams,
     white: Xyz,
+    should_cancel: &'a dyn Fn() -> bool,
     vertices: Vec<MeshVertex>,
     cache: HashMap<[u64; 3], usize>,
     patches: Vec<Patch>,
@@ -502,6 +513,12 @@ impl RefineCtx<'_> {
     where
         M: FnMut([f64; 3]) -> Result<ProbeSample, E>,
     {
+        // Cancellation point: bail before this patch's measurements, leaving
+        // the patch (and its whole subtree) out of the mesh. The longest
+        // post-cancel tail is the patch already in flight (≤ 5 measurements).
+        if (self.should_cancel)() {
+            return Ok(());
+        }
         let c = [
             self.sample(face_cv(axis, value, s0, t0), measure)?,
             self.sample(face_cv(axis, value, s0, t1), measure)?,
@@ -572,7 +589,9 @@ impl RefineCtx<'_> {
 }
 
 /// Hardware entry: drive the colorimeter + patch surface through an adaptive
-/// refinement. Per-measurement progress is reported as [`GamutEvent::Measured`].
+/// refinement. Per-measurement progress is reported as [`GamutEvent::Measured`];
+/// cancelling mid-refinement returns the partial mesh measured so far (like
+/// [`probe_gamut`]'s partial vertex list).
 pub fn probe_gamut_refined(
     config: &GamutConfig,
     params: &RefineParams,
@@ -601,7 +620,7 @@ pub fn probe_gamut_refined(
         })
     };
 
-    let mesh = refine_gamut(params, measure)?;
+    let mesh = refine_gamut(params, measure, &should_cancel)?;
     let _ = surface.set_code_values([0.0, 0.0, 0.0]);
     Ok(mesh)
 }
@@ -738,7 +757,7 @@ mod tests {
 
     #[test]
     fn smooth_display_converges_no_folds_recovers_primaries() {
-        let mesh = refine_gamut(&RefineParams::default(), smooth).unwrap();
+        let mesh = refine_gamut(&RefineParams::default(), smooth, || false).unwrap();
 
         // Adaptivity ran (more than one leaf per face) and nothing folded.
         assert!(
@@ -756,8 +775,38 @@ mod tests {
     }
 
     #[test]
+    fn cancel_mid_refinement_stops_measuring_returns_partial() {
+        use std::cell::Cell;
+
+        // Cancel fires once the synthetic display has been measured 10 times;
+        // afterwards no further measurements may happen (beyond the ≤ 5 of the
+        // patch already in flight — its corner samples run before the next
+        // cancellation point).
+        let measured = Cell::new(0usize);
+        let measure = |cv: [f64; 3]| {
+            measured.set(measured.get() + 1);
+            smooth(cv)
+        };
+        let mesh =
+            refine_gamut(&RefineParams::default(), measure, || measured.get() >= 10).unwrap();
+
+        let full = refine_gamut(&RefineParams::default(), smooth, || false).unwrap();
+        assert!(
+            measured.get() <= 15,
+            "cancel must stop the probe promptly, measured {}",
+            measured.get()
+        );
+        assert!(
+            mesh.vertices.len() < full.vertices.len(),
+            "cancelled mesh ({} vertices) should be smaller than a full one ({})",
+            mesh.vertices.len(),
+            full.vertices.len()
+        );
+    }
+
+    #[test]
     fn clamped_display_detects_folds() {
-        let mesh = refine_gamut(&RefineParams::default(), clamped).unwrap();
+        let mesh = refine_gamut(&RefineParams::default(), clamped, || false).unwrap();
 
         // The collapsed high-saturation corners must register as folds.
         assert!(
@@ -783,7 +832,7 @@ mod tests {
     #[test]
     fn repro_checker_gates_on_measured_gamut() {
         // Smooth sRGB display (measured primaries = sRGB).
-        let mesh = refine_gamut(&RefineParams::default(), smooth).unwrap();
+        let mesh = refine_gamut(&RefineParams::default(), smooth, || false).unwrap();
 
         // sRGB content on the sRGB display: the whole code cube is reproducible.
         let c = ReproChecker::new(&mesh, Some(&desc("srgb", "srgb"))).unwrap();
