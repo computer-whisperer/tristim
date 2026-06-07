@@ -1,3 +1,9 @@
+// Derived from the ArgyllCMS instrument drivers (spectro/spydX2.c,
+// spectro/spydX.c, spectro/i1d3.c), Copyright 2006-2014 Graeme W. Gill.
+// Copyright 2026 Christian Balcom.
+//
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 //! Device-generic colorimeter driver layer for tristim.
 //!
 //! The public surface is the [`Colorimeter`] trait and the device-agnostic
@@ -9,10 +15,11 @@
 //! Spyder 2024 ([`Spyder`], hardware-validated) and the original SpyderX
 //! ([`SpyderX`], untested) — and the X-Rite [`i1d3`] family —
 //! i1Display Pro / ColorMunki Display and OEM rebadges ([`I1d3`],
-//! untested). All wire protocols were reverse-engineered by Graeme
+//! untested). The wire protocols were reverse-engineered by Graeme
 //! Gill for ArgyllCMS (`spectro/spydX2.c`, `spectro/spydX.c`,
-//! `spectro/i1d3.c`) and are independently re-implemented here from the
-//! documented wire formats. Calibration mechanics live behind the trait in
+//! `spectro/i1d3.c`); these drivers are a Rust rework derived from that
+//! code, and the crate is licensed GPL-2.0-or-later to match it.
+//! Calibration mechanics live behind the trait in
 //! each driver module; device-aware tooling (the examples) can reach them
 //! directly.
 

@@ -1,11 +1,13 @@
 # Maintainer: Christian Balcom <robot.inventor@gmail.com>
 pkgname=tristim
-pkgver=0.2.1
+pkgver=0.2.2
 pkgrel=1
 pkgdesc='Wayland compositor color validation with USB display colorimeters (CLI + GUI)'
 arch=('x86_64')
 url='https://github.com/computer-whisperer/tristim'
-license=('MIT OR Apache-2.0')
+# The binaries link tristim-driver (GPL-2.0-or-later, derived from the
+# ArgyllCMS instrument drivers); the rest of the workspace is MIT OR Apache-2.0.
+license=('GPL-2.0-or-later')
 # wayland, libxkbcommon, and vulkan-icd-loader are dlopen'd by tristim-gui at
 # runtime, so they do not show up in ldd output — they belong in depends anyway.
 depends=('glibc' 'gcc-libs' 'systemd-libs' 'libusb'
@@ -50,4 +52,6 @@ package() {
   install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
   install -Dm644 LICENSE-MIT LICENSE-APACHE \
     -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 tristim-driver/LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE-GPL2"
 }

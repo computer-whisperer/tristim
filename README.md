@@ -2,8 +2,8 @@
 
 <img src="assets/tristim.svg" alt="tristim icon" width="128" align="right">
 
-A Rust toolkit for tristimulus colorimetry on Linux/Wayland: clean-room
-drivers for USB display colorimeters, plus a standalone tool that validates
+A Rust toolkit for tristimulus colorimetry on Linux/Wayland: drivers
+for USB display colorimeters, plus a standalone tool that validates
 how a Wayland compositor actually reproduces color on each display.
 
 ![A capture in progress: each measured sample embedded in CIELAB at its own
@@ -44,9 +44,10 @@ calibration lives in the consuming project, not here.
 
 The wire protocols were reverse-engineered by Graeme Gill for ArgyllCMS
 (`spectro/spydX2.c`, `spectro/spydX.c`, `spectro/i1d3.c`). The drivers here
-are a clean-room Rust re-implementation working from the documented wire
-formats, not a code translation, and do not link ArgyllCMS. Untested ports
-were written without hardware on hand; validation reports are very welcome.
+are a Rust rework derived from that code (and licensed GPL-2.0-or-later to
+match it — see [License](#license)), though they do not link ArgyllCMS.
+Untested ports were written without hardware on hand; validation reports
+are very welcome.
 See [`tristim-driver/README.md`](tristim-driver/README.md) for details and
 per-device notes.
 
@@ -159,4 +160,8 @@ here only to identify supported hardware.
 
 ## License
 
-Dual MIT / Apache-2.0.
+Dual MIT / Apache-2.0, with one exception: `tristim-driver` is
+GPL-2.0-or-later, as it is derived from the
+[ArgyllCMS](https://www.argyllcms.com/) instrument drivers (Copyright
+2006&ndash;2014 Graeme W. Gill). Since every binary links the driver,
+distributed binaries are governed by the GPL.

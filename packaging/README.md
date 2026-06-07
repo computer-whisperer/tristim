@@ -15,15 +15,15 @@ tag:
 ```sh
 cd $(mktemp -d)
 cp ~/workspace/tristim/packaging/aur/PKGBUILD .
-git -C ~/workspace/tristim archive --prefix=tristim-0.2.1/ \
-  -o "$PWD/tristim-0.2.1.tar.gz" HEAD
+git -C ~/workspace/tristim archive --prefix=tristim-0.2.2/ \
+  -o "$PWD/tristim-0.2.2.tar.gz" HEAD
 makepkg -f          # build + test + package
 pacman -Qlp tristim-*.pkg.tar.zst
 ```
 
 ## Release checklist
 
-1. Tag the release: `git tag v0.2.1 && git push origin v0.2.1`.
+1. Tag the release: `git tag v0.2.2 && git push origin v0.2.2`.
 2. In a clone of the AUR repo, copy `aur/PKGBUILD` in, then pin the real
    tarball hash: `updpkgsums` (replaces the `SKIP` placeholder).
 3. `makepkg -f` once against the published tarball (catches a tag/lockfile
