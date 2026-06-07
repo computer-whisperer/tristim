@@ -106,10 +106,17 @@ const MIX: [(usize, usize, usize, bool); 16] = [
 pub fn unlock_response(key: [u32; 2], challenge: &[u8; 64]) -> [u8; 64] {
     // Decode the 8 live challenge bytes (offset 35, XOR-masked with
     // challenge[3]) and pack them into two words per PACK.
-    let decoded: Vec<u8> = challenge[35..43].iter().map(|&b| challenge[3] ^ b).collect();
+    let decoded: Vec<u8> = challenge[35..43]
+        .iter()
+        .map(|&b| challenge[3] ^ b)
+        .collect();
     let ci: Vec<u32> = PACK
         .iter()
-        .map(|order| order.iter().fold(0u32, |w, &i| (w << 8) | u32::from(decoded[i])))
+        .map(|order| {
+            order
+                .iter()
+                .fold(0u32, |w, &i| (w << 8) | u32::from(decoded[i]))
+        })
         .collect();
 
     // Mix with the (negated) key words: two differences, two products.

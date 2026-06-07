@@ -38,9 +38,9 @@ pub mod eeprom;
 pub mod observer;
 pub mod unlock;
 
-use adaptive::{CLK_FREQ, Disposition, RefinePlan, SAT_FREQ, SURVEY_INTTIME};
 use crate::colorimeter::{CalibrationId, Colorimeter, DeviceInfo, Error, RawConversion, Result};
 use crate::sample::{Sample, Xyz};
+use adaptive::{CLK_FREQ, Disposition, RefinePlan, SAT_FREQ, SURVEY_INTTIME};
 use rusb::{Context, DeviceHandle, UsbContext};
 use std::time::Duration;
 

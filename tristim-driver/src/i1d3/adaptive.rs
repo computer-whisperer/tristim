@@ -146,10 +146,7 @@ mod tests {
     #[test]
     fn acceptance_boundary() {
         assert!(matches!(assess_survey(400.0, 0.25), Disposition::Done(_)));
-        assert!(matches!(
-            assess_survey(399.0, 0.25),
-            Disposition::Refine(_)
-        ));
+        assert!(matches!(assess_survey(399.0, 0.25), Disposition::Refine(_)));
     }
 
     #[test]
