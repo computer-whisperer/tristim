@@ -25,6 +25,25 @@ pub enum Error {
     #[error("no colorimeter found (looked for VID 0x{0:04x})")]
     NotFound(u16),
 
+    #[error(
+        "no colorimeter found on the USB bus (supported vendors: Datacolor 085c, X-Rite 0765) — is the instrument plugged in?"
+    )]
+    NoDevice,
+
+    #[error(
+        "found a {vendor} device ({vid:04x}:{pid:04x}), but this model is not supported by this crate"
+    )]
+    UnsupportedModel {
+        vendor: &'static str,
+        vid: u16,
+        pid: u16,
+    },
+
+    #[error(
+        "USB permission denied opening colorimeter {vid:04x}:{pid:04x} — grant access with a udev rule (see the tristim-driver README) and replug the instrument"
+    )]
+    AccessDenied { vid: u16, pid: u16 },
+
     #[error("short write: sent {sent}, expected {expected}")]
     ShortWrite { sent: usize, expected: usize },
 
@@ -73,6 +92,18 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl Error {
+    /// Map a USB error raised while opening/claiming a specific device:
+    /// permission failures become [`Error::AccessDenied`] so front ends can
+    /// point the user at udev setup instead of a bare "Access denied".
+    pub(crate) fn at_open(e: rusb::Error, vid: u16, pid: u16) -> Self {
+        match e {
+            rusb::Error::Access => Error::AccessDenied { vid, pid },
+            other => Error::Usb(other),
+        }
+    }
+}
+
 /// Vendor- and model-neutral device identity. Carries the provenance facts the
 /// capture file records (`usb_pid`, `firmware`) so the capture contract is
 /// device-agnostic at the type level; a non-USB instrument simply reports
@@ -95,6 +126,17 @@ pub struct DeviceInfo {
 /// presets / cal indices). Interpreted by the driver that issued it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CalibrationId(pub u8);
+
+/// One on-board calibration slot, as enumerated by
+/// [`Colorimeter::calibrations`]: the id to pass to
+/// [`select_calibration`](Colorimeter::select_calibration) plus the vendor's
+/// display-type name for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibrationDesc {
+    pub id: CalibrationId,
+    /// Vendor's name for the preset, e.g. `"Wide Gamut LED"`.
+    pub name: String,
+}
 
 /// How a device maps raw channel readings to CIE XYZ at its active
 /// calibration: `xyz = matrix · max(raw − black_floor, 0)`, then
@@ -167,6 +209,17 @@ pub trait Colorimeter {
     /// Vendor/model/serial/firmware identity.
     fn info(&self) -> &DeviceInfo;
 
+    /// The device's on-board calibration slots (display-type presets), in
+    /// index order — what [`select_calibration`](Self::select_calibration)
+    /// accepts. The default implementation reports a single slot named
+    /// `"Native"`, correct for devices with one fixed calibration.
+    fn calibrations(&self) -> Vec<CalibrationDesc> {
+        vec![CalibrationDesc {
+            id: CalibrationId(0),
+            name: "Native".to_string(),
+        }]
+    }
+
     /// Make `id` the active calibration for subsequent measurements.
     fn select_calibration(&mut self, id: CalibrationId) -> Result<()>;
 
@@ -236,6 +289,11 @@ pub trait RawDiagnostics {
 /// Probe the bus and open the first supported colorimeter, with a sensible
 /// default calibration already selected. Hardware-validated devices are tried
 /// before untested ports.
+///
+/// When nothing opens, the error distinguishes the three first-run failure
+/// modes: a device present but lacking permissions ([`Error::AccessDenied`] —
+/// udev rule missing), a known vendor's device of an unsupported model
+/// ([`Error::UnsupportedModel`]), and an empty bus ([`Error::NoDevice`]).
 pub fn open_any() -> Result<Box<dyn Colorimeter>> {
     match crate::spyder::Spyder::open_any() {
         Ok(spyder) => return Ok(Box::new(spyder)),
@@ -247,6 +305,37 @@ pub fn open_any() -> Result<Box<dyn Colorimeter>> {
         Err(Error::NotFound(_)) => {}
         Err(e) => return Err(e),
     }
-    let i1d3 = crate::i1d3::I1d3::open_any()?;
-    Ok(Box::new(i1d3))
+    match crate::i1d3::I1d3::open_any() {
+        Ok(i1d3) => return Ok(Box::new(i1d3)),
+        Err(Error::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    Err(diagnose_bus())
+}
+
+/// No family's scan matched: one more enumeration pass to tell "a known
+/// vendor's device is plugged in, but it's a model we don't drive" apart from
+/// "no instrument on the bus at all". A supported model can't reach here —
+/// its family scan would have tried to open it and propagated that result.
+fn diagnose_bus() -> Error {
+    use rusb::UsbContext;
+    let Ok(ctx) = rusb::Context::new() else {
+        return Error::NoDevice;
+    };
+    let Ok(devices) = ctx.devices() else {
+        return Error::NoDevice;
+    };
+    for device in devices.iter() {
+        let Ok(desc) = device.device_descriptor() else {
+            continue;
+        };
+        let (vid, pid) = (desc.vendor_id(), desc.product_id());
+        let vendor = match vid {
+            crate::spyder::transport::DATACOLOR_VID => "Datacolor",
+            crate::i1d3::XRITE_VID => "X-Rite",
+            _ => continue,
+        };
+        return Error::UnsupportedModel { vendor, vid, pid };
+    }
+    Error::NoDevice
 }

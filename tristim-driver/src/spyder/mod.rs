@@ -331,9 +331,60 @@ fn model_name(pid: u16) -> &'static str {
     }
 }
 
+/// Display-type preset names by calibration index, as ArgyllCMS documents them
+/// (`spydX2_disptypesel` / `spyd2024_disptypesel` in `spectro/spydX2.c`).
+/// Index 0 ("General") is the calibration-base type; the rest are
+/// panel-technology presets.
+const SPYDERX2_CAL_NAMES: [&str; 5] = [
+    "General",
+    "Standard LED",
+    "Wide Gamut LED",
+    "GB LED",
+    "High Brightness",
+];
+const SPYDER_2024_CAL_NAMES: [&str; 7] = [
+    "General",
+    "Standard LED",
+    "Wide Gamut LED",
+    "GB LED",
+    "High Brightness",
+    "OLED",
+    "Mini-LED",
+];
+
 impl Colorimeter for Spyder {
     fn info(&self) -> &DeviceInfo {
         &self.info
+    }
+
+    fn calibrations(&self) -> Vec<crate::colorimeter::CalibrationDesc> {
+        let names: &[&str] = if self.is_spyder_2024() {
+            &SPYDER_2024_CAL_NAMES
+        } else {
+            &SPYDERX2_CAL_NAMES
+        };
+        // 2024 high-level firmware advertises which display-type numbers are
+        // valid; honor that over the static table. Bits beyond the known
+        // names still list (as "Display type N") — the firmware says they
+        // exist, we just don't know what Datacolor calls them.
+        let valid = |i: usize| {
+            self.caps
+                .display_type_mask
+                .is_none_or(|mask| mask & (1 << i) != 0)
+        };
+        let count = match self.caps.display_type_mask {
+            Some(mask) => names.len().max(16 - mask.leading_zeros() as usize),
+            None => names.len(),
+        };
+        (0..count)
+            .filter(|&i| valid(i))
+            .map(|i| crate::colorimeter::CalibrationDesc {
+                id: CalibrationId(i as u8),
+                name: names
+                    .get(i)
+                    .map_or_else(|| format!("Display type {i}"), |n| (*n).to_string()),
+            })
+            .collect()
     }
 
     fn select_calibration(&mut self, id: CalibrationId) -> Result<()> {

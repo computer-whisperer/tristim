@@ -128,18 +128,26 @@ impl I1d3 {
         let devices = ctx.devices()?;
 
         for device in devices.iter() {
-            let desc = device.device_descriptor()?;
+            // An unreadable descriptor on some unrelated device shouldn't
+            // abort the scan — skip it and keep looking.
+            let Ok(desc) = device.device_descriptor() else {
+                continue;
+            };
             if desc.vendor_id() != XRITE_VID || desc.product_id() != I1D3_PID {
                 continue;
             }
-            let handle = device.open()?;
+            // From here on the failure concerns *this* device, so permission
+            // errors map to `AccessDenied` (udev rule missing) rather than a
+            // bare USB error.
+            let at_open = |e| Error::at_open(e, XRITE_VID, I1D3_PID);
+            let handle = device.open().map_err(at_open)?;
             // The i1d3 enumerates as a HID device; on Linux usbhid will have
             // claimed it.
             if handle.kernel_driver_active(INTERFACE).unwrap_or(false) {
-                handle.detach_kernel_driver(INTERFACE)?;
+                handle.detach_kernel_driver(INTERFACE).map_err(at_open)?;
             }
             let _ = handle.set_active_configuration(1);
-            handle.claim_interface(INTERFACE)?;
+            handle.claim_interface(INTERFACE).map_err(at_open)?;
 
             let mut dev = Self {
                 handle,

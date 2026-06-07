@@ -68,23 +68,32 @@ pub(crate) fn open_first(candidates: &[u16]) -> Result<(DeviceHandle<Context>, u
     let devices = ctx.devices()?;
 
     for device in devices.iter() {
-        let desc = device.device_descriptor()?;
+        // An unreadable descriptor on some unrelated device shouldn't abort
+        // the scan — skip it and keep looking.
+        let Ok(desc) = device.device_descriptor() else {
+            continue;
+        };
         if desc.vendor_id() != DATACOLOR_VID {
             continue;
         }
-        if !candidates.contains(&desc.product_id()) {
+        let pid = desc.product_id();
+        if !candidates.contains(&pid) {
             continue;
         }
-        let handle = device.open()?;
+        // From here on the failure concerns *this* device, so permission
+        // errors map to `AccessDenied` (udev rule missing) rather than a
+        // bare USB error.
+        let at_open = |e| Error::at_open(e, DATACOLOR_VID, pid);
+        let handle = device.open().map_err(at_open)?;
         if handle.kernel_driver_active(INTERFACE).unwrap_or(false) {
-            handle.detach_kernel_driver(INTERFACE)?;
+            handle.detach_kernel_driver(INTERFACE).map_err(at_open)?;
         }
         // Some libusb backends require a configuration be active before
         // claim_interface; idempotent so safe regardless.
         let _ = handle.set_active_configuration(1);
-        handle.claim_interface(INTERFACE)?;
+        handle.claim_interface(INTERFACE).map_err(at_open)?;
         let _ = handle.set_alternate_setting(INTERFACE, 0);
-        return Ok((handle, desc.product_id()));
+        return Ok((handle, pid));
     }
 
     Err(Error::NotFound(DATACOLOR_VID))

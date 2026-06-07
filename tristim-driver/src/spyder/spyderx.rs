@@ -464,6 +464,19 @@ impl Colorimeter for SpyderX {
         &self.info
     }
 
+    fn calibrations(&self) -> Vec<crate::colorimeter::CalibrationDesc> {
+        // The four slots documented at [`NUM_CALIBRATIONS`], named as
+        // ArgyllCMS's `spydX_disptypesel` table does.
+        ["General", "Standard LED", "Wide Gamut LED", "GB LED"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| crate::colorimeter::CalibrationDesc {
+                id: CalibrationId(i as u8),
+                name: name.to_string(),
+            })
+            .collect()
+    }
+
     fn select_calibration(&mut self, id: CalibrationId) -> Result<()> {
         let cal = self.get_calibration(id.0)?;
         let setup = self.get_setup(&cal)?;
