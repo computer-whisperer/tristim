@@ -37,11 +37,11 @@ use tristim_driver::{
 };
 use tristim_gather as gather;
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> std::process::ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     let cmd = argv.get(1).map(String::as_str).unwrap_or("help");
 
-    match cmd {
+    let result = match cmd {
         "list-outputs" | "outputs" | "ls" => cmd_list_outputs(),
         "info" => cmd_info(),
         "measure" => cmd_measure(&argv[2..]),
@@ -61,7 +61,37 @@ fn main() -> Result<(), Box<dyn Error>> {
             print_usage();
             std::process::exit(2);
         }
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // Display, not the default Debug Termination would print — the
+            // error chain carries the human-facing messages.
+            eprintln!("tristim: {e}");
+            if is_device_access_denied(e.as_ref()) {
+                eprintln!();
+                eprintln!("The colorimeter needs a udev rule before non-root users can open it:");
+                eprintln!("  sudo cp 50-tristim.rules /etc/udev/rules.d/");
+                eprintln!("  sudo udevadm control --reload");
+                eprintln!("then unplug and replug the instrument. (The rule file ships in the");
+                eprintln!("tristim repository root — see README.md, \"Setup — udev rule\".)");
+            }
+            std::process::ExitCode::FAILURE
+        }
     }
+}
+
+/// Whether `e`'s chain bottoms out in the driver's permission-denied error —
+/// the one failure with a fix the CLI can spell out (the udev rule).
+fn is_device_access_denied(e: &(dyn Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(drv) = err.downcast_ref::<tristim_driver::Error>() {
+            return matches!(drv, tristim_driver::Error::AccessDenied { .. });
+        }
+        cur = err.source();
+    }
+    false
 }
 
 fn print_usage() {
@@ -203,6 +233,10 @@ fn cmd_info() -> Result<(), Box<dyn Error>> {
         "{} (PID 0x{:04x}) — HW {}.{:02} — SN {}",
         info.model, info.usb_pid, info.firmware.0, info.firmware.1, info.serial,
     );
+    println!("calibrations (pass to --cal):");
+    for c in device.calibrations() {
+        println!("  {:2}  {}", c.id.0, c.name);
+    }
     Ok(())
 }
 
