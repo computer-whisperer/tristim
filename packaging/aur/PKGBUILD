@@ -1,6 +1,6 @@
 # Maintainer: Christian Balcom <robot.inventor@gmail.com>
 pkgname=tristim
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Wayland compositor color validation with USB display colorimeters (CLI + GUI)'
 arch=('x86_64')
