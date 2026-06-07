@@ -12,11 +12,12 @@ the colorimeter works through the remaining patches](assets/capture-3d.png)
 
 tristim has two faces:
 
-- **Reusable crates.** `tristim-driver` (the colorimeter hardware layer) and
-  `tristim-display` (the Wayland test-patch client) carry no
-  compositor-specific or tool-specific assumptions and are designed to be
-  consumed standalone — e.g. by closed-loop display calibration tools. Other
-  projects already depend on them as git Cargo dependencies.
+- **Reusable crates.** [`tristim-driver`](https://crates.io/crates/tristim-driver)
+  (the colorimeter hardware layer) and
+  [`tristim-display`](https://crates.io/crates/tristim-display) (the Wayland
+  test-patch client) are published on crates.io, carry no compositor-specific
+  or tool-specific assumptions, and are designed to be consumed standalone —
+  e.g. by closed-loop display calibration tools.
 - **A standalone compositor color-validation tool.** Point it at a display,
   let it drive test patches through the compositor's normal client path, and
   measure what the panel actually emits. It reports where color reproduction
@@ -91,7 +92,7 @@ downstream against the recorded facts.
   stats). Carries the workspace's heaviest dependency tree (damascene →
   wgpu/winit); `cargo run -p tristim-gui` (see its README).
 
-`tristim-driver` and `tristim-display` are headed to crates.io; the other
+`tristim-driver` and `tristim-display` are published on crates.io; the other
 crates are internal libraries behind the two applications. The applications
 ship together as one Arch package — see
 [`packaging/`](packaging) for the AUR `PKGBUILD` (both binaries, the udev
@@ -111,10 +112,33 @@ with a client's color request, so the resulting characterization is an
 honest check on the compositor's pipeline rather than a measurement of a
 bypassed one.
 
-## Setup — udev rule
+## Requirements
+
+- Linux, and a Wayland compositor that implements `wlr-layer-shell`
+  (wlroots-based compositors and KDE Plasma do; GNOME does not).
+- For HDR and color-managed measurements, the compositor must additionally
+  implement `wp_color_management_v1`. SDR-unmanaged captures work without it.
+- A supported colorimeter from the table above.
+
+## Installing
+
+On Arch Linux, the [`tristim` AUR package](https://aur.archlinux.org/packages/tristim)
+installs both binaries, the udev rule, and the desktop entry — no further
+setup needed.
+
+Elsewhere, build from source:
+
+```sh
+cargo build --release -p tristim-cli -p tristim-gui
+# binaries land in target/release/{tristim,tristim-gui}
+```
+
+then install the udev rule by hand:
+
+### udev rule
 
 The colorimeters are vendor-class USB devices that need explicit access for
-non-root users:
+non-root users. From the repository root:
 
 ```sh
 sudo cp 50-tristim.rules /etc/udev/rules.d/
@@ -123,7 +147,8 @@ sudo udevadm control --reload
 ```
 
 After that the device is accessible to your logged-in user via
-systemd-logind's `uaccess` tag — no group membership needed.
+systemd-logind's `uaccess` tag — no group membership needed. (The AUR
+package ships this rule already.)
 
 ## Affiliation
 
