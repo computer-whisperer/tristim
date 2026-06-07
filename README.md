@@ -4,6 +4,10 @@ A Rust toolkit for tristimulus colorimetry on Linux/Wayland: clean-room
 drivers for USB display colorimeters, plus a standalone tool that validates
 how a Wayland compositor actually reproduces color on each display.
 
+![A capture in progress: each measured sample embedded in CIELAB at its own
+color, with the trial's gamut cage and expected→measured error vectors, while
+the colorimeter works through the remaining patches](assets/capture-3d.png)
+
 tristim has two faces:
 
 - **Reusable crates.** `tristim-driver` (the colorimeter hardware layer) and
