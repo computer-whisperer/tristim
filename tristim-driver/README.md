@@ -1,6 +1,6 @@
 # tristim-driver
 
-Clean-room Rust drivers for display colorimeters (Datacolor Spyder family,
+Independent Rust drivers for display colorimeters (Datacolor Spyder family,
 X-Rite i1Display Pro family), behind a device-generic `Colorimeter` trait.
 No Wayland or display dependency — this crate talks USB and returns absolute
 CIE XYZ; what you point the puck at is your business.
@@ -43,8 +43,8 @@ blob and the Spyder 4/5 need vendor spectral calibration data, neither
 redistributable) and spectrometers (a different instrument class).
 
 The wire protocols were reverse-engineered by Graeme Gill for ArgyllCMS
-(`spectro/spydX2.c`, `spectro/spydX.c`, `spectro/i1d3.c`). This crate is a
-clean-room Rust re-implementation working from the documented wire formats,
+(`spectro/spydX2.c`, `spectro/spydX.c`, `spectro/i1d3.c`). This crate is an
+independent Rust re-implementation working from the documented wire formats,
 not a code translation, and does not link ArgyllCMS.
 
 Driver-specific notes:

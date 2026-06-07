@@ -11,7 +11,7 @@
 //! i1Display Pro / ColorMunki Display and OEM rebadges ([`I1d3`],
 //! untested). All wire protocols were reverse-engineered by Graeme
 //! Gill for ArgyllCMS (`spectro/spydX2.c`, `spectro/spydX.c`,
-//! `spectro/i1d3.c`) and are re-implemented clean-room here from the
+//! `spectro/i1d3.c`) and are independently re-implemented here from the
 //! documented wire formats. Calibration mechanics live behind the trait in
 //! each driver module; device-aware tooling (the examples) can reach them
 //! directly.

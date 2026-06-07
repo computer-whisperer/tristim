@@ -3461,7 +3461,7 @@ dependencies = [
 
 [[package]]
 name = "tristim-analyze"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "tristim-capture",
  "tristim-color",
@@ -3469,7 +3469,7 @@ dependencies = [
 
 [[package]]
 name = "tristim-capture"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3478,7 +3478,7 @@ dependencies = [
 
 [[package]]
 name = "tristim-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "tristim-analyze",
  "tristim-capture",
@@ -3490,11 +3490,11 @@ dependencies = [
 
 [[package]]
 name = "tristim-color"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "tristim-display"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "half",
  "libc",
@@ -3506,7 +3506,7 @@ dependencies = [
 
 [[package]]
 name = "tristim-driver"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rand 0.8.6",
  "rusb",
@@ -3515,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "tristim-gather"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror 1.0.69",
  "tristim-capture",
@@ -3526,7 +3526,7 @@ dependencies = [
 
 [[package]]
 name = "tristim-gui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "damascene-core",
  "damascene-winit-wgpu",
