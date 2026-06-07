@@ -90,6 +90,10 @@ impl FormatSpec {
                 reference_white_nits: Some(80.0),
                 mastering: None,
             },
+            // `DescriptionKind` is `#[non_exhaustive]`, but every request this
+            // module formats is one it built itself, so no other kind can
+            // reach here.
+            _ => unreachable!("description kind not built by this module"),
         })
     }
 }

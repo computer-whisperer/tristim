@@ -110,6 +110,7 @@ const PATCH_WIDTH: u32 = 512;
 const PATCH_HEIGHT: u32 = 512;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("Wayland connect: {0}")]
     Connect(#[from] wayland_client::ConnectError),

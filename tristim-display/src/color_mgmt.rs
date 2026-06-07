@@ -78,6 +78,7 @@ impl DescriptionRequest {
 // and boxing would just make construction uglier for consumers.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum DescriptionKind {
     /// Built through `create_parametric_creator` from explicit
     /// colorimetric parameters.
@@ -393,6 +394,7 @@ pub struct ColorManagedSurface {
 /// protocol value or feature the compositor didn't advertise — sending
 /// it anyway would be a fatal protocol error, so we refuse client-side.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum AttachError {
     /// TF name this build's tables don't map.
     UnknownTransferFunction(String),

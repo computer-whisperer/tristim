@@ -18,6 +18,7 @@ use thiserror::Error;
 /// the Spyder wire protocol; they live here so the trait can expose a single
 /// `Result` type rather than an associated error per device.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("USB I/O: {0}")]
     Usb(#[from] rusb::Error),

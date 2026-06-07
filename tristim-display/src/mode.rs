@@ -78,6 +78,7 @@ pub struct PipelinePlan {
 /// Why a [`RenderMode`] can't be arranged on this compositor. The
 /// `reason()` text is chip-sized for UI surfacing.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Unarrangeable {
     /// The mode wants a color description but the compositor exposes no
     /// `wp_color_manager_v1`.
