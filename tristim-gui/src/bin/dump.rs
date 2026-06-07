@@ -12,7 +12,8 @@
 //! calibration slots; gamut-probe expanded with the probe in flight;
 //! capability-gated with no sensor found; and with both error rows plus the
 //! multi-line udev permission failure), the running view frozen at each phase
-//! of a capture, the presenter over every trial in every view and projection
+//! of a capture (plus mid-sweep on the 3D tab — the widest plot card in the
+//! app), the presenter over every trial in every view and projection
 //! (legend and inspector variants), the open-error banner over the presenter,
 //! and a trial-less capture.
 //!
@@ -167,7 +168,7 @@ fn run(path: &str, out_dir: &str) -> Result<usize, String> {
     // The live running view (progress strip + live plots), frozen at each
     // distinct moment of a run: countdown, gamut probe (open-ended ~total),
     // mid-sweep, cancelling, and all formats done.
-    let running_apps: Vec<(PresenterApp, &str)> = [
+    let mut running_apps: Vec<(PresenterApp, &str)> = [
         (DebugRunPhase::Countdown, "running-countdown"),
         (DebugRunPhase::Probing, "running-probe"),
         (DebugRunPhase::Sweeping, "running-sweep"),
@@ -177,6 +178,13 @@ fn run(path: &str, out_dir: &str) -> Result<usize, String> {
     .into_iter()
     .map(|(phase, tag)| (PresenterApp::debug_running(capture.clone(), phase), tag))
     .collect();
+    // Mid-sweep with the 3D tab active: with no sidebar and the stat column
+    // pinned, this is the widest plot card in the app — the layout the scene's
+    // floating control island and the side-by-side row must hold at every
+    // viewport.
+    let mut running_3d = PresenterApp::debug_running(capture.clone(), DebugRunPhase::Sweeping);
+    running_3d.set_view(Tab::Space3D);
+    running_apps.push((running_3d, "running-space3d"));
     // The presenter with the open-file banner over a loaded capture (a failed
     // "Open…" keeps presenting what was already in focus).
     let mut present_error_app = PresenterApp::new(capture.clone());

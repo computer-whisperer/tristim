@@ -655,13 +655,17 @@ impl PresenterApp {
     pub fn set_view(&mut self, view: Tab) {
         self.view = view;
         // The 3D view reads cached geometry handles; build them up front so a
-        // headless render (which never calls `before_build`) still has a scene.
+        // headless render (which never calls `before_build`) still has a scene
+        // — for the live running snapshot too, like `before_build` does.
         if view == Tab::Space3D {
             let s3v = self.space3d_view;
             let refs = self.space3d_refs;
             let show = self.space3d_show_measured;
             if let Some(p) = self.presented.as_mut() {
                 p.ensure_space3d(s3v, refs, show);
+            }
+            if let Some(live) = self.running.as_mut().and_then(|r| r.live.as_mut()) {
+                live.ensure_space3d(s3v, refs, show);
             }
         }
     }
@@ -1211,15 +1215,16 @@ impl PresenterApp {
 
     /// The plot + stats panel for the in-focus trial. `extra_chrome` is added to
     /// the vertical budget reserved above the plot (the running view sits a
-    /// progress strip there).
-    fn content_panel(&self, p: &Presented, cx: &BuildCx, extra_chrome: f32) -> El {
+    /// progress strip there); `sidebar` is whether the caller renders one
+    /// beside this panel (the running view doesn't).
+    fn content_panel(&self, p: &Presented, cx: &BuildCx, extra_chrome: f32, sidebar: bool) -> El {
         if p.analyzed.trials.is_empty() {
             return column([text("Nothing to show.").muted()]).width(Size::Fill(1.0));
         }
         let i = p.selected.min(p.analyzed.trials.len() - 1);
         let t = &p.analyzed.trials[i];
 
-        let layout = content_layout(cx, extra_chrome);
+        let layout = content_layout(cx, extra_chrome, sidebar);
         // Inner plot size: the budgeted square minus the card's padding on both
         // sides, so the enclosing `plot_card` ends up at the budgeted footprint.
         let plot_px = layout.plot_card_px - 2.0 * PLOT_CARD_PAD;
@@ -1275,13 +1280,18 @@ impl PresenterApp {
                     .get(i)
                     .is_some_and(|t| t.gamut.is_some())
                     .then_some(self.space3d_show_measured);
-                // Width inside the card: the full content column when
-                // stacked, the budgeted square beside the stat column.
-                let inner_w = if layout.stacked {
-                    layout.content_w
+                // The scene has no native aspect ratio, so its card never hugs
+                // the budgeted square: it spans the full content column when
+                // stacked, and beside the stat column it takes every pixel the
+                // (pinned-width) column doesn't — at full vertical budget.
+                let (inner_w, inner_h) = if layout.stacked {
+                    (layout.content_w - 2.0 * PLOT_CARD_PAD, plot_px)
                 } else {
-                    layout.plot_card_px
-                } - 2.0 * PLOT_CARD_PAD;
+                    (
+                        layout.content_w - tokens::SPACE_4 - STAT_COL_W - 2.0 * PLOT_CARD_PAD,
+                        layout.wide_card_h - 2.0 * PLOT_CARD_PAD,
+                    )
+                };
                 let controls =
                     space3d_controls(inner_w, self.space3d_view, self.space3d_refs, measured);
                 // The geometry handles are cached on `Presented` and refreshed
@@ -1294,14 +1304,9 @@ impl PresenterApp {
                 };
                 // Scene first, controls after: layers paint in order (controls
                 // on top) and hit-test in reverse (buttons win over orbit).
-                let plot = stack([chart, controls]).height(Size::Fixed(plot_px));
-                let plot = if layout.stacked {
-                    // Stacked: span the full content width (the card fills it).
-                    plot.width(Size::Fill(1.0))
-                } else {
-                    // Beside the stat column: keep the budgeted square footprint.
-                    plot.width(Size::Fixed(plot_px))
-                };
+                let plot = stack([chart, controls])
+                    .height(Size::Fixed(inner_h))
+                    .width(Size::Fill(1.0));
                 (plot, space_legend(self.space3d_view))
             }
             Tab::Chromaticity => {
@@ -1350,23 +1355,32 @@ impl PresenterApp {
             rows.push(summary_card(t).width(Size::Fill(1.0)));
             rows.push(detail.width(Size::Fill(1.0)));
         } else {
+            let stats = column([
+                summary_card(t).width(Size::Fill(1.0)),
+                detail.width(Size::Fill(1.0)),
+            ])
+            // SPACE_2, not _3: the column's intrinsic height is the
+            // vertical high-water mark at 800-high windows when the
+            // banner row is present.
+            .gap(tokens::SPACE_2);
+            // The 2D charts are square plots, so their cards hug and the stat
+            // column absorbs the leftover width. The 3D scene is the opposite:
+            // the stat column is pinned at its design width and the scene's
+            // card grows into everything else.
+            let (pc, stats) = if self.view == Tab::Space3D {
+                (
+                    plot_card(plot).width(Size::Fill(1.0)),
+                    stats.width(Size::Fixed(STAT_COL_W)),
+                )
+            } else {
+                (plot_card(plot), stats.width(Size::Fill(1.0)))
+            };
             rows.push(
-                row([
-                    plot_card(plot),
-                    column([
-                        summary_card(t).width(Size::Fill(1.0)),
-                        detail.width(Size::Fill(1.0)),
-                    ])
-                    // SPACE_2, not _3: the column's intrinsic height is the
-                    // vertical high-water mark at 800-high windows when the
-                    // banner row is present.
-                    .gap(tokens::SPACE_2)
-                    .width(Size::Fill(1.0)),
-                ])
-                .gap(tokens::SPACE_4)
-                .align(Align::Start)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0)),
+                row([pc, stats])
+                    .gap(tokens::SPACE_4)
+                    .align(Align::Start)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0)),
             );
         }
 
@@ -1386,11 +1400,14 @@ impl PresenterApp {
             extra_chrome = 36.0;
         }
         items.push(
-            row([self.sidebar(p, cx), self.content_panel(p, cx, extra_chrome)])
-                .gap(tokens::SPACE_6)
-                .align(Align::Stretch)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0)),
+            row([
+                self.sidebar(p, cx),
+                self.content_panel(p, cx, extra_chrome, true),
+            ])
+            .gap(tokens::SPACE_6)
+            .align(Align::Stretch)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0)),
         );
         column(items)
             .gap(tokens::SPACE_4)
@@ -1430,7 +1447,9 @@ impl PresenterApp {
         // samples arrive; reserve their height in the plot's vertical budget.
         const STRIP_CHROME: f32 = 64.0;
         let body = match &r.live {
-            Some(p) => self.content_panel(p, cx, STRIP_CHROME),
+            // No sidebar in the running view — the panel budgets the full
+            // window width.
+            Some(p) => self.content_panel(p, cx, STRIP_CHROME, false),
             None => column([text("Waiting for the first measurement…")
                 .muted()
                 .width(Size::Fill(1.0))])
@@ -1605,6 +1624,11 @@ impl PresenterApp {
 /// matches the old bare-plot footprint and the stat column keeps its width.
 const PLOT_CARD_PAD: f32 = tokens::SPACE_4;
 
+/// Width of the stat/legend column beside the plot. The 2D views treat it as
+/// a minimum (the column fills whatever the square plot leaves over); the 3D
+/// view pins the column here and gives the scene every remaining pixel.
+const STAT_COL_W: f32 = 410.0;
+
 /// Wrap a plot in damascene's panel card, so all three views share one
 /// content-separation surface (CARD fill + border + radius + shadow) instead
 /// of a hand-drawn frame. Hugs the plot rather than filling the row width;
@@ -1627,11 +1651,16 @@ fn hovered_scene_sample(cx: &BuildCx, t: &AnalyzedTrial) -> Option<usize> {
 struct ContentLayout {
     /// Footprint (square side, px) of the plot card, padding included.
     plot_card_px: f32,
+    /// Footprint height (px) of a plot card that spans the row width instead
+    /// of hugging the square (the side-by-side 3D view): the full vertical
+    /// budget, decoupled from the square's width bound.
+    wide_card_h: f32,
     /// Stats and legend stack beneath the plot instead of beside it — a window
     /// at half a 1080p display can't fit the stat column at readable width.
     stacked: bool,
-    /// Width (px) of the whole content column (right of the sidebar). The
-    /// plot card's width when a view spans it instead of hugging the square.
+    /// Width (px) of the whole content column (right of the sidebar, when one
+    /// is shown). The plot card's width when a view spans it instead of
+    /// hugging the square.
     content_w: f32,
 }
 
@@ -1639,14 +1668,14 @@ struct ContentLayout {
 /// the plot grown to fill the content area when the stat/legend column keeps
 /// its minimum width, stacked otherwise. Bounded vertically so the panel
 /// always fits on screen (present mode has no scroll — the 3D view owns the
-/// wheel). Falls back to a sensible size when no viewport is attached
-/// (headless).
-fn content_layout(cx: &BuildCx, extra_chrome: f32) -> ContentLayout {
+/// wheel). `sidebar` is whether the caller renders one beside the panel (the
+/// running view doesn't — its width budget is the whole window). Falls back
+/// to a sensible size when no viewport is attached (headless).
+fn content_layout(cx: &BuildCx, extra_chrome: f32, sidebar: bool) -> ContentLayout {
     const ROOT_PAD: f32 = 24.0; // SPACE_6, window padding each side
     const SIDEBAR_W: f32 = 300.0;
     const COL_GAP: f32 = 24.0; // sidebar ↔ content
     const ROW_GAP: f32 = 16.0; // chart ↔ stat column
-    const RIGHT_MIN: f32 = 410.0; // keep the stat/legend column readable
     const V_CHROME: f32 = 238.0; // header + heading + one controls row + gaps
     const PLOT_MIN: f32 = 360.0;
     const PLOT_MAX: f32 = 920.0;
@@ -1656,19 +1685,25 @@ fn content_layout(cx: &BuildCx, extra_chrome: f32) -> ContentLayout {
     const STACKED_PLOT_MIN: f32 = 240.0;
 
     let (vw, vh) = cx.viewport().unwrap_or((1280.0, 800.0));
-    let content_w = vw - 2.0 * ROOT_PAD - SIDEBAR_W - COL_GAP;
+    let mut content_w = vw - 2.0 * ROOT_PAD;
+    if sidebar {
+        content_w -= SIDEBAR_W + COL_GAP;
+    }
     let v_budget = vh - extra_chrome - V_CHROME;
-    if content_w < PLOT_MIN + ROW_GAP + RIGHT_MIN {
+    if content_w < PLOT_MIN + ROW_GAP + STAT_COL_W {
         let plot = (v_budget - STACKED_STATS).min(content_w);
+        let plot = plot.clamp(STACKED_PLOT_MIN, PLOT_MAX);
         ContentLayout {
-            plot_card_px: plot.clamp(STACKED_PLOT_MIN, PLOT_MAX),
+            plot_card_px: plot,
+            wide_card_h: plot,
             stacked: true,
             content_w,
         }
     } else {
-        let h_budget = content_w - ROW_GAP - RIGHT_MIN;
+        let h_budget = content_w - ROW_GAP - STAT_COL_W;
         ContentLayout {
             plot_card_px: h_budget.min(v_budget).clamp(PLOT_MIN, PLOT_MAX),
+            wide_card_h: v_budget.clamp(PLOT_MIN, PLOT_MAX),
             stacked: false,
             content_w,
         }
