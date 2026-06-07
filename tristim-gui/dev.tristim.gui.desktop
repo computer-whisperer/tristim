@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Tristim
+GenericName=Display Color Validator
+Comment=Measure how faithfully a Wayland compositor reproduces color, using a USB colorimeter
+Exec=tristim-gui %f
+TryExec=tristim-gui
+Terminal=false
+Categories=Graphics;
+Keywords=color;colorimeter;calibration;HDR;ICC;display;gamut;

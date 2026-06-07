@@ -86,7 +86,10 @@ downstream against the recorded facts.
   wgpu/winit); `cargo run -p tristim-gui` (see its README).
 
 `tristim-driver` and `tristim-display` are headed to crates.io; the other
-crates are internal libraries behind the two applications.
+crates are internal libraries behind the two applications. The applications
+ship together as one Arch package — see
+[`packaging/`](packaging) for the AUR `PKGBUILD` (both binaries, the udev
+rule, and the desktop entry) and the release checklist.
 
 ## How the tool talks to the compositor
 
