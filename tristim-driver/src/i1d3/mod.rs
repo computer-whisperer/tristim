@@ -1,9 +1,14 @@
 //! X-Rite i1Display Pro / ColorMunki Display family driver (USB `0765:5020`,
 //! the `i1d3.c` protocol).
 //!
-//! **Untested.** This driver implements the wire format reverse-engineered
-//! and published by Graeme Gill in ArgyllCMS (`spectro/i1d3.c`); we have not
-//! run it against real hardware. Validation reports welcome.
+//! **Hardware-validated** against an i1Display Pro (reports as `i1Display3`,
+//! HW 2.28) on 2026-06-13: device open/unlock, EEPROM calibration decode, and
+//! the frequency-survey + period-refine measurement path were all confirmed
+//! against the real instrument (one-shot readings plus a full GUI capture
+//! sweep, 784 samples). This driver implements the wire format
+//! reverse-engineered and published by Graeme Gill in ArgyllCMS
+//! (`spectro/i1d3.c`). The ColorMunki Display and the OEM rebadges share the
+//! protocol but have not each been validated individually; reports welcome.
 //!
 //! Covers the i1Display Pro, ColorMunki Display, and the OEM rebadges that
 //! share the protocol (NEC SpectraSensor Pro, HP DreamColor, Calibrite-era
@@ -101,7 +106,7 @@ pub enum CommandCode {
 /// back to a long frequency measurement.
 const STATUS_PERIOD_FAIL: u8 = 0x83;
 
-/// An opened i1d3-family colorimeter. **Untested driver** — see module docs.
+/// An opened i1d3-family colorimeter. Hardware-validated — see module docs.
 pub struct I1d3 {
     handle: DeviceHandle<Context>,
     info: DeviceInfo,

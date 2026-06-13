@@ -40,7 +40,7 @@ calibration lives in the consuming project, not here.
 | Spyder 2024 | `085c:0a0b` | spydX2 | tested |
 | SpyderX2 | `085c:0a0a` | spydX2 | should work, untested |
 | Original SpyderX | `085c:0a00` | spydX | **untested port** |
-| i1Display Pro / ColorMunki Display | `0765:5020` | i1d3 | **untested port** — covers the OEM rebadges too (NEC SpectraSensor Pro, HP DreamColor, …) |
+| i1Display Pro / ColorMunki Display | `0765:5020` | i1d3 | tested (i1Display Pro) — covers the OEM rebadges too (NEC SpectraSensor Pro, HP DreamColor, …), which share the protocol but aren't each validated |
 
 The wire protocols were reverse-engineered by Graeme Gill for ArgyllCMS
 (`spectro/spydX2.c`, `spectro/spydX.c`, `spectro/i1d3.c`). The drivers here
